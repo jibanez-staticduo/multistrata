@@ -267,8 +267,9 @@ void test_world3_layout() {
         check(gate_exps && gate_exps->axis == 1, "expert_gate_up" + rk + " is cut on the output axis");
         check(in && in->axis == 0 && in->byte_row_stride == 360,
               "down" + rk + " keeps the original 360 B slab stride");
-        check(in && in->block_size == 32 && in->scale_ref == "fp16-scale-plus-codebook-codes",
-              "down" + rk + " keeps its codec, block size and scale reference");
+        check(in && in->block_size == 32 && in->scale_kind == "fp16-scale-plus-codebook-codes" &&
+                  in->scale_ref.empty(),
+              "down" + rk + " keeps its codec, block size and says how its scales ride");
     }
     check(component(p, "weights_owned_ffn.rank0") > component(p, "weights_owned_ffn.rank1"),
           "the FFN split is unequal by design (rank 0 owns 256 of 640 columns)");
@@ -426,7 +427,8 @@ void test_validator_block_gap() {
         if (s.tensor != "blk.1.ffn_down_exps.weight" || s.rank != 1) continue;
         s.range_start = 288;                      // 288 % 64 != 0
         s.local_shape[0] = s.range_end - s.range_start;
-        s.valid_lanes.assign((size_t)(s.range_end - s.range_start), 0);
+        s.valid_lanes.assign(3, 0);
+        s.valid_lanes[1] = s.range_end - s.range_start;
     }
     ValidationResult v = validate_plan(p);
     check(!v.ok, "a cut inside a block is not valid");
@@ -535,7 +537,8 @@ void test_key_keeps_its_values() {
         s.range_start = 0;
         s.range_end = 6144;
         s.local_shape[1] = 6144;
-        s.valid_lanes.assign((size_t)6144, 0);
+        s.valid_lanes.assign(3, 0);
+        s.valid_lanes[1] = 6144;
     }
     ValidationResult v = validate_plan(p);
     check(!v.ok, "a value group that is not its key's is not valid");
@@ -743,6 +746,130 @@ void test_hash_freezes_the_plan() {
     check(d.plan_hash != a.plan_hash, "a different gate gives a different hash");
 }
 
+/// The transport needs explicit per-rank counts: a uniform padded all-gather is exactly where an empty or
+/// ambiguous list goes wrong.  Checked on the plan and again on the serialized manifest, because that text is
+/// what the packer and the runtime read.
+void test_valid_lanes_are_one_count_per_rank() {
+    begin("valid_lanes is one explicit count per rank");
+    for (int world : {1, 2, 3}) {
+        ModelInventory inv = fixture();
+        ShardPlan p = make_tp_plan(inv, world);
+        check_ok(validate_plan(p), "the world " + std::to_string(world) + " plan");
+        for (const auto& s : p.slices) {
+            const std::string tag = s.tensor + " rank" + std::to_string(s.rank) + " (world " +
+                                    std::to_string(world) + ")";
+            const int64_t span = s.range_end - s.range_start;
+            check_eq((int64_t)s.valid_lanes.size(), (int64_t)world, tag + ": one entry per rank");
+            if ((int64_t)s.valid_lanes.size() != world) continue;
+            for (int r = 0; r < world; ++r) {
+                const int64_t c = s.valid_lanes[(size_t)r];
+                check(c >= 0 && c <= span, tag + ": rank " + std::to_string(r) + " count " +
+                          std::to_string(c) + " outside a range of " + std::to_string(span));
+                check(s.replicated ? c == span : (r == s.rank ? c == span : c == 0),
+                      tag + ": rank " + std::to_string(r) + " count is not its own share of this slice");
+            }
+        }
+        // The same facts out of the serialized manifest, read back with the plan reader.
+        const std::string js = to_tp_plan_json(p);
+        std::string err;
+        strata::distributed::jsonlite::JReader rd(js, &err);
+        strata::distributed::jsonlite::JVal root;
+        const bool parsed = rd.parse(root) && root.k == strata::distributed::jsonlite::JVal::K::Obj;
+        check(parsed, "the manifest parses back (err: " + err + ")");
+        if (!parsed) continue;
+        const strata::distributed::jsonlite::JVal* sl = root.at("slices");
+        check(sl != nullptr && sl->k == strata::distributed::jsonlite::JVal::K::Arr,
+              "the manifest has a slices array");
+        if (sl == nullptr || sl->k != strata::distributed::jsonlite::JVal::K::Arr) continue;
+        check_eq((int64_t)sl->arr.size(), (int64_t)p.slices.size(), "and one entry per slice");
+        for (const auto& v : sl->arr) {
+            const strata::distributed::jsonlite::JVal* lanes = v.at("valid_lanes");
+            check(lanes != nullptr, "slice " + std::string(v.at("tensor") &&
+                                    v.at("tensor")->k == strata::distributed::jsonlite::JVal::K::Str
+                                        ? v.at("tensor")->s : "?") + ": valid_lanes is present");
+            if (lanes == nullptr) continue;
+            check(lanes->k == strata::distributed::jsonlite::JVal::K::Arr,
+                  "a slice's valid_lanes is a list of counts, not a bare number");
+            if (lanes->k != strata::distributed::jsonlite::JVal::K::Arr) continue;
+            check_eq((int64_t)lanes->arr.size(), (int64_t)world, "a serialized slice has one count per rank");
+            const strata::distributed::jsonlite::JVal* rng = v.at("range");
+            const strata::distributed::jsonlite::JVal* local = v.at("local_shape");
+            const strata::distributed::jsonlite::JVal* axis = v.at("axis");
+            if (rng == nullptr || local == nullptr || axis == nullptr || rng->arr.size() != 2 ||
+                local->arr.empty()) {
+                check(false, "a serialized slice carries range, local_shape and axis");
+                continue;
+            }
+            const int64_t ax = (int64_t)axis->num;
+            const int64_t span = (int64_t)rng->arr[1].num - (int64_t)rng->arr[0].num;
+            check_eq((int64_t)local->arr[(size_t)ax].num, span, "local width on the cut axis is the range");
+            for (const auto& c : lanes->arr)
+                check(c.k == strata::distributed::jsonlite::JVal::K::Num && c.num >= 0 &&
+                          c.num <= (double)span,
+                      "a serialized count " + std::to_string((int64_t)c.num) + " is outside a range of " +
+                          std::to_string(span) + " items");
+        }
+    }
+    // A count that is not the owner's share, or not a whole cut unit, is refused.
+    ModelInventory inv = fixture();
+    ShardPlan p = make_tp_plan(inv, 3);
+    for (auto& s : p.slices) {
+        if (s.tensor != "blk.0.attn_qkv.weight" || s.part != "gdn_v" || s.rank != 0) continue;
+        s.valid_lanes[0] = 2000;                       // not a whole number of 128-item cut units
+    }
+    ValidationResult v = validate_plan(p);
+    check(!v.ok, "a partial count that is not whole cut units is refused");
+    check_has(v.errors, "not a whole number of 128-item cut units", "and the message names the cut unit");
+
+    p = make_tp_plan(inv, 3);
+    for (auto& s : p.slices) {
+        if (s.tensor != "blk.0.ffn_down_shexp.weight" || s.rank != 1) continue;
+        s.valid_lanes[2] = 128;                        // inside the span, but rank 2 owns none of it
+    }
+    v = validate_plan(p);
+    check(!v.ok, "a count for a rank that does not own the slice is refused");
+    check_has(v.errors, "a range it does not own", "and the message says who holds what");
+
+    p = make_tp_plan(inv, 3);
+    for (auto& s : p.slices) {
+        if (s.tensor != "blk.0.ffn_down_shexp.weight" || s.rank != 1) continue;
+        s.valid_lanes.pop_back();
+    }
+    v = validate_plan(p);
+    check(!v.ok, "a slice with no count for every rank is refused");
+    check_has(v.errors, "one explicit count per rank", "and the message names the rule");
+}
+
+void test_scale_tensors_are_named_by_their_tensors() {
+    begin("a scale tensor in the inventory is named by the slices that need it");
+    ModelInventory inv = fixture();
+    InventoryTensor sc;
+    sc.name = "blk.0.ffn_down_shexp_scales";
+    sc.file = "fixture-00001-of-00002.gguf";
+    sc.dtype = "F16";
+    sc.shape = {20, 2560};                      // one fp16 scale per 32-block of the 640 rows
+    sc.block_size = 1;
+    sc.byte_offset = 1024;
+    sc.byte_length = 20 * 2560 * 2;
+    sc.family = TensorFamily::Other;
+    inv.tensors.push_back(sc);
+    ShardPlan p = make_tp_plan(inv, 3);
+    check_ok(validate_plan(p), "the plan with a scale tensor of its own");
+    const std::string js = to_tp_plan_json(p);
+    check(js.find("\"scale_ref\": \"blk.0.ffn_down_shexp_scales\"") != std::string::npos,
+          "the slices of the block-quantized tensor name the inventory's scale tensor");
+    check(js.find("\"scale_ref\": null") != std::string::npos,
+          "and the tensors whose scales ride in the block name nothing");
+    int64_t named = 0;
+    for (const auto& s : p.slices)
+        if (s.scale_ref == "blk.0.ffn_down_shexp_scales") ++named;
+    check_eq(named, (int64_t)3, "one named scale_ref per rank of that tensor, and no others");
+    for (const auto& s : p.slices)
+        if (s.tensor == "blk.0.ffn_down_shexp.weight")
+            check(s.scale_ref == "blk.0.ffn_down_shexp_scales" && !s.scale_kind.empty(),
+                  "the slice carries both: where the scales are and how they ride");
+}
+
 void test_manifest_for_task3() {
     begin("every manifest slice names its rank or says it is replicated");
     ModelInventory inv = fixture();
@@ -761,7 +888,16 @@ void test_manifest_for_task3() {
              "one \"replicated\" per slice in tp-plan.json");
     check_eq(count("\"byte_row_stride\":"), (int64_t)p.slices.size(), "one stride per slice");
     check_eq(count("\"range\":"), (int64_t)p.slices.size(), "one range per slice");
-    check_eq(count("\"scale_ref\":"), (int64_t)p.slices.size(), "one scale reference per slice");
+    check_eq(count("\"scale_ref\":"), (int64_t)p.slices.size(), "one scale_ref per slice");
+    check_eq(count("\"scale_kind\":"), (int64_t)p.slices.size(), "one scale_kind per slice");
+    // A scale_ref that is not empty must be a tensor the reader can open.  This inventory keeps no scales in
+    // a tensor of their own, so every slice says so by naming none.
+    for (const auto& s : p.slices) {
+        check(s.scale_ref.empty(), "slice " + s.tensor + " names no scale tensor the inventory lacks");
+        check(s.block_size <= 1 || !s.scale_kind.empty(),
+              "block-quantized slice " + s.tensor + " states how its scales ride");
+    }
+    check_eq(count("\"valid_lanes\":"), (int64_t)p.slices.size(), "one valid_lanes per slice");
     bool has_rank = true, flagged = true, in_order = true;
     size_t from = 0;
     for (const auto& s : p.slices) {
@@ -1031,6 +1167,8 @@ void run_fixture_suite() {
     test_validator_block_gap();
     test_missing_scale_and_stride();
     test_verdict_and_shapes();
+    test_valid_lanes_are_one_count_per_rank();
+    test_scale_tensors_are_named_by_their_tensors();
     test_gqa_map_is_global();
     test_key_keeps_its_values();
     test_local_quantizer_that_crosses_is_routed();

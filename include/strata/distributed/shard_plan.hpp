@@ -168,8 +168,24 @@ struct TensorSlice {
                                             // reads; a sharded slice must carry it
     std::string codec;
     int64_t block_size = 0;
-    std::string scale_ref;                  // "" = none; a block-quantized slice must name its scales
-    std::vector<int64_t> valid_lanes;       // local lane ids valid on the wire; empty = full copy
+    std::string scale_kind;                 // how this codec carries its scales, copied from the inventory
+                                           // ("fp16-scale-plus-codebook-codes", ...); "" = the tensor has no
+                                           // scales.  A block-quantized slice states one of the two ways its
+                                           // scales travel, never neither.
+    std::string scale_ref;                  // the INVENTORY TENSOR holding this slice's scales, when the
+                                           // inventory keeps them in a tensor of their own; "" = they ride
+                                           // inside the slice's own block bytes, which is how GGUF stores
+                                           // them for every tensor of this pack.  Anything here must be a
+                                           // name the inventory actually lists, because that is what a
+                                           // reader opens to find them.
+    std::vector<int64_t> valid_lanes;       // valid items of this slice's range, ONE COUNT PER RANK, in the
+                                          // range's own units (the same shape as an activation contract's
+                                          // valid_counts).  Never empty: a reader must not have to guess
+                                          // between "all lanes" and "none".  A rank that does not own this
+                                          // slice holds 0 of its items; a replicated slice is whole on every
+                                          // rank.  Anything below the local width is padding: the local share
+                                          // is padded to the agreed slot count and the tail is zeros, never a
+                                          // read past the source.
     std::vector<int64_t> halo;              // [left, right] read-only lanes kept to complete straddling
                                             // activation blocks; empty when none are needed
     std::vector<int64_t> gqa_map;           // "qsa_head": local query head -> GLOBAL kv head (the 24Q/2KV map)
@@ -278,6 +294,25 @@ inline int64_t slab_bytes(const InventoryTensor& t) {
     for (size_t i = 1; i < t.shape.size(); ++i) after *= t.shape[i];
     if (after <= 0 || t.byte_length % after != 0) return -1;
     return t.byte_length / after;
+}
+
+/// The inventory tensor holding a tensor's scales, when the inventory keeps scales in a tensor of their own.
+/// The names tried, in order: `<name>_scales`, `<name>_scale`, and both again on the name with a trailing
+/// `.weight` dropped.  GGUF keeps scales inside the block bytes instead, which is what every tensor of this
+/// pack does: then this is empty and the slice carries `scale_kind` alone, so a reader never has to guess
+/// which of the two ways the scales travel.
+inline std::string find_scale_tensor(const std::map<std::string, bool>& names, const std::string& tensor) {
+    std::vector<std::string> stems = {tensor};
+    const std::string suffix = ".weight";
+    if (tensor.size() > suffix.size() &&
+        tensor.compare(tensor.size() - suffix.size(), suffix.size(), suffix) == 0)
+        stems.push_back(tensor.substr(0, tensor.size() - suffix.size()));
+    for (const std::string& stem : stems)
+        for (const char* tail : {"_scales", "_scale"}) {
+            const std::string cand = stem + tail;
+            if (names.count(cand) != 0) return cand;
+        }
+    return std::string();
 }
 
 }  // namespace detail
@@ -738,6 +773,11 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
         if (a.block_size > 1 && (a.consumer == "down" || a.consumer == "expert_down"))
             ffn_act_block = std::max(ffn_act_block, a.block_size);
 
+    // Where each tensor's scales are: an inventory tensor of their own when the inventory has one, otherwise
+    // inside the block bytes, which is what this pack does for all 1224 tensors.
+    std::map<std::string, bool> tensor_names;
+    for (const auto& t : inv.tensors) tensor_names[t.name] = true;
+
     for (const auto& t : inv.tensors) {
         if (t.shape.empty()) {
             reject("tensor " + t.name + ": empty shape in the inventory");
@@ -801,8 +841,11 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
             plan.world = 0;
             return plan;
         }
-        if (cut_ok && t.block_size > 1 && t.scale_kind.empty()) {
-            reject("tensor " + t.name + ": block-quantized with no scale reference");
+        const std::string scale_ref =
+            t.block_size > 1 ? detail::find_scale_tensor(tensor_names, t.name) : std::string();
+        if (cut_ok && t.block_size > 1 && t.scale_kind.empty() && scale_ref.empty()) {
+            reject("tensor " + t.name + ": block-quantized with no scale reference: the inventory names no "
+                   "scale tensor and says nothing about how the scales ride with the codes");
             plan.world = 0;
             return plan;
         }
@@ -821,8 +864,11 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
                 s.byte_row_stride = stride;
                 s.codec = t.dtype;
                 s.block_size = t.block_size;
-                s.scale_ref = t.block_size > 1 ? t.scale_kind : std::string();
+                s.scale_kind = t.scale_kind;
+                s.scale_ref = scale_ref;
                 s.replicated = true;
+                // Whole on every rank, stated as a count per rank rather than left empty.
+                s.valid_lanes.assign((size_t)world, t.shape[0]);
                 plan.slices.push_back(std::move(s));
                 continue;
             }
@@ -844,10 +890,15 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
                 s.byte_row_stride = stride;
                 s.codec = t.dtype;
                 s.block_size = t.block_size;
-                s.scale_ref = t.block_size > 1 ? t.scale_kind : std::string();
+                s.scale_kind = t.scale_kind;
+                s.scale_ref = scale_ref;
                 s.local_shape[(size_t)s.axis] = s.range_end - s.range_start;
-                s.valid_lanes.resize((size_t)(s.range_end - s.range_start));
-                for (size_t i = 0; i < s.valid_lanes.size(); ++i) s.valid_lanes[i] = (int64_t)i;
+                // One explicit count per rank, in the range's own units: this rank holds every item of the
+                // range it owns, the ranks that do not own this slice hold none of it.  Empty would be
+                // ambiguous between "all lanes" and "none", and a uniform padded gather is exactly where an
+                // ambiguous count goes wrong.
+                s.valid_lanes.assign((size_t)world, 0);
+                s.valid_lanes[(size_t)rank] = s.range_end - s.range_start;
                 if (sec.part == "qsa_head") {
                     const int64_t per_kv = g.n_head / g.n_head_kv;   // global 24Q/2KV map, never a local count
                     for (int64_t h = hs; h < he; ++h) s.gqa_map.push_back(h / per_kv);
@@ -1034,7 +1085,8 @@ inline std::string plan_canonical_body(const ShardPlan& p) {
              std::to_string(s.range_end) + "," + std::to_string(s.cut_unit) + "," +
              std::to_string(s.head_start) + "," + std::to_string(s.head_end) + "," +
              std::to_string(s.byte_row_stride) + "," + s.codec + "," + std::to_string(s.block_size) + "," +
-             s.scale_ref + "," + detail::lane_str(s.valid_lanes) + "," + detail::lane_str(s.halo) + "," +
+             s.scale_kind + "," + s.scale_ref + "," + detail::lane_str(s.valid_lanes) + "," +
+             detail::lane_str(s.halo) + "," +
              detail::lane_str(s.gqa_map) + (s.replicated ? ",R" : ",S");
     }
     for (const auto& c : p.activation) {
@@ -1091,6 +1143,17 @@ inline ValidationResult validate_plan(const ShardPlan& p) {
                 if (s->range_start != 0 || s->range_end != total)
                     v.fail("tensor " + name + " rank " + std::to_string(s->rank) +
                            ": replicated slice must own the full range");
+                if ((int64_t)s->valid_lanes.size() != p.world) {
+                    v.fail("tensor " + name + " rank " + std::to_string(s->rank) + ": valid_lanes must carry "
+                           "one explicit count per rank (" + std::to_string(p.world) + "), not " +
+                           std::to_string((int64_t)s->valid_lanes.size()));
+                    continue;
+                }
+                for (int r = 0; r < p.world; ++r)
+                    if (s->valid_lanes[(size_t)r] != total)
+                        v.fail("tensor " + name + " rank " + std::to_string(s->rank) + ": rank " +
+                               std::to_string(r) + " holds " + std::to_string(s->valid_lanes[(size_t)r]) +
+                               " of a whole copy of " + std::to_string(total) + " items");
             }
             continue;
         }
@@ -1107,15 +1170,35 @@ inline ValidationResult validate_plan(const ShardPlan& p) {
             if (s->byte_row_stride <= 0)
                 v.fail("tensor " + name + " rank " + std::to_string(s->rank) +
                        ": sharded without the original byte stride");
-            if ((int64_t)s->valid_lanes.size() != s->range_end - s->range_start)
-                v.fail("tensor " + name + " rank " + std::to_string(s->rank) +
-                       ": valid lanes do not cover the owned lanes");
+            const int64_t span = s->range_end - s->range_start;
+            if ((int64_t)s->valid_lanes.size() != p.world) {
+                v.fail("tensor " + name + " rank " + std::to_string(s->rank) + ": valid_lanes must carry "
+                       "one explicit count per rank (" + std::to_string(p.world) + "), not " +
+                       std::to_string((int64_t)s->valid_lanes.size()));
+            } else {
+                for (int r = 0; r < p.world; ++r) {
+                    const int64_t c = s->valid_lanes[(size_t)r];
+                    if (c < 0 || c > span)
+                        v.fail("tensor " + name + " rank " + std::to_string(s->rank) + ": rank " +
+                               std::to_string(r) + " valid count " + std::to_string(c) + " is outside this "
+                               "slice's range of " + std::to_string(span) + " items");
+                    else if (r != s->rank && c != 0)
+                        v.fail("tensor " + name + " rank " + std::to_string(s->rank) + ": rank " +
+                               std::to_string(r) + " holds " + std::to_string(c) + " items of a range it does "
+                               "not own");
+                    else if (c < span && s->cut_unit > 1 && c % s->cut_unit != 0)
+                        v.fail("tensor " + name + " rank " + std::to_string(s->rank) + ": a valid count of " +
+                               std::to_string(c) + " is not a whole number of " + std::to_string(s->cut_unit) +
+                               "-item cut units");
+                }
+            }
             if (s->block_size > 1 && s->axis == 0 && s->range_start % s->block_size != 0)
                 v.fail("tensor " + name + " rank " + std::to_string(s->rank) + " part " + s->part +
                        ": cut at " + std::to_string(s->range_start) + " splits a " +
                        std::to_string(s->block_size) + " weight block");
-            if (s->block_size > 1 && s->scale_ref.empty())
-                v.fail("tensor " + name + ": block-quantized slice names no scales");
+            if (s->block_size > 1 && s->scale_ref.empty() && s->scale_kind.empty())
+                v.fail("tensor " + name + ": block-quantized slice says neither where its scales are nor how "
+                       "they ride with the codes");
             rs.push_back({s->range_start, s->range_end});
         }
         std::sort(rs.begin(), rs.end());
@@ -1339,6 +1422,8 @@ inline std::string to_tp_plan_json(const ShardPlan& p) {
         o += ", \"codec\": "; json_str(o, s.codec);
         o += ", \"block_size\": ";
         if (s.block_size <= 0) o += "null"; else o += std::to_string(s.block_size);
+        o += ", \"scale_kind\": ";
+        if (s.scale_kind.empty()) o += "null"; else json_str(o, s.scale_kind);
         o += ", \"scale_ref\": ";
         if (s.scale_ref.empty()) o += "null"; else json_str(o, s.scale_ref);
         o += ", \"valid_lanes\": " + detail::lane_str(s.valid_lanes);
