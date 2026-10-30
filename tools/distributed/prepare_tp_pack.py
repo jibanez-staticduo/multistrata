@@ -2,35 +2,50 @@
 """Prepare and verify the per-rank artifacts for a Strata TP3 run.
 
 A rank artifact is a byte-range view over the original, pinned source files.  Nothing here
-recomputes a scale, requantizes a code or trims a vocabulary: a rank takes whole blocks, with
-the native scale tail that lives inside each block, and copies them as they are.  Scales kept
-as their own tensor travel through the same range logic, so they are copied, not rebuilt.
+recomputes a scale, requantizes a code or trims a vocabulary: a rank takes whole blocks, with the
+native scale tail that lives inside each block, and copies them as they are.  Scales kept as their
+own tensor travel through the same range logic, so they are copied, not rebuilt.
+
+Blocks run along the contiguous axis.  A model file stores a tensor with its contiguous dimension
+first, so a [in, out] weight holds one whole row of blocks per output index, and a stacked expert
+[in, out, experts] one row per (out, expert), with the output axis the inner of the two: one expert's rows
+lie next to each other, and the next expert starts a full set of output rows later.  A Q4_K block is 256
+weights of the input width and
+144 bytes wherever it appears, which is exactly what the inventory's sizes say: for
+blk.0.ffn_gate_shexp.weight at [2560, 640] with byte_length 921600, 6400 blocks of 144 bytes come
+out of axis 0 and nothing sensible comes out of the last axis.  So a cut of whole output rows
+copies whole blocks and needs no alignment at all, while a cut of the input width has to land on a
+block edge.  This module reads the row stride from the tensor's own sizes and checks it against the
+stride the plan declares.
 
 Two modes, kept apart on purpose:
 
-* ``prepare_tp_pack(source, plan, output, materialize=False)`` reads the inventory and the
-  plan, checks every length and offset against the real size of the source file, and returns
-  the candidate manifest.  It opens no output file at all, so it is safe against a source
-  that is still on the mirror.
-* ``prepare_tp_pack(..., materialize=True)`` writes rank-local files.  It asks for spare disk
-  of its own first (50 GiB by default, on top of the bytes it is about to write), writes into
-  a sibling staging directory, and only then moves it into place, so a run cut in half leaves
-  no half-published pack behind.  It returns the same manifest with a byte-equality receipt.
+* ``prepare_tp_pack(source, plan, output, materialize=False)`` reads the inventory and the plan,
+  checks every length and offset against the real size of the source file, and returns the
+  candidate manifest.  It opens no output file at all, so it is safe against a source that is still
+  copying in.
+* ``prepare_tp_pack(..., materialize=True)`` writes rank-local files.  It asks for spare disk of its
+  own first (50 GiB by default, on top of the bytes it is about to write), writes into a sibling
+  staging directory, and only then moves it into place, so a run cut in half leaves no
+  half-published pack behind.  It returns the same manifest with a byte-equality receipt.
 
-``verify_tp_pack(source, output)`` reads a published pack back and compares every copied block
-and scale against the source byte for byte, and its report says both what it checked and what
-it left unproven.
+``verify_tp_pack(source, output)`` reads a published pack back and compares every copied block and
+scale against the source byte for byte, and its report says both what it checked and what it left
+unproven.
 
-How much work each mode does: plan mode reads only the arithmetic (file sizes and the ranges the plan
-names), so it costs a few stats and stays safe against a source that is still copying in.  Recomputing
-a source file's sha256 reads that whole file, so it happens on a materialized write and on a verify,
-never in plan mode.  A file the inventory leaves with a null sha256 is size-checked and named in the
-report, not silently counted as hashed.
+How much work each mode does: plan mode reads only the arithmetic (file sizes and the ranges the
+plan names), so it costs a few stats and stays safe against a source that is still copying in.
+Recomputing a source file's sha256 reads that whole file, so it happens on a materialized write and
+on a verify, never in plan mode.  A file the inventory leaves with a null sha256 is size-checked and
+named in the report, not silently counted as hashed.
 
 On the shared schema: the contract lists ``range``, ``local_shape``, ``valid_lanes`` and
-``replicated`` per slice without naming a rank.  This module reads a slice as one rank's share
-when it carries ``rank``, and as a copy for every rank when it carries ``"replicated": true``.
-Task 2 is free to emit one entry per rank; both shapes give the same segments.
+``replicated`` per slice without naming a rank.  This module reads a slice as one rank's share when
+it carries ``rank``, and as a copy for every rank when it carries ``"replicated": true``.
+
+A segment is one run, or a constant-stride set of runs, or a general pattern of run counts and
+strides, so a cut of the contiguous axis -- a row piece repeated over every (out, expert) row -- is
+one entry that verification walks run by run, not thousands of them.
 
 Tests: $VENV/bin/python -m pytest tests/distributed/test_prepare_tp_pack.py -q
 """
@@ -45,16 +60,25 @@ import shutil
 import sys
 import uuid
 from dataclasses import dataclass, field
+from functools import reduce
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
+
+try:                                    # numpy makes the strided gather one copy instead of a loop
+    import numpy as _np
+except Exception:                       # pragma: no cover - the toolchain venv has numpy
+    _np = None
 
 SCHEMA_VERSION = 1
 MANIFEST_VERSION = 1
 MANIFEST_NAME = "tp-pack-v1.json"
 
-# The materialized path keeps this much disk free after it writes, so a rank file never lands
-# next to a full volume.
+# The materialized path keeps this much disk free after it writes, so a rank file never lands next
+# to a full volume.
 DEFAULT_MIN_FREE_BYTES = 50 * 1024**3
+
+# Bytes held in hand at a time: one read of the source, one write or compare of the destination.
+CHUNK_BYTES = 1 << 26
 
 VOCABULARY_FAMILIES = ("embed", "head")
 
@@ -87,18 +111,63 @@ class PackMismatch(PackError):
     """A byte written into a rank file is not the source byte it claims to be."""
 
 
+def _prod(values) -> int:
+    return reduce(lambda a, b: a * b, values, 1)
+
+
 @dataclass(frozen=True)
 class Segment:
-    """One contiguous run of bytes a rank owns: source codes, source scales, or padding."""
+    """Bytes one rank owns: one run, or runs at a fixed stride, or a general run pattern.
+
+    ``pattern`` is a list of (count, stride) levels in increasing stride, so the runs sit at
+    ``source_offset + sum(i_level * stride_level)`` for every digit, and they are enumerated in
+    increasing order.  ``pattern == ()`` is a single run.  The destination always holds the runs
+    back to back, so ``source_length`` is the size of the destination block.
+    """
 
     tensor: str
     kind: str                 # "codes" | "scales" | "padding"
     rank: int
     source_path: str | None   # inventory-relative; None for padding
     source_offset: int | None
-    source_length: int
+    run_bytes: int
+    pattern: tuple[tuple[int, int], ...]
     dest_offset: int
-    scale_of: str | None      # the codes tensor a scale run belongs to
+    scale_of: str | None
+
+    @property
+    def source_length(self) -> int:
+        return self.run_bytes * _prod(count for count, _ in self.pattern)
+
+    @property
+    def run_count(self) -> int:
+        return _prod(count for count, _ in self.pattern) or 1
+
+    def last_end(self) -> int:
+        if self.source_offset is None:
+            return self.dest_offset + self.source_length
+        return (self.source_offset + sum((count - 1) * stride for count, stride in self.pattern)
+                + self.run_bytes)
+
+    def runs(self) -> Iterator[tuple[int, int]]:
+        """(source_offset, length) for every run, in the order they fill the destination."""
+        if self.source_offset is None:
+            return iter(())
+        if not self.pattern:
+            yield self.source_offset, self.run_bytes
+            return
+        counts = [count for count, _ in self.pattern]
+        strides = [stride for _, stride in self.pattern]
+        digits = [0] * len(counts)
+        while True:
+            yield self.source_offset + sum(d * s for d, s in zip(digits, strides)), self.run_bytes
+            for position in range(len(digits) - 1, -1, -1):
+                digits[position] += 1
+                if digits[position] < counts[position]:
+                    break
+                digits[position] = 0
+            else:
+                return
 
     def as_dict(self) -> dict:
         return {
@@ -107,7 +176,10 @@ class Segment:
             "rank": self.rank,
             "source_path": self.source_path,
             "source_offset": self.source_offset,
+            "run_bytes": self.run_bytes,
+            "pattern": [[count, stride] for count, stride in self.pattern],
             "source_length": self.source_length,
+            "run_count": self.run_count,
             "dest_offset": self.dest_offset,
             "scale_of": self.scale_of,
         }
@@ -120,7 +192,8 @@ class Segment:
             rank=int(raw["rank"]),
             source_path=raw["source_path"],
             source_offset=None if raw["source_offset"] is None else int(raw["source_offset"]),
-            source_length=int(raw["source_length"]),
+            run_bytes=int(raw["run_bytes"]),
+            pattern=tuple((int(count), int(stride)) for count, stride in raw["pattern"]),
             dest_offset=int(raw["dest_offset"]),
             scale_of=raw["scale_of"],
         )
@@ -181,8 +254,8 @@ def inventory_hash_variants(inventory: dict) -> set[str]:
     """The hashes a plan may legitimately carry for this inventory.
 
     This module canonicalizes with tight separators; the Task 1 inventory writer hashes
-    ``json.dumps(obj, sort_keys=True)`` with the default separators.  Same content, two digests,
-    and refusing a plan over a separator would be a false refusal at integration time.
+    ``json.dumps(obj, sort_keys=True)`` with the default separators.  Same content, two digests, and
+    refusing a plan over a separator would be a false refusal at integration time.
     """
     return {inventory_hash(inventory),
             hashlib.sha256(json.dumps(inventory, sort_keys=True).encode("utf-8")).hexdigest()}
@@ -306,86 +379,116 @@ def _check_inside(rel: str, file_size: int, offset: int, length: int, what: str)
                          f"{offset + length}) and the file holds {file_size} bytes")
 
 
-def _units(tensor: dict, axis: int, start: int, end: int) -> tuple[int, int, int, int]:
-    """(first_unit, unit_count, bytes_per_unit, rows) for a cut.
+def _layout(tensor: dict) -> dict:
+    """Row size, row count and the axis the quantization blocks run along, from the tensor's sizes.
 
-    A cut on axis 0 takes whole rows.  A cut on the last axis takes whole quantization blocks
-    when the tensor has a block size, and whole items when it does not (f16 norms, per-block
-    scale rows).  Nothing in between: a rank never takes half a block.
+    The contiguous dimension comes first in a model file, so one row is a whole run along axis 0 and
+    the rows are the rest of the dimensions.  Blocks therefore run along axis 0, and a block's byte
+    size falls out of ``row_bytes`` rather than out of a codec table this module would have to keep
+    in step with the engine.
     """
     shape = [int(x) for x in tensor.get("shape", [])]
     _require(bool(shape), f"tensor {tensor['name']} has no shape", InventoryError)
-    _require(0 <= axis < len(shape), f"tensor {tensor['name']}: axis {axis} outside shape {shape}")
-    if len(shape) > 1 and axis != 0 and axis != len(shape) - 1:
-        raise PlanError(f"tensor {tensor['name']}: axis {axis} is neither a row cut (0) nor a last-axis cut "
-                        f"({len(shape) - 1}); this pack copies rows and blocks, not inner strides")
-    extent = shape[axis]
-    _require(0 <= start < end <= extent,
-             f"tensor {tensor['name']}: range [{start}, {end}) outside extent {extent} on axis {axis}")
-
-    rows = int(shape[0]) if len(shape) > 1 else 1
+    _require(all(x > 0 for x in shape), f"tensor {tensor['name']}: zero or negative extent in {shape}")
     total = int(tensor["byte_length"])
-    if len(shape) == 1:
-        block_size = tensor.get("block_size")
-        if block_size is None:
-            _require(total % extent == 0,
-                     f"tensor {tensor['name']}: byte_length {total} is not a whole number of items over {extent}")
-            return start, end - start, total // extent, 1
-        return start // int(block_size), (end - start) // int(block_size), _block_unit(tensor, total, 1, extent), 1
-
-    if axis == 0:
-        _require(total % rows == 0,
-                 f"tensor {tensor['name']}: byte_length {total} is not a whole number of rows over {rows} rows")
-        return start, end - start, total // rows, rows
-
-    last = shape[-1]
+    row_count = _prod(shape[1:])
+    _require(total % row_count == 0,
+             f"tensor {tensor['name']}: byte_length {total} is not a whole number of rows over {row_count} rows")
+    row_bytes = total // row_count
     block_size = tensor.get("block_size")
     if block_size is None:
-        _require(total % (rows * last) == 0,
-                 f"tensor {tensor['name']}: byte_length {total} does not divide into {rows} rows of {last} items, "
-                 f"so this cut cannot be proven item-aligned")
-        return start, end - start, total // (rows * last), rows
-    unit = _block_unit(tensor, total, rows, last)
-    _require(start % int(block_size) == 0 and end % int(block_size) == 0,
-             f"tensor {tensor['name']}: cut [{start}, {end}) crosses a quantization block of {block_size}; a rank "
-             f"may take whole blocks only, and no scale is recomputed to make it fit")
-    return start // int(block_size), (end - start) // int(block_size), unit, rows
+        _require(row_bytes % shape[0] == 0,
+                 f"tensor {tensor['name']}: a row of {row_bytes} bytes is not a whole number of items over "
+                 f"{shape[0]} items, so this cut cannot be proven item-aligned")
+        return {"shape": shape, "row_bytes": row_bytes, "row_count": row_count, "block_axis": None,
+                "unit_bytes": row_bytes // shape[0], "block_size": None}
+    block_size = int(block_size)
+    _require(block_size > 0, f"tensor {tensor['name']}: block size {block_size} is not positive")
+    if len(shape) > 1 and shape[0] % block_size != 0:
+        _require(shape[-1] % block_size != 0,
+                 f"tensor {tensor['name']}: blocks of {block_size} divide the last axis ({shape[-1]}) but not the "
+                 f"contiguous axis ({shape[0]}); this packer copies whole rows of blocks and does not support "
+                 f"blocks along the outer axis")
+        raise PlanError(f"tensor {tensor['name']}: neither the contiguous axis ({shape[0]}) nor the last axis "
+                        f"({shape[-1]}) is a whole number of blocks of {block_size}")
+    _require(shape[0] % block_size == 0,
+             f"tensor {tensor['name']}: extent {shape[0]} is not a whole number of blocks of {block_size}")
+    blocks_per_row = shape[0] // block_size
+    _require(row_bytes % blocks_per_row == 0,
+             f"tensor {tensor['name']}: a row of {row_bytes} bytes does not divide into {blocks_per_row} blocks, "
+             f"so this codec's scale tail is not block-proportional and the cut cannot be proven byte-exact")
+    return {"shape": shape, "row_bytes": row_bytes, "row_count": row_count, "block_axis": 0,
+            "unit_bytes": row_bytes // blocks_per_row, "block_size": block_size}
 
 
-def _block_unit(tensor: dict, total: int, rows: int, last: int) -> int:
-    """Bytes in one quantization block, scale tail included, from the tensor's real byte length."""
-    block_size = int(tensor["block_size"])
-    _require(block_size > 0 and last % block_size == 0,
-             f"tensor {tensor['name']}: extent {last} is not a whole number of blocks of {block_size}", PlanError)
-    blocks = rows * (last // block_size)
-    _require(total % blocks == 0,
-             f"tensor {tensor['name']}: byte_length {total} does not divide into {blocks} blocks, so this codec's "
-             f"scale tail is not block-proportional and the cut cannot be proven byte-exact", PlanError)
-    return total // blocks
+def _row_stride_bytes(layout: dict, axis: int) -> int:
+    """Bytes between one step along a non-contiguous axis.
+
+    A model file stores a tensor with its fastest-varying dimension first, so the axis right after the
+    contiguous one is the inner one and each later axis steps over the whole block of axes before it.  For
+    a stacked expert [in, out, experts] that means the 32 output rows of one expert sit next to each other,
+    and the next expert starts 32 rows on: one expert is a contiguous run, and the experts of one output
+    row are 32 rows apart.
+    """
+    shape = layout["shape"]
+    return layout["row_bytes"] * _prod(shape[1:axis])
 
 
-def _runs(tensor: dict, axis: int, base: int, start: int, end: int) -> list[tuple[int, int]]:
-    """Source runs for one item cut: one run where items sit next to each other, one per row otherwise."""
-    first, count, unit, rows = _units(tensor, axis, start, end)
-    if rows == 1 or axis == 0:
-        return [(base + first * unit, count * unit)]
-    stride = int(tensor["byte_length"]) // rows
-    runs = [(base + row * stride + first * unit, count * unit) for row in range(rows)]
-    merged: list[tuple[int, int]] = []
-    for offset, length in runs:
-        if merged and offset == merged[-1][0] + merged[-1][1]:
-            merged[-1] = (merged[-1][0], merged[-1][1] + length)
+def _normalize(offset: int, run_bytes: int, levels: Sequence[tuple[int, int]]) -> tuple[int, int, tuple]:
+    """Fold runs that sit right against the current run into it, and drop levels that select nothing."""
+    kept = sorted(((int(count), int(stride)) for count, stride in levels if count > 1),
+                  key=lambda pair: pair[1])
+    changed = True
+    while changed:
+        changed = False
+        if kept and kept[0][1] == run_bytes:
+            run_bytes *= kept[0][0]
+            kept = kept[1:]
+            changed = True
+    return offset, run_bytes, tuple(kept)
+
+
+def _cut(layout: dict, axis: int, start: int, end: int, name: str) -> tuple[int, int, tuple]:
+    """(offset from the tensor start, run_bytes, levels) for a cut of one axis.
+
+    A cut of the contiguous axis has to land on a block edge, and gives one run per row at the row
+    stride.  A cut of any other axis takes whole rows, which is why any row boundary is valid: the
+    blocks inside a row come along whole, tail and all.
+    """
+    shape = layout["shape"]
+    _require(0 <= axis < len(shape), f"tensor {name}: axis {axis} outside shape {shape}")
+    _require(0 <= start < end <= shape[axis],
+             f"tensor {name}: range [{start}, {end}) outside extent {shape[axis]} on axis {axis}")
+    if axis == 0:
+        if layout["block_axis"] == 0:
+            block_size = layout["block_size"]
+            _require(start % block_size == 0 and end % block_size == 0,
+                     f"tensor {name}: cut [{start}, {end}) splits a quantization block of {block_size} on the "
+                     f"contiguous axis; a rank may take whole blocks only, and no scale is recomputed to make it fit")
+            units = (end - start) // block_size
         else:
-            merged.append((offset, length))
-    return merged
+            units = end - start
+        start_units = start if layout["block_axis"] is None else start // layout["block_size"]
+        # A cut that starts inside a row has to start there: rank 1 of a [640, 128] down projection owns
+        # blocks 4..6 of every output row, not blocks 0..2, and the same holds for the scale row beside it.
+        offset = start_units * layout["unit_bytes"]
+        run_bytes = units * layout["unit_bytes"]
+        if layout["row_count"] == 1:
+            return _normalize(offset, run_bytes, ())
+        if run_bytes == layout["row_bytes"]:
+            return _normalize(offset, run_bytes * layout["row_count"], ())   # rows are adjacent: one range
+        return _normalize(offset, run_bytes, ((layout["row_count"], layout["row_bytes"]),))
+    stride = _row_stride_bytes(layout, axis)
+    levels = [(end - start, stride)]
+    levels += [(shape[other], _row_stride_bytes(layout, other)) for other in range(1, len(shape)) if other != axis]
+    return _normalize(start * stride, layout["row_bytes"], levels)
 
 
 def _valid_count(slice_entry: dict, requested: int, world: int, rank: int) -> int:
     """How many items of the local range really exist in the source, in the range's own units.
 
-    The rest of the range is padding: the local share is padded to the agreed slot count, and the
-    padded tail is written as zeros instead of read out of the source.  For a block codec the count
-    must land on a block boundary, which ``_units`` checks.
+    The rest of the range is padding: the local share is padded to the agreed slot count and the
+    tail is written as zeros instead of read out of the source.
     """
     lanes = slice_entry.get("valid_lanes")
     if lanes is None:
@@ -395,16 +498,6 @@ def _valid_count(slice_entry: dict, requested: int, world: int, rank: int) -> in
     _require(len(lanes) == world,
              f"slice {slice_entry['tensor']}: valid_lanes has {len(lanes)} entries for a world of {world}")
     return int(lanes[rank])
-
-
-def _scale_range(source_extent: int, scale_extent: int, start: int, end: int, block_size) -> tuple[int, int]:
-    """Map a codes cut onto the scale tensor that describes it: one scale per block, or one per item."""
-    if scale_extent in (source_extent, end - start):
-        return start, end
-    if block_size and source_extent == scale_extent * int(block_size):
-        return start // int(block_size), end // int(block_size)
-    raise PlanError(f"a scale tensor of extent {scale_extent} cannot be mapped from a codes extent of "
-                    f"{source_extent} for a cut of [{start}, {end}) with block {block_size}")
 
 
 def _ranks_of(slice_entry: dict, world: int) -> list[int]:
@@ -417,37 +510,62 @@ def _ranks_of(slice_entry: dict, world: int) -> list[int]:
     return list(range(world))
 
 
+def _cross_check_plan_fields(slice_entry: dict, tensor: dict, layout: dict, axis: int, start: int,
+                             end: int) -> None:
+    """Use what the plan declares as a second opinion on the inventory, not as a free pass."""
+    declared_stride = slice_entry.get("byte_row_stride")
+    if declared_stride is not None:
+        _require(int(declared_stride) == layout["row_bytes"],
+                 f"slice {slice_entry['tensor']}: the plan declares a row stride of {declared_stride} bytes and the "
+                 f"inventory's sizes give {layout['row_bytes']}")
+    declared_block = slice_entry.get("block_size")
+    if declared_block is not None:
+        _require(int(declared_block) == (layout["block_size"] or 0),
+                 f"slice {slice_entry['tensor']}: the plan says block size {declared_block} and the inventory says "
+                 f"{layout['block_size']}")
+    codec, dtype = slice_entry.get("codec"), tensor.get("dtype")
+    _require(codec in (None, dtype),
+             f"slice {slice_entry['tensor']}: plan codec {codec!r} is not the source dtype {dtype!r}; this pack "
+             f"copies codes, it does not requantize them to make a cut fit")
+    _require(slice_entry.get("family") in (None, tensor.get("family")),
+             f"slice {slice_entry['tensor']}: family {slice_entry.get('family')!r} is not the inventory family "
+             f"{tensor.get('family')!r}")
+    _require(slice_entry.get("global_shape") is None
+             or [int(x) for x in slice_entry["global_shape"]] == layout["shape"],
+             f"slice {slice_entry['tensor']}: global_shape {slice_entry.get('global_shape')} is not the inventory "
+             f"shape {layout['shape']}")
+    local_shape = slice_entry.get("local_shape")
+    if local_shape is not None:
+        local_shape = [int(x) for x in local_shape]
+        _require(len(local_shape) == len(layout["shape"]),
+                 f"slice {slice_entry['tensor']}: local_shape {local_shape} does not describe a tensor of rank "
+                 f"{len(layout['shape'])}")
+        _require(local_shape[axis] == end - start,
+                 f"slice {slice_entry['tensor']}: local_shape {local_shape} says {local_shape[axis]} items on the "
+                 f"cut axis and the range is {end - start}")
+        for other, (local, global_extent) in enumerate(zip(local_shape, layout["shape"])):
+            if other != axis:
+                _require(local == global_extent,
+                         f"slice {slice_entry['tensor']}: local_shape {local_shape} shrinks axis {other} to {local} "
+                         f"of {global_extent}; a slice cuts one axis and takes the rest whole")
+    cut_unit = slice_entry.get("cut_unit")
+    if isinstance(cut_unit, int) and cut_unit > 1:
+        _require(start % cut_unit == 0 and end % cut_unit == 0,
+                 f"slice {slice_entry['tensor']}: cut [{start}, {end}) does not land on the plan's own cut unit of "
+                 f"{cut_unit}")
+
+
 def segments_for_slice(slice_entry: dict, tensors: dict[str, dict], sizes: dict[str, int],
                        world: int) -> list[Segment]:
     """Every byte run one slice contributes, per rank, with padding made explicit."""
     name = slice_entry["tensor"]
     _require(name in tensors, f"the plan slices an unknown tensor {name!r}")
     tensor = tensors[name]
-    _require(slice_entry.get("family") in (None, tensor.get("family")),
-             f"slice {name}: family {slice_entry.get('family')!r} is not the inventory family "
-             f"{tensor.get('family')!r}")
-    codec, dtype = slice_entry.get("codec"), tensor.get("dtype")
-    _require(codec in (None, dtype),
-             f"slice {name}: plan codec {codec!r} is not the source dtype {dtype!r}; this pack copies codes, it "
-             f"does not requantize them to make a cut fit")
-
+    layout = _layout(dict(tensor, byte_length=_tensor_span(tensor)[1]))
     axis = int(slice_entry["axis"])
     start, end = (int(x) for x in slice_entry["range"])
     _require(0 <= start < end, f"slice {name}: empty or reversed range [{start}, {end})")
-    declared_shape = slice_entry.get("global_shape")
-    _require(declared_shape is None or [int(x) for x in declared_shape] == [int(x) for x in tensor["shape"]],
-             f"slice {name}: global_shape {declared_shape} is not the inventory shape {tensor['shape']}")
-
-    shape = [int(x) for x in tensor["shape"]]
-    local_shape = slice_entry.get("local_shape")
-    requested = end - start
-    if local_shape is not None:
-        local_shape = [int(x) for x in local_shape]
-        _require(len(local_shape) == len(shape),
-                 f"slice {name}: local_shape {local_shape} does not describe a tensor of rank {len(shape)}")
-        on_axis = local_shape[0] if (len(shape) == 1 or axis == 0) else local_shape[-1]
-        _require(on_axis == requested,
-                 f"slice {name}: local_shape {local_shape} says {on_axis} items and the range is {requested}")
+    _cross_check_plan_fields(slice_entry, tensor, layout, axis, start, end)
 
     rel = tensor["file"]
     _require(rel in sizes, f"slice {name}: tensor file {rel!r} is not among the inventory source files")
@@ -457,27 +575,40 @@ def segments_for_slice(slice_entry: dict, tensors: dict[str, dict], sizes: dict[
 
     out: list[Segment] = []
     for rank in _ranks_of(slice_entry, world):
-        valid = _valid_count(slice_entry, requested, world, rank)
-        _require(0 <= valid <= requested,
-                 f"slice {name}: rank {rank} valid_lanes {valid} outside a range of {requested} items")
-        for offset, length in _runs(tensor, axis, base, start, start + valid):
-            _check_inside(rel, file_size, offset, length, f"tensor {name}")
-            out.append(Segment(tensor=name, kind="codes", rank=rank, source_path=rel, source_offset=offset,
-                               source_length=length, dest_offset=0, scale_of=None))
-        if valid < requested:
-            # Padding is what the local range promises and the source does not have: whole units
-            # of the same cut, so it lands as zeros at the end of the rank's share.
-            _, full_count, unit, _ = _units(tensor, axis, start, start + requested)
-            _, valid_count, _, _ = _units(tensor, axis, start, start + valid)
-            _require(full_count > valid_count,
-                     f"slice {name}: rank {rank} valid_lanes {valid} is not a whole number of cut units")
+        valid = _valid_count(slice_entry, end - start, world, rank)
+        _require(0 <= valid <= end - start,
+                 f"slice {name}: rank {rank} valid_lanes {valid} outside a range of {end - start} items")
+        offset, run_bytes, levels = _cut(layout, axis, start, start + valid, name)
+        segment = Segment(tensor=name, kind="codes", rank=rank, source_path=rel, source_offset=base + offset,
+                          run_bytes=run_bytes, pattern=levels, dest_offset=0, scale_of=None)
+        _check_inside(rel, file_size, segment.source_offset, segment.last_end() - segment.source_offset,
+                      f"tensor {name} rank {rank}")
+        out.append(segment)
+        if valid < end - start:
+            full_offset, full_run, full_levels = _cut(layout, axis, start, end, name)
+            full = Segment(tensor=name, kind="codes", rank=rank, source_path=rel, source_offset=base + full_offset,
+                           run_bytes=full_run, pattern=full_levels, dest_offset=0, scale_of=None)
+            _require(axis != 0 or layout["block_axis"] is None,
+                     f"slice {name}: rank {rank} has a short share of the contiguous axis, and a part-block tail is "
+                     f"not a defined padding; only whole-row shares may be padded")
+            pad = full.source_length - segment.source_length
+            _require(pad > 0, f"slice {name}: rank {rank} padding came out as {pad} bytes")
             out.append(Segment(tensor=name, kind="padding", rank=rank, source_path=None, source_offset=None,
-                               source_length=(full_count - valid_count) * unit, dest_offset=0, scale_of=None))
+                               run_bytes=pad, pattern=(), dest_offset=0, scale_of=None))
 
-    ref = slice_entry.get("scale_ref")
-    if ref:
+    if slice_entry.get("scale_ref"):
         out.extend(_scale_segments(slice_entry, tensors, sizes, world, axis, start, end))
     return out
+
+
+def _scale_range(source_extent: int, scale_extent: int, start: int, end: int, block_size) -> tuple[int, int]:
+    """Map a codes cut onto the scale tensor that describes it: one scale per block, or one per item."""
+    if scale_extent in (source_extent, end - start):
+        return start, end
+    if block_size and source_extent == scale_extent * int(block_size):
+        return start // int(block_size), end // int(block_size)
+    raise PlanError(f"a scale tensor of extent {scale_extent} cannot be mapped from a codes extent of "
+                    f"{source_extent} for a cut of [{start}, {end}) with block {block_size}")
 
 
 def _scale_segments(slice_entry: dict, tensors: dict[str, dict], sizes: dict[str, int], world: int,
@@ -487,9 +618,12 @@ def _scale_segments(slice_entry: dict, tensors: dict[str, dict], sizes: dict[str
     name = slice_entry["tensor"]
     _require(ref in tensors, f"slice {name}: scale_ref {ref!r} is not an inventory tensor")
     codes, scale = tensors[name], tensors[ref]
-    source_extent = int(codes["shape"][axis]) if axis < len(codes["shape"]) else int(codes["shape"][-1])
-    scale_axis = axis if axis < len(scale["shape"]) else len(scale["shape"]) - 1
-    s_start, s_end = _scale_range(source_extent, int(scale["shape"][scale_axis]), start, end, codes.get("block_size"))
+    codes_layout = _layout(dict(codes, byte_length=_tensor_span(codes)[1]))
+    scale_layout = _layout(dict(scale, byte_length=_tensor_span(scale)[1]))
+    source_extent = codes_layout["shape"][axis] if axis < len(codes_layout["shape"]) else codes_layout["shape"][-1]
+    scale_axis = axis if axis < len(scale_layout["shape"]) else len(scale_layout["shape"]) - 1
+    s_start, s_end = _scale_range(source_extent, scale_layout["shape"][scale_axis], start, end,
+                                  codes_layout["block_size"])
 
     rel = scale["file"]
     _require(rel in sizes, f"scale {ref}: file {rel!r} is not among the inventory source files")
@@ -499,10 +633,12 @@ def _scale_segments(slice_entry: dict, tensors: dict[str, dict], sizes: dict[str
 
     out: list[Segment] = []
     for rank in _ranks_of(slice_entry, world):
-        for offset, length in _runs(scale, scale_axis, base, s_start, s_end):
-            _check_inside(rel, file_size, offset, length, f"scale {ref} for {name}")
-            out.append(Segment(tensor=ref, kind="scales", rank=rank, source_path=rel, source_offset=offset,
-                               source_length=length, dest_offset=0, scale_of=name))
+        offset, run_bytes, levels = _cut(scale_layout, scale_axis, s_start, s_end, ref)
+        segment = Segment(tensor=ref, kind="scales", rank=rank, source_path=rel, source_offset=base + offset,
+                          run_bytes=run_bytes, pattern=levels, dest_offset=0, scale_of=name)
+        _check_inside(rel, file_size, segment.source_offset, segment.last_end() - segment.source_offset,
+                      f"scale {ref} for {name} rank {rank}")
+        out.append(segment)
     return out
 
 
@@ -514,53 +650,65 @@ def _assign_dest_offsets(segments: Sequence[Segment]) -> list[Segment]:
         start = cursor.get(segment.rank, 0)
         placed.append(Segment(tensor=segment.tensor, kind=segment.kind, rank=segment.rank,
                               source_path=segment.source_path, source_offset=segment.source_offset,
-                              source_length=segment.source_length, dest_offset=start, scale_of=segment.scale_of))
+                              run_bytes=segment.run_bytes, pattern=segment.pattern, dest_offset=start,
+                              scale_of=segment.scale_of))
         cursor[segment.rank] = start + segment.source_length
     return placed
 
 
-def _check_vocabulary(plan_geometry: dict, slices: Sequence[dict], world: int) -> dict:
+def _check_vocabulary(plan_geometry: dict, slices: Sequence[dict], tensors: dict[str, dict],
+                    world: int) -> dict:
     """The logical vocabulary stays whole.
 
-    Rows may be split across ranks (a row-sharded embedding) or replicated whole, but no row may
-    be dropped to make the model load and no row may appear twice.  So per vocabulary family, the
-    ranges in the plan must cover ``n_vocab`` exactly once, across the whole pack.
+    Rows may be split across ranks (a row-sharded embedding) or carried whole, but no row may be
+    dropped to make the model load and no row may be lost between ranks.  Only the axis that really
+    carries the vocabulary counts: for a [n_embd, n_vocab] embedding that is the second axis, so a
+    rank that takes the whole tensor and splits the *width* still holds every row.
     """
     n_vocab = int(plan_geometry.get("n_vocab", 0) or 0)
-    families = sorted({str(entry["family"]) for entry in slices if entry.get("family") in VOCABULARY_FAMILIES})
-    for family in families:
-        entries = [entry for entry in slices if str(entry.get("family")) == family]
-        whole = [entry for entry in entries if entry.get("replicated")]
-        if whole:
-            for entry in whole:
-                start, end = (int(x) for x in entry["range"])
-                _require(n_vocab == 0 or (start == 0 and end == n_vocab),
-                         f"{family}: a replicated vocabulary slice covers [{start}, {end}) of {n_vocab} rows, which "
-                         f"trims the logical vocabulary")
+    modes: list[str] = []
+    for name in sorted({entry["tensor"] for entry in slices
+                        if entry.get("family") in VOCABULARY_FAMILIES}):
+        tensor = tensors.get(name)
+        _require(tensor is not None, f"vocabulary tensor {name!r} is not in the inventory")
+        shape = [int(x) for x in tensor.get("shape", [])]
+        vocab_axis = next((axis for axis, extent in enumerate(shape) if n_vocab and extent == n_vocab), None)
+        if vocab_axis is None:
+            modes.append(f"{name}: no axis of {shape} is the vocabulary, so nothing to trim")
             continue
-        covered: list[tuple[int, int]] = []
+        entries = [entry for entry in slices if entry["tensor"] == name]
+        whole_ranks = set()
+        ranges: list[tuple[int, int]] = []
         for entry in entries:
-            _ranks_of(entry, world)          # a vocab slice without a rank and not replicated is unclear
-            covered.append((int(entry["range"][0]), int(entry["range"][1])))
+            ranks = _ranks_of(entry, world)
+            start, end = (int(x) for x in entry["range"])
+            if int(entry["axis"]) != vocab_axis or (start == 0 and end == n_vocab):
+                whole_ranks.update(ranks)
+            else:
+                ranges.append((start, end))
+        if whole_ranks:
+            modes.append(f"{name}: the whole vocabulary ({n_vocab} rows) is carried by rank "
+                         f"{sorted(whole_ranks)[0]}{'...' if len(whole_ranks) > 1 else ''}")
+            continue
         cursor = 0
-        for start, end in sorted(covered):
+        for start, end in sorted(ranges):
             _require(start == cursor,
-                     f"{family}: the vocabulary rows leave a gap at {cursor} (the next range starts at {start}); this "
+                     f"{name}: the vocabulary rows leave a gap at {cursor} (the next range starts at {start}); this "
                      f"pack copies rows, it does not drop them to make the model load")
             cursor = end
         _require(n_vocab == 0 or cursor == n_vocab,
-                 f"{family}: the vocabulary rows reach {cursor} of {n_vocab}, which trims the logical vocabulary to "
-                 f"make the model load")
-    return {"logical_n_vocab": n_vocab or None, "families": families, "trimmed": False,
-            "note": "every vocabulary row of the plan is present exactly once across the pack"}
+                 f"{name}: the vocabulary rows reach {cursor} of {n_vocab}, which trims the logical vocabulary to make "
+                 f"the model load")
+        modes.append(f"{name}: {n_vocab} rows are split across the ranks and add up exactly")
+    return {"logical_n_vocab": n_vocab or None, "families": sorted(VOCABULARY_FAMILIES), "trimmed": False,
+            "note": modes or ["no vocabulary-row tensor in the plan, so there is nothing to trim"]}
 
 
 def _check_source_lock(inventory: dict, plan: dict) -> None:
     lock = plan.get("source_lock") or {}
     recorded = lock.get("inventory_hash")
     if recorded:
-        variants = inventory_hash_variants(inventory)
-        _require(recorded in variants,
+        _require(recorded in inventory_hash_variants(inventory),
                  f"the plan is locked to inventory {recorded} but the inventory reads "
                  f"{inventory_hash(inventory)}", SourceError)
     lock_repo, inv_repo = lock.get("repo"), (inventory.get("source") or {}).get("repo")
@@ -594,12 +742,14 @@ def build_segments(source, plan, *, source_root: Path | None = None
         segments.extend(segments_for_slice(entry, tensors, sizes, world))
 
     geometry = plan_doc.get("geometry") or inventory.get("geometry") or {}
-    vocabulary = _check_vocabulary(geometry, slices, world)
+    vocabulary = _check_vocabulary(geometry, slices, tensors, world)
     placed = _assign_dest_offsets(segments)
 
     rank_bytes = {rank: 0 for rank in range(world)}
+    runs = 0
     for segment in placed:
         rank_bytes[segment.rank] += segment.source_length
+        runs += segment.run_count
     _require(all(value > 0 for value in rank_bytes.values()),
              "some rank gets no bytes at all, which is not a tensor-parallel layout")
 
@@ -621,6 +771,8 @@ def build_segments(source, plan, *, source_root: Path | None = None
         "memory": plan_doc.get("memory"),
         "activation": plan_doc.get("activation"),
         "segments": [segment.as_dict() for segment in placed],
+        "segment_count": len(placed),
+        "run_count": runs,
         "rank_files": None,
         "rank_bytes": {str(rank): rank_bytes[rank] for rank in sorted(rank_bytes)},
         "receipts": {},
@@ -637,6 +789,98 @@ def rank_view(manifest: dict, rank: int) -> list[dict]:
     """The source reads that make one rank's half of the model, in destination order."""
     return sorted((segment for segment in manifest["segments"] if segment["rank"] == rank),
                   key=lambda segment: segment["dest_offset"])
+
+
+# -------------------------------------------------------------- reading a pattern
+
+
+class _PatternReader:
+    """Hands out a segment's bytes in destination order, reading each source file forward.
+
+    A cut of the contiguous axis is one small piece per row, with a small gap between them: a
+    million pieces on a stacked expert.  Seeking per piece would be a million seeks, so rows are read
+    in blocks of whole rows and gathered in one copy (numpy when it is present, a plain loop when it
+    is not), and a sparse segment costs the few seeks it always cost.
+    """
+
+    def __init__(self, path: Path, chunk_bytes: int = CHUNK_BYTES):
+        self.path = path
+        self.handle = open(path, "rb")
+        self.chunk_bytes = chunk_bytes
+        self.window_start = 0
+        self.window = b""
+
+    def close(self) -> None:
+        self.handle.close()
+
+    def _slice(self, offset: int, length: int) -> bytes:
+        if length == 0:
+            return b""
+        if self.window_start <= offset and offset + length <= self.window_start + len(self.window):
+            return self.window[offset - self.window_start: offset - self.window_start + length]
+        want = max(length, self.chunk_bytes)
+        self.handle.seek(offset)
+        data = self.handle.read(want)
+        if len(data) < length:
+            raise SourceError(f"source {self.path} gave up short at offset {offset}: wanted {length}, got "
+                              f"{len(data)}")
+        self.window_start = offset
+        self.window = data
+        return data[:length]
+
+    def pieces(self, segment: Segment) -> Iterator[bytes]:
+        """Byte strings that fill the segment's destination block, in order, each at most chunk-sized."""
+        if segment.source_path is None:                    # padding: the caller writes zeros
+            return
+        if not segment.pattern:
+            produced = 0
+            while produced < segment.source_length:
+                length = min(self.chunk_bytes, segment.source_length - produced)
+                yield self._slice(segment.source_offset + produced, length)
+                produced += length
+            return
+        if len(segment.pattern) == 1 and segment.pattern[0][1] > segment.run_bytes:
+            yield from self._strided(segment)
+            return
+        buffer = bytearray()
+        for offset, length in segment.runs():
+            if length > self.chunk_bytes:
+                if buffer:
+                    yield bytes(buffer)
+                    buffer = bytearray()
+                yield self._slice(offset, length)
+                continue
+            if len(buffer) + length > self.chunk_bytes:
+                yield bytes(buffer)
+                buffer = bytearray()
+            buffer += self._slice(offset, length)
+        if buffer:
+            yield bytes(buffer)
+
+    def _strided(self, segment: Segment) -> Iterator[bytes]:
+        """One constant-stride level: read whole rows, hand back the owned prefix of each row."""
+        count, stride = segment.pattern[0]
+        run_bytes = segment.run_bytes
+        rows_per_read = max(1, self.chunk_bytes // stride)
+        done = 0
+        while done < count:
+            rows = min(rows_per_read, count - done)
+            start = segment.source_offset + done * stride
+            # Only the owned prefix of each row is wanted, so the read asks for the last row's prefix and not
+            # for a whole stride: a cut that starts inside a row ends past the last stride the file holds.
+            whole = rows - 1
+            block = self._slice(start, whole * stride + run_bytes)
+            tail = block[whole * stride:]
+            if _np is not None:
+                head = _np.frombuffer(block[:whole * stride], dtype=_np.uint8).reshape(whole, stride)[:, :run_bytes]
+                yield head.copy().tobytes() + tail
+            else:
+                yield b"".join(block[row * stride: row * stride + run_bytes] for row in range(whole)) + tail
+            done += rows
+
+
+def _writers(paths: dict[int, Path]) -> dict[int, object]:
+    return {rank: open(path, "wb") for rank, path in paths.items()}
 
 
 # -------------------------------------------------------------------------- writing
@@ -664,13 +908,13 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _read_at(path: Path, offset: int, length: int) -> bytes:
-    with open(path, "rb") as handle:
-        handle.seek(offset)
-        data = handle.read(length)
-    if len(data) != length:
-        raise SourceError(f"source {path} gave up short at offset {offset}: wanted {length}, got {len(data)}")
-    return data
+def _readers_for(segments: Sequence[Segment], inv_root: Path, src_root: Path | None) -> dict[str, _PatternReader]:
+    readers: dict[str, _PatternReader] = {}
+    for segment in segments:
+        if segment.source_path is None or segment.source_path in readers:
+            continue
+        readers[segment.source_path] = _PatternReader(resolve_source_file(inv_root, segment.source_path, src_root))
+    return readers
 
 
 def prepare_tp_pack(source, plan, output, materialize: bool = False, *,
@@ -705,26 +949,35 @@ def prepare_tp_pack(source, plan, output, materialize: bool = False, *,
 
     staging = output.parent / f".{output.name}.staging-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     (staging / "ranks").mkdir(parents=True)
+    readers: dict[str, _PatternReader] = {}
+    handles: dict[int, object] = {}
     try:
-        handles: dict[int, object] = {}
+        readers = _readers_for(segments, inv_root, src_root)
+        handles = _writers({rank: staging / "ranks" / f"rank{rank}.bin"
+                           for rank in range(manifest["world"])})
         written = 0
         for index, segment in enumerate(segments):
             if progress is not None:
                 progress(index, segment.as_dict())
-            handle = handles.get(segment.rank)
-            if handle is None:
-                handle = open(staging / "ranks" / f"rank{segment.rank}.bin", "wb")
-                handles[segment.rank] = handle
+            handle = handles[segment.rank]
             if segment.source_path is None:
-                handle.write(b"\0" * segment.source_length)   # padding: no source byte behind it
+                # padding: no source byte behind it, and verify expects zeros of this exact size
+                remaining = segment.source_length
+                while remaining:
+                    block = handle.write(b"\0" * min(remaining, CHUNK_BYTES))
+                    remaining -= block
             else:
-                path = resolve_source_file(inv_root, segment.source_path, src_root)
-                handle.write(_read_at(path, int(segment.source_offset), segment.source_length))
+                for piece in readers[segment.source_path].pieces(segment):
+                    handle.write(piece)
             written += segment.source_length
         for handle in handles.values():
             handle.flush()
             os.fsync(handle.fileno())
             handle.close()
+        handles = {}
+        for reader in readers.values():
+            reader.close()
+        readers = {}
         if written != needed:
             raise PackError(f"wrote {written} bytes and planned {needed}")
 
@@ -734,39 +987,40 @@ def prepare_tp_pack(source, plan, output, materialize: bool = False, *,
             for rank in range(manifest["world"])
         }
 
-        # The receipt is the comparison itself: read every copied run back out of the rank file
-        # and put it next to the source bytes again.
+        # The receipt is the comparison itself: every copied run is read back out of the rank file
+        # and put next to the source bytes again.
         compared = 0
         compared_bytes = 0
-        source_handles: dict[str, object] = {}
-        rank_handles = {rank: open(staging / "ranks" / f"rank{rank}.bin", "rb") for rank in range(manifest["world"])}
+        readers = _readers_for(segments, inv_root, src_root)
+        rank_handles = {rank: open(staging / "ranks" / f"rank{rank}.bin", "rb")
+                        for rank in range(manifest["world"])}
         try:
             for segment in segments:
                 if segment.source_path is None:
                     continue
-                path = resolve_source_file(inv_root, segment.source_path, src_root)
-                if str(path) not in source_handles:
-                    source_handles[str(path)] = open(path, "rb")
-                src = source_handles[str(path)]
-                src.seek(segment.source_offset)
-                want = src.read(segment.source_length)
-                dst = rank_handles[segment.rank]
-                dst.seek(segment.dest_offset)
-                got = dst.read(segment.source_length)
-                if want != got:
-                    raise PackMismatch(f"rank {segment.rank} {segment.tensor} kind={segment.kind}: source bytes "
-                                       f"[{segment.source_offset}, {segment.source_offset + segment.source_length}) "
-                                       f"are not what the rank file holds at [{segment.dest_offset}, "
-                                       f"{segment.dest_offset + segment.source_length})")
+                reader = readers[segment.source_path]
+                dest = rank_handles[segment.rank]
+                dest.seek(segment.dest_offset)
+                position = 0
+                for piece in reader.pieces(segment):
+                    got = dest.read(len(piece))
+                    if got != piece:
+                        raise PackMismatch(
+                            f"rank {segment.rank} {segment.tensor} kind={segment.kind}: source bytes at "
+                            f"{segment.source_offset} + {position} are not what the rank file holds at "
+                            f"{segment.dest_offset + position}")
+                    position += len(piece)
                 compared += 1
                 compared_bytes += segment.source_length
         finally:
-            for handle in source_handles.values():
-                handle.close()
             for handle in rank_handles.values():
                 handle.close()
+            for reader in readers.values():
+                reader.close()
         manifest["receipts"]["byte_equality"] = {
-            "status": "verified", "runs": compared, "bytes": compared_bytes,
+            "status": "verified", "segments": compared, "runs": sum(s.run_count for s in segments
+                                                                    if s.source_path is not None),
+            "bytes": compared_bytes,
             "note": "every copied block and scale was read back out of the rank file and compared to the source",
         }
 
@@ -799,6 +1053,16 @@ def prepare_tp_pack(source, plan, output, materialize: bool = False, *,
         _fsync_dir(output.parent)
         return manifest
     except BaseException:
+        for handle in handles.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        for reader in readers.values():
+            try:
+                reader.close()
+            except Exception:
+                pass
         shutil.rmtree(staging, ignore_errors=True)
         raise
 
@@ -869,11 +1133,12 @@ def verify_tp_pack(source, output, *, source_root=None, hash_source_files: bool 
     runs_compared = 0
     bytes_compared = 0
     padding_checked = 0
+    readers: dict[str, _PatternReader] = {}
+    rank_handles: dict[int, object] = {}
     if byte_equality and not mismatches:
-        source_handles: dict[str, object] = {}
-        rank_handles: dict[int, object] = {}
         broke_early = False
         try:
+            readers = _readers_for(segments, inv_root, src_root)
             for segment in segments:
                 if segment.source_path is None:
                     continue
@@ -882,9 +1147,9 @@ def verify_tp_pack(source, output, *, source_root=None, hash_source_files: bool 
                     mismatches.append(f"segment {segment.tensor} names a file the inventory does not list: {rel}")
                     broke_early = True
                     break
-                if int(segment.source_offset) + segment.source_length > sizes[rel]:
-                    mismatches.append(f"segment {segment.tensor} reads outside {rel}: [{segment.source_offset}, "
-                                      f"{int(segment.source_offset) + segment.source_length}) of {sizes[rel]} bytes")
+                if segment.last_end() > sizes[rel]:
+                    mismatches.append(f"segment {segment.tensor} reads outside {rel}: its last byte is "
+                                      f"{segment.last_end()} and the file holds {sizes[rel]}")
                     broke_early = True
                     break
                 if segment.rank not in rank_handles:
@@ -894,30 +1159,26 @@ def verify_tp_pack(source, output, *, source_root=None, hash_source_files: bool 
                         broke_early = True
                         break
                     rank_handles[segment.rank] = open(rank_path, "rb")
-                path = resolve_source_file(inv_root, rel, src_root)
-                if str(path) not in source_handles:
-                    source_handles[str(path)] = open(path, "rb")
-                src = source_handles[str(path)]
-                src.seek(segment.source_offset)
-                want = src.read(segment.source_length)
-                dst = rank_handles[segment.rank]
-                dst.seek(segment.dest_offset)
-                got = dst.read(segment.source_length)
-                if want != got:
-                    mismatches.append(f"rank {segment.rank} {segment.tensor} kind={segment.kind} scale_of="
-                                      f"{segment.scale_of}: source [{segment.source_offset}, "
-                                      f"{int(segment.source_offset) + segment.source_length}) of {rel} is not the "
-                                      f"rank file at [{segment.dest_offset}, "
-                                      f"{int(segment.dest_offset) + segment.source_length})")
-                    broke_early = True
+                dest = rank_handles[segment.rank]
+                dest.seek(segment.dest_offset)
+                position = 0
+                for piece in readers[rel].pieces(segment):
+                    if dest.read(len(piece)) != piece:
+                        mismatches.append(f"rank {segment.rank} {segment.tensor} kind={segment.kind} scale_of="
+                                          f"{segment.scale_of}: source at {segment.source_offset} + {position} of "
+                                          f"{rel} is not the rank file at {segment.dest_offset + position}")
+                        broke_early = True
+                        break
+                    position += len(piece)
+                if broke_early:
                     break
-                runs_compared += 1
+                runs_compared += segment.run_count
                 bytes_compared += segment.source_length
         finally:
-            for handle in source_handles.values():
-                handle.close()
             for handle in rank_handles.values():
                 handle.close()
+            for reader in readers.values():
+                reader.close()
         if runs_compared:
             checked.append(f"byte-for-byte reconstruction against the source: {runs_compared} runs, "
                            f"{bytes_compared} bytes of codes and scales, each read at its recorded offsets")
@@ -933,15 +1194,19 @@ def verify_tp_pack(source, output, *, source_root=None, hash_source_files: bool 
             rank_path = output / "ranks" / f"rank{rank}.bin"
             if not rank_path.is_file():
                 continue
-            for segment in segments:
-                if segment.rank != rank or segment.kind != "padding":
-                    continue
-                with open(rank_path, "rb") as handle:
+            with open(rank_path, "rb") as handle:
+                for segment in segments:
+                    if segment.rank != rank or segment.kind != "padding":
+                        continue
                     handle.seek(segment.dest_offset)
-                    blob = handle.read(segment.source_length)
-                if any(blob):
-                    mismatches.append(f"rank {rank} padding at dest offset {segment.dest_offset} is not zero")
-                padding_checked += 1
+                    remaining = segment.source_length
+                    while remaining:
+                        blob = handle.read(min(remaining, CHUNK_BYTES))
+                        if any(blob):
+                            mismatches.append(f"rank {rank} padding at dest offset {segment.dest_offset} is not zero")
+                            break
+                        remaining -= len(blob)
+                    padding_checked += 1
         if padding_checked:
             checked.append(f"padding runs are zero-filled and were not read from the source: {padding_checked} runs")
 
@@ -994,8 +1259,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--verify", action="store_true", help="verify a published pack instead of building one")
     parser.add_argument("--skip-source-hash", action="store_true", help="do not recompute the source sha256")
     parser.add_argument("--overwrite", action="store_true", help="replace a pack that is already published")
+    parser.add_argument("--quiet", action="store_true", help="no per-segment progress on stderr")
     parser.add_argument("--json", action="store_true", help="print the manifest or the report as JSON")
     args = parser.parse_args(argv)
+
+    def progress(index: int, segment: dict) -> None:
+        if args.quiet or args.json:
+            return
+        if index % 500 == 0:
+            print(f"  segment {index}: {segment['tensor']} rank {segment['rank']} "
+                  f"{segment['source_length']} bytes", file=sys.stderr, flush=True)
 
     try:
         if args.verify:
@@ -1006,7 +1279,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest = prepare_tp_pack(args.inventory, args.plan, args.output, materialize=args.materialize,
                                    source_root=args.source_root, overwrite=args.overwrite,
                                    hash_source_files=not args.skip_source_hash,
-                                   min_free_bytes=int(args.min_free_gib * 1024**3))
+                                   min_free_bytes=int(args.min_free_gib * 1024**3),
+                                   progress=progress)
     except PackError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
@@ -1015,8 +1289,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(manifest, indent=2, sort_keys=True))
     else:
         total = sum(int(value) for value in manifest["rank_bytes"].values())
-        print(f"{args.output}: {manifest['world']} ranks, {len(manifest['segments'])} runs, {total} bytes planned, "
-              f"materialized={manifest['materialized']}")
+        print(f"{args.output}: {manifest['world']} ranks, {manifest['segment_count']} segments, "
+              f"{manifest['run_count']} runs, {total} bytes, materialized={manifest['materialized']}")
+        for rank, value in sorted(manifest["rank_bytes"].items(), key=lambda kv: int(kv[0])):
+            print(f"  rank {rank}: {int(value) / 2**30:.2f} GiB")
         for line in manifest["not_verified"]:
             print(f"  not verified: {line}")
     return 0
