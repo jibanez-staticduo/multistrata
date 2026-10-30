@@ -2776,6 +2776,29 @@ if(STRATA_BUILD_DISTRIBUTED AND NOT STRATA_ENABLE_CUDA)
   message(FATAL_ERROR "STRATA_BUILD_DISTRIBUTED needs STRATA_ENABLE_CUDA=ON")
 endif()
 
+if(STRATA_BUILD_DISTRIBUTED)
+  # The device backend's one compile-only check: it names the NCCL C API and a real cudaStream_t, so it fails
+  # where the CPU contract tests cannot see.  It links no NCCL: the library is dlopen'ed at run time, and its
+  # provenance is a hash the operator approves, not a link-time dependency.
+  find_file(STRATA_NCCL_HEADER nccl.h PATHS ${STRATA_NCCL_INCLUDE_DIR} NO_DEFAULT_PATH)
+  if(NOT STRATA_NCCL_HEADER)
+    message(FATAL_ERROR "STRATA_BUILD_DISTRIBUTED needs -DSTRATA_NCCL_INCLUDE_DIR=<dir with the pinned nccl.h>")
+  endif()
+  get_filename_component(STRATA_NCCL_INCLUDE_DIR "${STRATA_NCCL_HEADER}" DIRECTORY)
+
+  # One translation unit: the probe includes src/distributed/nccl_transport.cpp, the same way the standalone
+  # nvcc command that first compiled this route does.  Listing the .cpp beside it would define the backend twice.
+  add_executable(strata-tp3-nccl-probe tests/distributed/nccl_backend_probe.cu)
+  target_compile_definitions(strata-tp3-nccl-probe PRIVATE STRATA_DISTRIBUTED_CUDA)
+  # The toolkit headers stay on the target so a later split of the probe into a .cu plus the .cpp compiled as C++
+  # does not lose the cudaStream_t route: a C++ target here does not get them by itself.
+  target_include_directories(strata-tp3-nccl-probe PRIVATE include src ${STRATA_NCCL_INCLUDE_DIR}
+                           ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(strata-tp3-nccl-probe PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME distributed_nccl_probe COMMAND strata-tp3-nccl-probe)
+  set_tests_properties(distributed_nccl_probe PROPERTIES LABELS "distributed;cuda")
+endif()
+
 if(STRATA_BUILD_DISTRIBUTED_TESTS)
   enable_testing()
   find_package(Threads REQUIRED)  # test_session drives three ranks in three threads over real loopback TCP
