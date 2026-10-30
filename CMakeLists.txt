@@ -2764,3 +2764,39 @@ if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND N
     target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
   endif()
 endif()
+
+# ---- TP3 distributed (experimental) ---------------------------------------
+# One Qwen model over three hosts, TP inside every layer.  Both options default OFF: the existing build gains
+# no distributed dependency and no changed execution path.  Nothing here names a CUDA or NCCL symbol except
+# through src/distributed/nccl_api.hpp, whose device implementation is still to come.
+option(STRATA_BUILD_DISTRIBUTED "EXPERIMENTAL: build the TP3 CUDA/NCCL device backend (docs/superpowers/)" OFF)
+option(STRATA_BUILD_DISTRIBUTED_TESTS "Build the TP3 transport CPU contract tests (no CUDA, no NCCL)" OFF)
+
+if(STRATA_BUILD_DISTRIBUTED AND NOT STRATA_ENABLE_CUDA)
+  message(FATAL_ERROR "STRATA_BUILD_DISTRIBUTED needs STRATA_ENABLE_CUDA=ON")
+endif()
+
+if(STRATA_BUILD_DISTRIBUTED_TESTS)
+  enable_testing()
+  find_package(Threads REQUIRED)  # test_session drives three ranks in three threads over real loopback TCP
+
+  # the shard plan: coverage, quantized-block boundaries and the global-activation contract (synthetic tensors)
+  add_executable(shard_plan_test tests/distributed/shard_plan_test.cpp)
+  target_include_directories(shard_plan_test PRIVATE include)
+  target_link_libraries(shard_plan_test PRIVATE strata_warnings)
+  add_test(NAME shard_plan_test COMMAND shard_plan_test)
+
+  # the collective contract at the boundary a caller calls: padded slots, aliasing, sequence order, one
+  # operation in flight, terminal failures.  Rules over a fake library boundary, no NCCL.
+  add_executable(test_transport_contract tests/distributed/test_transport_contract.cpp)
+  target_include_directories(test_transport_contract PRIVATE include src)
+  target_link_libraries(test_transport_contract PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME test_transport_contract COMMAND test_transport_contract)
+
+  # three ranks forming one session: the join protocol on a scripted channel, framing and sockets over real TCP
+  add_executable(test_session tests/distributed/test_session.cpp
+                             src/distributed/session.cpp src/distributed/control_tcp.cpp)
+  target_include_directories(test_session PRIVATE include)
+  target_link_libraries(test_session PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME test_session COMMAND test_session)
+endif()
