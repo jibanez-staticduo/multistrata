@@ -2822,4 +2822,13 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_include_directories(test_session PRIVATE include)
   target_link_libraries(test_session PRIVATE strata_warnings Threads::Threads)
   add_test(NAME test_session COMMAND test_session)
+
+  # the shard-aware projection primitives in their CPU scalar form: gate/up with the monolithic SwiGLU, a down
+  # partial at full width, the one reduction, a replicated term applied once, the padded gather, and the
+  # activation quantized once on the grid anchored at lane 0.  Expected values come from the monolithic path or
+  # from hand, never from the planner.  No CUDA, no NCCL, no framework.
+  add_executable(tp_projection_test tests/distributed/tp_projection_test.cpp)
+  target_include_directories(tp_projection_test PRIVATE include)
+  target_link_libraries(tp_projection_test PRIVATE strata_warnings)
+  add_test(NAME tp_projection_test COMMAND tp_projection_test)
 endif()
