@@ -19,8 +19,8 @@ __global__ void finish(float* y, int64_t n, int width, const float* scale, const
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) {
         float v = y[i];
-        if (scale) v *= *scale;
-        if (bias) v += bias[i % width];
+        if (scale) v = __fmul_rn(v, *scale);
+        if (bias) v = __fadd_rn(v, bias[i % width]);
         y[i] = v;
     }
 }

@@ -72,6 +72,7 @@ void unpack_gathered(const distributed::ActivationContract& contract, const floa
                      int rows, float* logical, void* stream);
 
 // Add one global scale and optional bias AFTER the all-reduce of partials.
+// Scale then bias round separately to FP32 (never contracted into an FMA).
 void finish_projection(float* reduced, int rows, int width, const float* scale,
                        const float* bias, void* stream);
 

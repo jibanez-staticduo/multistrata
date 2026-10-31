@@ -330,6 +330,11 @@ void exact_lane_selftest() {
     const float x = 1.f + std::ldexp(1.f, -23), y = 1.f - std::ldexp(1.f, -23);
     const volatile float rounded_product = x * y;
     require(std::fma(x, y, -1.f) != rounded_product - 1.f, "FMA counterexample disappeared");
+    const float finish_input = std::nextafter(1.f, 2.f), finish_bias = -.75f;
+    const volatile float finish_product = finish_input * .75f;
+    const float finish_separate = finish_product + finish_bias;
+    require(finish_separate != std::fma(finish_input, .75f, finish_bias),
+            "finish two-rounding counterexample disappeared");
     for (int type : {20, 42}) for (int width : {192, 640, 1024}) {
         const auto counts = width == 192 ? std::array<int,3>{64,64,64} :
                             width == 640 ? std::array<int,3>{256,192,192} : std::array<int,3>{384,320,320};
@@ -352,6 +357,7 @@ void exact_lane_selftest() {
         }
     }
     std::puts("exact-lane-host-ownership-and-FMA-selftest passed GPU_NOT_RUN");
+    std::puts("finish-host-separate-rounding-vs-FMA-selftest passed GPU_NOT_RUN");
 }
 Sample sample_real(const Options& o) {
     std::vector<Tensor> all;
@@ -383,6 +389,14 @@ __global__ void fill_parts(const float* source, float* parts, int n, int width) 
         const int token = i / (10 * width), expert = (i / width) % 10, lane = i % width;
         parts[i] = expert == 8 ? 0.f : source[token * width + lane];
     }
+}
+
+// Independent scalar policy control. Native finish applies optional scale and
+// bias as separate branches/roundings (FMUL then FADD in the compiled kernel).
+// Explicit intrinsics prevent the test compiler from contracting this oracle.
+__global__ void finish_reference(const float* input, float* output, const float* bias, int n, int width) {
+    const int i = int(blockIdx.x) * blockDim.x + int(threadIdx.x);
+    if (i < n) output[i] = __fadd_rn(__fmul_rn(input[i], .75f), bias[i % width]);
 }
 
 void tiny_scalar_probe() {
@@ -578,7 +592,15 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
     route.upload(rw); shared.upload(sh); bias.upload(bs); scale.upload({.75f});
     auto projected_ref = oracle.read();
     for (std::size_t i = 0; i < projected_ref.size(); ++i)
-        projected_ref[i] = std::fma(projected_ref[i], .75f, bs[i % width]);
+    {
+        const volatile float rounded_product = projected_ref[i] * .75f;
+        projected_ref[i] = rounded_product + bs[i % width];
+    }
+    Device<float> finish_control(oracle.size);
+    finish_reference<<<unsigned((oracle.size + 255) / 256), 256, 0, stream.s>>>(
+        oracle.p, finish_control.p, bias.p, int(oracle.size), width);
+    ck(cudaGetLastError()); ck(cudaStreamSynchronize(stream.s));
+    metrics.compare("finish-independent-device-vs-cpu-rounding-control", projected_ref, finish_control.read(), true);
     for (std::size_t i = 0; i < roundoff.error.size(); ++i) {
         roundoff.norm[i] = .75 * roundoff.norm[i] + std::abs(double(bs[i % width]));
         roundoff.error[i] = .75 * roundoff.error[i] + 2 * gamma(2) * roundoff.norm[i];
@@ -587,7 +609,7 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
     ck(cudaStreamSynchronize(stream.s));
     metrics.compare("expert-scale-bias-after-rank-sum", projected_ref, reduced.read(), metrics.o.exact_lane,
                     metrics.o.exact_lane ? nullptr : &roundoff.error, metrics.o.exact_lane ? nullptr : &roundoff.norm);
-    oracle.upload(projected_ref);
+    ck(cudaMemcpyAsync(oracle.p, finish_control.p, oracle.size * sizeof(float), cudaMemcpyDeviceToDevice, stream.s));
     fill_parts<<<unsigned((n + 255) / 256), 256, 0, stream.s>>>(reduced.p, parts.p, n, width);
     fill_parts<<<unsigned((n + 255) / 256), 256, 0, stream.s>>>(oracle.p, reference_parts.p, n, width);
     bool alias_rejected = false;
