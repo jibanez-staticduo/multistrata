@@ -29,6 +29,8 @@ class CanonicalWriter {
 
 Failure canonical_step_command(const StepCommand& command, std::string& out) {
     out.clear();
+    if (static_cast<uint32_t>(command.phase) > static_cast<uint32_t>(StepPhase::rollback))
+        return bad("unknown step phase");
     CanonicalWriter w;
     bool valid = w.field("strata-model-worker-command-v1") && w.field(command.session) &&
                  w.field(command.request) && w.number(command.slot) && w.number(command.step) &&
@@ -52,14 +54,17 @@ Failure canonical_step_command(const StepCommand& command, std::string& out) {
 }
 
 Failure model_forward_schedule(const StepCommand& command, const core::ModelGeometry& g, uint64_t sequence,
-                               std::vector<ScheduledCollective>& out) {
+                               std::vector<ScheduledCollective>& out, bool batched_expert_collectives) {
     out.clear();
+    if (static_cast<uint32_t>(command.phase) > static_cast<uint32_t>(StepPhase::rollback))
+        return bad("unknown model step phase");
     if (g.n_layers != 48 || g.n_embd != 2560 || g.qsa_interval != 4 || g.n_expert_used != 10 ||
         g.n_ff != 640 || g.ssm_state_size != 128 || g.ssm_k_heads != 16 || g.ssm_v_heads != 48 ||
         g.n_head != 24 || g.head_dim != 256) return bad("unsupported C1 model schedule geometry");
     if (command.phase != StepPhase::prefill && command.phase != StepPhase::decode) return {};
     if (command.tokens.empty() || command.tokens.size() > 8) return bad("model command supports one to eight tokens");
-    const uint64_t count = uint64_t(command.tokens.size()) * uint64_t(g.n_layers) * uint64_t(2 + 2 * g.n_expert_used);
+    const uint64_t count = uint64_t(command.tokens.size()) * uint64_t(g.n_layers) *
+                           uint64_t(batched_expert_collectives ? 4 : 2 + 2 * g.n_expert_used);
     if (sequence == 0 || count > std::numeric_limits<uint64_t>::max() - sequence) return bad("model schedule sequence exhausted");
     auto append = [&](int64_t layer, std::string stage, std::vector<uint64_t> valid) {
         CollectiveDescriptor d;
@@ -78,7 +83,13 @@ Failure model_forward_schedule(const StepCommand& command, const core::ModelGeom
             append(layer, qsa ? "qsa_gated_reference" : "gdn_values",
                    qsa ? std::vector<uint64_t>{2048, 2048, 2048} : std::vector<uint64_t>{2304, 1920, 1920});
             append(layer, qsa ? "qsa_output_rank_zero_reference" : "mixer", {});
-            for (int64_t slot = 0; slot < g.n_expert_used; ++slot) {
+            if (batched_expert_collectives) {
+                // Transport includes each row's padding; logical valid counts remain 256/192/192.
+                const uint64_t hidden = uint64_t(g.n_expert_used) * 256;
+                const uint64_t lanes = uint64_t(g.n_expert_used) * uint64_t(g.n_embd) * 128;
+                append(layer, "expert_hidden_batch", {hidden, hidden, hidden});
+                append(layer, "expert_lane_terms_batch", {lanes, lanes, lanes});
+            } else for (int64_t slot = 0; slot < g.n_expert_used; ++slot) {
                 append(layer, "expert_hidden_" + std::to_string(slot), {256, 192, 192});
                 const uint64_t lanes = uint64_t(g.n_embd) * 128;
                 append(layer, "expert_lane_terms_" + std::to_string(slot), {lanes, lanes, lanes});
@@ -124,6 +135,10 @@ struct ModelWorkerBackend::Impl {
     bool published = false;
     std::string agreed_command;
     std::string execution_receipt;
+    ModelCheckpoint checkpoint;
+    ModelCheckpointIdentity checkpoint_identity;
+    bool checkpoint_committed = false;
+    std::string request;
 
     Impl(ModelWorkerConfig c, ModelForward& m, SessionCollectives& l, Session& s, GuardedTransport& t)
         : config(std::move(c)), model(m), collectives(l), session(s), transport(t) {}
@@ -168,6 +183,21 @@ struct ModelWorkerBackend::Impl {
                          [](float value) { return std::isfinite(value); })) return bad("nonfinite CUDA logits");
         return {};
     }
+    void clear_checkpoint() {
+        checkpoint.clear();
+        checkpoint_identity = {};
+        checkpoint_committed = false;
+    }
+    std::string checkpoint_receipt() const {
+        if (!checkpoint.complete()) return {};
+        const auto& id = checkpoint_identity;
+        // Rank-local shards differ. Agree identity and logical position, never their bytes.
+        return ":checkpoint=" + std::to_string(id.model_id.size()) + ":" + id.model_id + ":" +
+               std::to_string(id.request_id.size()) + ":" + id.request_id + ":" +
+               std::to_string(id.generation) + ":" + std::to_string(id.slot) + ":" +
+               std::to_string(id.max_context) + ":" + std::to_string(id.position_base) + ":" +
+               std::to_string(checkpoint.next_position());
+    }
 };
 
 ModelWorkerBackend::ModelWorkerBackend(ModelWorkerConfig c, ModelForward& m, SessionCollectives& l,
@@ -182,12 +212,16 @@ Failure ModelWorkerBackend::plan(const StepCommand& command, std::vector<Schedul
         command.manifest_hash != p.config.worker.manifest_hash || p.config.worker.rank >= kTpWorld)
         return bad("model worker identity/stream/position base is invalid");
     if (command.tokens.size() != command.positions.size()) return bad("model token/position mismatch");
+    if (command.phase == StepPhase::checkpoint &&
+        (!p.config.checkpoint_max_bytes || !p.config.checkpoint_max_context))
+        return bad("checkpoint requires an explicit context capacity and nonzero byte cap");
     for (size_t i = 0; i < command.tokens.size(); ++i) {
         if (command.tokens[i] < 0 || command.tokens[i] >= p.model.geometry().n_vocab ||
             command.positions[i] > uint64_t(std::numeric_limits<int32_t>::max()))
             return bad("model token or position outside supported range");
     }
-    return model_forward_schedule(command, p.model.geometry(), p.collectives.sequence(), out);
+    return model_forward_schedule(command, p.model.geometry(), p.collectives.sequence(), out,
+                                  p.config.batched_expert_collectives);
 }
 
 Failure ModelWorkerBackend::agree(const StepCommand& command) {
@@ -221,6 +255,10 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
         p.initialized = true;
     } else if (command.phase == StepPhase::prefill || command.phase == StepPhase::decode) {
         if (!p.initialized || p.candidate) return bad("forward requires initialized model without pending candidate");
+        if (p.request != command.request) {
+            p.clear_checkpoint();
+            p.request = command.request;
+        }
         for (size_t i = 0; i < command.tokens.size(); ++i) {
             if (!p.model.token(command.tokens[i], int64_t(command.positions[i]), p.config.position_base,
                                p.device_logits, p.config.stream, err)) return bad(err);
@@ -228,8 +266,30 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
         }
         p.candidate = true;
     } else if (command.phase == StepPhase::reset || command.phase == StepPhase::cancel) {
+        p.clear_checkpoint();
+        p.request.clear();
         if (!p.model.reset(p.config.stream, err)) return bad(err);
         p.candidate = false;
+    } else if (command.phase == StepPhase::checkpoint) {
+        if (!p.initialized || p.candidate || p.request != command.request)
+            return bad("checkpoint requires a committed current request");
+        Deadline deadline;
+        if (auto f = p.session.operation_deadline(deadline)) return f;
+        p.clear_checkpoint();
+        p.checkpoint_identity = {p.config.worker.manifest_hash, command.request, command.step, command.slot,
+                                 p.config.worker.rank, p.config.checkpoint_max_context, p.config.position_base};
+        if (!p.model.capture_checkpoint(p.checkpoint, p.checkpoint_identity, p.config.checkpoint_max_bytes,
+                                         p.config.stream, deadline.end, err)) return bad(err);
+    } else if (command.phase == StepPhase::rollback) {
+        if (!p.checkpoint_committed || !p.checkpoint.complete() || p.request != command.request ||
+            p.checkpoint_identity.request_id != command.request || p.checkpoint_identity.slot != command.slot)
+            return bad("rollback requires the current request's all-rank checkpoint");
+        Deadline deadline;
+        if (auto f = p.session.operation_deadline(deadline)) return f;
+        if (!p.model.restore_checkpoint(p.checkpoint, p.checkpoint_identity, p.config.stream, deadline.end, err))
+            return bad(err);
+        p.candidate = false;
+        std::fill_n(p.host_logits, size_t(p.model.geometry().n_vocab), 0.0f);
     } else if (command.phase == StepPhase::commit) {
         if (!p.candidate) return bad("model commit requires a finite candidate");
         if (auto f = p.finite_logits()) return f;
@@ -251,9 +311,11 @@ Failure ModelWorkerBackend::finish(const StepCommand& command, BackendCompletion
     if (auto f = p.wait()) return f;
     // Receipt confirms completed command and logical position. It does not claim to checksum model
     // KV/GDN/QSA/PLE bytes; numerical state parity still requires the GPU qualification harness.
-    const std::string receipt = "noncrypto-execution-receipt-v1:position=" + std::to_string(p.model.next_position());
+    const std::string receipt = "noncrypto-execution-receipt-v1:position=" +
+                                std::to_string(p.model.next_position()) + p.checkpoint_receipt();
     if (auto f = p.agree_bytes("model-stage-complete-v1", p.agreed_command + receipt)) return f;
     p.execution_receipt = receipt;
+    if (command.phase == StepPhase::checkpoint) p.checkpoint_committed = true;
     if (command.phase == StepPhase::commit) {
         p.candidate = false;
         p.published = p.config.worker.rank == 0;
@@ -268,6 +330,7 @@ void ModelWorkerBackend::abort() noexcept {
     p.dead = true;
     p.published = false;
     p.candidate = false;
+    p.clear_checkpoint();
     p.model.invalidate();
     p.transport.abort("model worker aborted");
     p.session.abort("model worker aborted");
@@ -276,6 +339,7 @@ void ModelWorkerBackend::discard_session() noexcept {
     auto& p = *impl_;
     p.dead = true;
     p.published = p.candidate = false;
+    p.clear_checkpoint();
     p.agreed_command.clear();
     p.execution_receipt.clear();
     p.model.invalidate();

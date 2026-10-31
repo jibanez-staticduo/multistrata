@@ -451,6 +451,102 @@ void tiny_scalar_probe() {
     std::puts("tiny-scalar-independent-bytes passed");
 }
 
+void run_expert_batch(const Sample& sample, int seed, Metrics& metrics) {
+    constexpr int experts = 10;
+    const int width = sample.input, ff = sample.ff;
+    const auto layout = k::native_expert_layout(sample.gu, sample.down, width, ff);
+    const auto gather = contract(ff);
+    auto input_contract = gather; input_contract.gather = "none";
+    Stream stream;
+    std::mt19937 rng(0x4ba7 + seed);
+    std::vector<float> x(width);
+    for (auto& v : x) v = float(int(rng() % 2001) - 1000) / 503.f;
+    Device<float> input(width); input.upload(x);
+    Device<uint8_t> input_q(tp::global_q81_bytes(1, width));
+    const auto q = tp::quantize_global(input_contract, input.p, 1, width, input_q.p, input_q.size, stream.s);
+    Device<float> wire(3 * experts * gather.wire_slots), hidden(experts * ff), reference_hidden(hidden.size);
+    Device<uint8_t> hidden_q(experts * tp::global_q81_bytes(1, ff)), reference_q(hidden_q.size);
+    const auto lane_count = std::size_t(width) * tp::down_lane_payload_width;
+    Device<float> lanes(3 * experts * lane_count), output(experts * width), sequential(output.size), oracle(output.size);
+    Device<float> sequential_wire(3 * lane_count), one_wire(3 * gather.wire_slots);
+    wire.upload(std::vector<float>(wire.size, std::numeric_limits<float>::quiet_NaN()));
+    std::vector<std::unique_ptr<Device<uint8_t>>> weights;
+    // Row permutations select distinct expert planes without altering any quantized block bytes.
+    for (int expert = 0; expert < experts; ++expert) {
+        auto bytes = sample.blob;
+        for (int row = 0; row < ff; ++row) {
+            const auto source = std::size_t((row + expert) % ff) * layout.gu_row;
+            std::memcpy(bytes.data() + std::size_t(row) * layout.gu_row, sample.blob.data() + source, layout.gu_row);
+            std::memcpy(bytes.data() + layout.up_off + std::size_t(row) * layout.gu_row,
+                        sample.blob.data() + layout.up_off + source, layout.gu_row);
+        }
+        for (int row = 0; row < width; ++row)
+            std::memcpy(bytes.data() + layout.down_off + std::size_t(row) * layout.d_row,
+                        sample.blob.data() + layout.down_off + std::size_t((row + expert) % width) * layout.d_row,
+                        layout.d_row);
+        auto blob = std::make_unique<Device<uint8_t>>(bytes.size()); blob->upload(bytes);
+        Device<unsigned long long> ptr(1); ptr.upload({reinterpret_cast<unsigned long long>(blob->p)});
+        Device<int32_t> starts(2), groups(1), dest(1), token(1);
+        starts.upload({0, 1}); groups.upload({1}); dest.upload({0}); token.upload({0});
+        Device<uint8_t> scratch(k::native_expert_scratch_bytes(1, ff));
+        k::native_expert_grouped(layout, ptr.p, starts.p, groups.p, dest.p, token.p, 1, 1,
+                                 input_q.p, scratch.p, oracle.p + expert * width, stream.s);
+        int begin = 0;
+        for (int rank = 0; rank < 3; ++rank) {
+            const int count = int(gather.valid_counts[rank]), end = begin + count;
+            Device<float> gate(count), up(count), h(count);
+            const auto offset = std::size_t(begin) * layout.gu_row;
+            tp::gate_up(view(sample.gu, width, ff, 1, begin, end, blob->p + offset,
+                             layout.gu_row, layout.up_off - offset),
+                        view(sample.gu, width, ff, 1, begin, end, blob->p + layout.up_off + offset,
+                             layout.gu_row, layout.up_off - offset), input_contract, q, gate.p, up.p, h.p, stream.s);
+            ck(cudaMemcpyAsync(wire.p + (rank * experts + expert) * gather.wire_slots, h.p,
+                               count * sizeof(float), cudaMemcpyDeviceToDevice, stream.s));
+            ck(cudaMemcpyAsync(one_wire.p + rank * gather.wire_slots, h.p,
+                               count * sizeof(float), cudaMemcpyDeviceToDevice, stream.s));
+            begin = end;
+        }
+        tp::unpack_gathered(gather, one_wire.p, 1, reference_hidden.p + expert * ff, stream.s);
+        ck(cudaStreamSynchronize(stream.s));
+        weights.push_back(std::move(blob));
+    }
+    tp::unpack_expert_batch(gather, wire.p, experts, hidden.p, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    metrics.compare("batch10-hidden-vs-sequential-poison-padding", reference_hidden.read(), hidden.read(), true);
+    const auto qbytes = tp::global_q81_bytes(1, ff);
+    for (int expert = 0; expert < experts; ++expert) {
+        const auto hq = tp::quantize_global(gather, hidden.p + expert * ff, 1, ff,
+                                           hidden_q.p + expert * qbytes, qbytes, stream.s);
+        const auto sq = tp::quantize_global(gather, reference_hidden.p + expert * ff, 1, ff,
+                                           reference_q.p + expert * qbytes, qbytes, stream.s);
+        int begin = 0;
+        for (int rank = 0; rank < 3; ++rank) {
+            const int end = begin + int(gather.valid_counts[rank]);
+            const auto offset = k::iq_row_bytes(sample.down, begin);
+            const auto down = view(sample.down, ff, width, 0, begin, end,
+                weights[expert]->p + layout.down_off + offset, layout.d_row,
+                layout.bytes - layout.down_off - offset);
+            tp::down_lanes(down, gather, hq, lanes.p + (rank * experts + expert) * lane_count, stream.s);
+            tp::down_lanes(down, gather, sq, sequential_wire.p + rank * lane_count, stream.s);
+            begin = end;
+        }
+        tp::finish_down_lanes(sequential_wire.p, sample.down, ff, width, 1,
+            {uint64_t(gather.valid_counts[0]), uint64_t(gather.valid_counts[1]), uint64_t(gather.valid_counts[2])},
+            sequential.p + expert * width, stream.s);
+    }
+    tp::finish_down_lanes(lanes.p, sample.down, ff, width, experts,
+        {uint64_t(gather.valid_counts[0]), uint64_t(gather.valid_counts[1]), uint64_t(gather.valid_counts[2])},
+        output.p, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    require(hidden_q.read() == reference_q.read(), "batch10 global hidden Q8_1 bytes differ");
+    metrics.compare("batch10-exact-operands-vs-sequential", sequential.read(), output.read(), true);
+    metrics.compare("batch10-exact-operands-vs-native-experts", oracle.read(), output.read(), true);
+    bool rejected = false;
+    try { tp::unpack_expert_batch(gather, wire.p, experts, wire.p, stream.s); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "batch hidden unpack accepted aliased buffers");
+}
+
 void run(const Sample& sample, int rows, Metrics& metrics) {
     const int width = sample.input, ff = sample.ff;
     require(ff == 192 || ff == 640, "test qualification supports FF192 tiny or FF640 original geometry");
@@ -639,6 +735,7 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
     k::native_expert_grouped(layout, ptr.p, starts.p, groups.p, dest.p, token.p, 1, rows,
                              qx_native.p, scratch.p, oracle.p, stream.s);
     ck(cudaStreamSynchronize(stream.s)); metrics.compare("zero-selected-experts", sh, oracle.read(), true);
+    run_expert_batch(sample, rows, metrics);
 }
 }  // namespace
 

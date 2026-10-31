@@ -4,6 +4,7 @@
 #include "strata/kernels/native_gdn_preprocess.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/tp_gdn.hpp"
+#include "model_state.hpp"
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -20,6 +21,45 @@ struct DeviceMemory {
     ~DeviceMemory() { if (data) cudaFree(data); }
     void allocate(size_t bytes) { checked(cudaMalloc(&data, bytes)); }
 };
+#ifdef STRATA_MODEL_CHECKPOINT_WITH_CUDA
+struct CheckpointIo {
+    CudaCheckpointTransfer transfer;
+    ~CheckpointIo() {
+        // A worker with pending DMA exits without unwinding borrowed session
+        // owners. Never free staging that a failed CUDA operation may still use.
+        if (transfer.pending || transfer.poisoned) return;
+        if (transfer.completion_event) cudaEventDestroy(static_cast<cudaEvent_t>(transfer.completion_event));
+        if (transfer.pinned_staging) cudaFreeHost(transfer.pinned_staging);
+    }
+    bool prepare(std::string& err) {
+        if (transfer.poisoned || transfer.pending) { err = "checkpoint CUDA transfer is poisoned"; return false; }
+        if (transfer.pinned_staging && transfer.completion_event) return true;
+        constexpr size_t bytes = 1024 * 1024;
+        auto status = cudaSuccess;
+        if (!transfer.pinned_staging) {
+            status = cudaMallocHost(&transfer.pinned_staging, bytes);
+            if (status != cudaSuccess) { err = cudaGetErrorString(status); return false; }
+            transfer.staging_bytes = bytes;
+        }
+        cudaEvent_t event = nullptr;
+        status = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (status != cudaSuccess) { err = cudaGetErrorString(status); return false; }
+        transfer.completion_event = event;
+        return true;
+    }
+    bool copy(void* host, void* device, size_t bytes, bool to_device, void* stream,
+              CheckpointDeadline deadline, std::string& err) {
+        for (size_t offset = 0; offset < bytes;) {
+            const auto count = std::min(bytes - offset, transfer.staging_bytes);
+            if (!cuda_checkpoint_copy(transfer, static_cast<uint8_t*>(host) + offset,
+                                      static_cast<uint8_t*>(device) + offset, count,
+                                      to_device, stream, deadline, err)) return false;
+            offset += count;
+        }
+        return true;
+    }
+};
+#endif
 }
 
 SessionCollectives::SessionCollectives(Session& s, GuardedTransport& t, const Clock& c, uint32_t ms)
@@ -129,6 +169,11 @@ struct ModelForward::Impl {
     bool ready = false;
     bool failed = false;
     int64_t next_position = 0;
+    int32_t checkpoint_position_base = 0;
+    bool checkpoint_exit = false;
+#ifdef STRATA_MODEL_CHECKPOINT_WITH_CUDA
+    CheckpointIo checkpoint_io;
+#endif
 
     Impl(const core::WeightTable& w, const core::ModelGeometry& g, core::SessionState& s,
          int r, LayerCollectives& c, RoutedExperts& e)
@@ -240,6 +285,77 @@ std::vector<GdnStateSource> ModelForward::state_sources() const {
     return result;
 }
 void ModelForward::invalidate() noexcept { impl_->failed = true; }
+bool ModelForward::requires_process_exit() const noexcept { return impl_->checkpoint_exit; }
+
+bool ModelForward::capture_checkpoint(ModelCheckpoint& checkpoint, ModelCheckpointIdentity id,
+                                      uint64_t max_bytes, void* stream, CheckpointDeadline deadline,
+                                      std::string& err) {
+    checkpoint.clear();
+    auto& p = *impl_;
+    if (!p.ready || p.failed || !stream || id.rank != uint32_t(p.rank) ||
+        id.max_context != uint64_t(p.state.max_cells) ||
+        (p.next_position && id.position_base != p.checkpoint_position_base) ||
+        std::chrono::steady_clock::now() >= deadline) {
+        p.failed = true; err = "checkpoint capture requires live model, matching rank/capacity and deadline"; return false;
+    }
+#ifdef STRATA_MODEL_CHECKPOINT_WITH_CUDA
+    try {
+        if (!p.checkpoint_io.prepare(err)) { p.failed = true; return false; }
+        const detail::ModelStateCopy copy = [&](void* host, void* device, size_t bytes, bool to_device, std::string& error) {
+            return p.checkpoint_io.copy(host, device, bytes, to_device, stream, deadline, error);
+        };
+        detail::ModelStateArrays arrays;
+        if (detail::describe_checkpoint_state(p.state, p.geometry, state_sources(), uint64_t(p.next_position), copy, arrays, err) &&
+            checkpoint.capture({std::move(id), uint64_t(p.next_position), max_bytes,
+                                state_evidence_inventory(arrays.sources)}, arrays.sources, deadline, err)) return true;
+    } catch (const std::exception& ex) { err = std::string("model checkpoint capture: ") + ex.what(); }
+      catch (...) { err = "model checkpoint capture failed"; }
+    p.failed = true;
+    p.checkpoint_exit = p.checkpoint_io.transfer.pending;
+    if (p.checkpoint_exit) p.memory.data = nullptr;
+    return false;
+#else
+    (void)max_bytes;
+    p.failed = true; err = "model checkpoint CUDA support is not compiled"; return false;
+#endif
+}
+
+bool ModelForward::restore_checkpoint(const ModelCheckpoint& checkpoint, ModelCheckpointIdentity id,
+                                      void* stream, CheckpointDeadline deadline, std::string& err) {
+    auto& p = *impl_;
+    if (!p.ready || p.failed || !stream || id.rank != uint32_t(p.rank) ||
+        id.max_context != uint64_t(p.state.max_cells) || std::chrono::steady_clock::now() >= deadline) {
+        p.failed = true; err = "checkpoint restore requires live model, matching rank/capacity and deadline"; return false;
+    }
+#ifdef STRATA_MODEL_CHECKPOINT_WITH_CUDA
+    try {
+        if (!checkpoint.complete()) { p.failed = true; err = "cannot restore incomplete model checkpoint"; return false; }
+        if (!p.checkpoint_io.prepare(err)) { p.failed = true; return false; }
+        const detail::ModelStateCopy copy = [&](void* host, void* device, size_t bytes, bool to_device, std::string& error) {
+            return p.checkpoint_io.copy(host, device, bytes, to_device, stream, deadline, error);
+        };
+        detail::ModelStateArrays arrays;
+        if (detail::describe_checkpoint_state(p.state, p.geometry, state_sources(), checkpoint.next_position(), copy, arrays, err)) {
+            const auto base = id.position_base;
+            ModelCheckpointDestination destination{std::move(id), state_evidence_inventory(arrays.sources),
+                std::move(arrays.destinations),
+                [&, base](uint64_t position, std::string&) {
+                    p.next_position = int64_t(position); p.checkpoint_position_base = base; return true;
+                },
+                [&] { p.failed = true; }};
+            if (checkpoint.restore(destination, deadline, err)) return true;
+        }
+    } catch (const std::exception& ex) { err = std::string("model checkpoint restore: ") + ex.what(); }
+      catch (...) { err = "model checkpoint restore failed"; }
+    p.failed = true;
+    p.checkpoint_exit = p.checkpoint_io.transfer.pending;
+    if (p.checkpoint_exit) p.memory.data = nullptr;
+    return false;
+#else
+    (void)checkpoint;
+    p.failed = true; err = "model checkpoint CUDA support is not compiled"; return false;
+#endif
+}
 void ModelForward::native_head(const core::NativeHead* head) { impl_->head = head; }
 void ModelForward::parity_observer(ParityObserver observer) { impl_->observer = std::move(observer); }
 
@@ -298,6 +414,7 @@ bool ModelForward::reset(void* stream, std::string& err) {
             std::fill_n(q.host_pos, p.geometry.n_head, int32_t(0));
         }
         p.next_position = 0;
+        p.checkpoint_position_base = 0;
         return true;
     } catch (const std::exception& e) { p.failed = true; err = e.what(); return false; }
 }
@@ -371,6 +488,7 @@ bool ModelForward::token(int32_t token, int64_t pos, int32_t base,
         // after a peer failure and bypass that bounded completion path.
         p.state.ple_prev[0] = p.state.ple_prev[1]; p.state.ple_prev[1] = token;
         ++p.next_position;
+        p.checkpoint_position_base = base;
         return true;
     } catch (const std::exception& e) { p.failed = true; err = e.what(); return false; }
 }

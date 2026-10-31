@@ -71,6 +71,11 @@ void finish_down_lanes(const float* rank_major_operands, int ggml_type,
 void unpack_gathered(const distributed::ActivationContract& contract, const float* wire,
                      int rows, float* logical, void* stream);
 
+// Batched expert wire is [rank][expert][wire_slots], logical is [expert][sum(valid)].
+// Each expert is independent: discard its padding before ordinary global Q8_1.
+void unpack_expert_batch(const distributed::ActivationContract& contract, const float* wire,
+                         int experts, float* logical, void* stream);
+
 // Add one global scale and optional bias AFTER the all-reduce of partials.
 // Scale then bias round separately to FP32 (never contracted into an FMA).
 void finish_projection(float* reduced, int rows, int width, const float* scale,

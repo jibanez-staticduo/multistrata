@@ -107,6 +107,7 @@ struct NativeRoutedExperts::Impl {
     Buffer input_q, gate, up, local_hidden, wire, hidden, hidden_q, partial;
     Buffer lane_terms, lane_wire;
     ExpertDownPolicy down_policy;
+    ExpertCollectivePolicy collective_policy;
     ActivationContract input_contract, hidden_contract;
     RouteReadback readback;
     uint32_t readback_timeout_ms;
@@ -114,13 +115,18 @@ struct NativeRoutedExperts::Impl {
     bool initialized = false;
 
     Impl(std::string pack_dir, std::string gguf, const core::ModelGeometry& g, int r,
-         LayerCollectives& c, std::array<uint64_t, 3> counts, uint32_t timeout_ms, ExpertDownPolicy policy)
+         LayerCollectives& c, std::array<uint64_t, 3> counts, uint32_t timeout_ms, ExpertDownPolicy policy,
+         ExpertCollectivePolicy collect_policy)
         : pack(std::move(pack_dir)), native(std::move(gguf)), geometry(g), rank(r), collective(c), valid(counts),
-          down_policy(policy), readback_timeout_ms(timeout_ms) {
+          down_policy(policy), collective_policy(collect_policy), readback_timeout_ms(timeout_ms) {
         require(timeout_ms > 0 && timeout_ms <= 3600000,
                 "TP expert model: readback timeout must be in [1,3600000] ms");
         require(policy == ExpertDownPolicy::ExactLaneReference || policy == ExpertDownPolicy::PartialReduce,
                 "TP expert model: unknown down arithmetic policy");
+        require(collect_policy == ExpertCollectivePolicy::Sequential || collect_policy == ExpertCollectivePolicy::Batched,
+                "TP expert model: unknown collective policy");
+        require(collect_policy != ExpertCollectivePolicy::Batched || policy == ExpertDownPolicy::ExactLaneReference,
+                "TP batched experts require exact lane arithmetic");
     }
 
     void initialize() {
@@ -246,12 +252,15 @@ struct NativeRoutedExperts::Impl {
             layers.push_back(std::move(layer));
         }
         input_q = Buffer(tp::global_q81_bytes(1, int(geometry.n_embd)));
-        gate = Buffer(valid[rank] * sizeof(float)); up = Buffer(gate.bytes);
-        local_hidden = Buffer(slots * sizeof(float)); wire = Buffer(3 * slots * sizeof(float));
-        hidden = Buffer(geometry.n_ff * sizeof(float)); hidden_q = Buffer(tp::global_q81_bytes(1, int(geometry.n_ff)));
+        const auto scratch_experts = collective_policy == ExpertCollectivePolicy::Batched ?
+                                     std::size_t(geometry.n_expert_used) : std::size_t(1);
+        gate = Buffer(scratch_experts * valid[rank] * sizeof(float)); up = Buffer(gate.bytes);
+        local_hidden = Buffer(scratch_experts * slots * sizeof(float)); wire = Buffer(3 * local_hidden.bytes);
+        hidden = Buffer(scratch_experts * geometry.n_ff * sizeof(float));
+        hidden_q = Buffer(scratch_experts * tp::global_q81_bytes(1, int(geometry.n_ff)));
         partial = Buffer(geometry.n_embd * sizeof(float));
         if (down_policy == ExpertDownPolicy::ExactLaneReference) {
-            lane_terms = Buffer(geometry.n_embd * tp::down_lane_payload_width * sizeof(float));
+            lane_terms = Buffer(scratch_experts * geometry.n_embd * tp::down_lane_payload_width * sizeof(float));
             lane_wire = Buffer(3 * lane_terms.bytes);
         }
         readback.initialize(std::size_t(geometry.n_expert_used));
@@ -292,6 +301,38 @@ struct NativeRoutedExperts::Impl {
                     "TP expert model: routed id outside original experts");
         const auto q = tp::quantize_global(input_contract, input, 1, int(geometry.n_embd), input_q.data, input_q.bytes, stream);
         auto& layer = layers[std::size_t(index)];
+        if (collective_policy == ExpertCollectivePolicy::Batched) {
+            const auto slots = uint64_t(hidden_contract.wire_slots);
+            const auto qbytes = tp::global_q81_bytes(1, int(geometry.n_ff));
+            const auto lane_count = uint64_t(geometry.n_embd) * tp::down_lane_payload_width;
+            check(cudaMemsetAsync(local_hidden.data, 0, local_hidden.bytes, static_cast<cudaStream_t>(stream)));
+            for (int64_t i = 0; i < k; ++i) {
+                const auto expert = std::size_t(readback.ids[i]);
+                layer.gate_view.data = layer.gate.byte() + expert * layer.gu_bytes;
+                layer.up_view.data = layer.up.byte() + expert * layer.gu_bytes;
+                tp::gate_up(layer.gate_view, layer.up_view, input_contract, q,
+                            gate.floats() + i * valid[rank], up.floats() + i * valid[rank],
+                            local_hidden.floats() + i * slots, stream);
+            }
+            // Uniform transport counts include the holes at the end of each expert's local row.
+            const auto hidden_count = uint64_t(k) * slots;
+            if (!collective.gather(index, "expert_hidden_batch", local_hidden.floats(), wire.floats(),
+                                   {hidden_count, hidden_count, hidden_count}, stream, err)) return false;
+            tp::unpack_expert_batch(hidden_contract, wire.floats(), int(k), hidden.floats(), stream);
+            for (int64_t i = 0; i < k; ++i) {
+                const auto hq = tp::quantize_global(hidden_contract, hidden.floats() + i * geometry.n_ff,
+                    1, int(geometry.n_ff), hidden_q.byte() + i * qbytes, qbytes, stream);
+                layer.down_view.data = layer.down.byte() + std::size_t(readback.ids[i]) * layer.down_bytes;
+                tp::down_lanes(layer.down_view, hidden_contract, hq, lane_terms.floats() + i * lane_count, stream);
+            }
+            const auto count = uint64_t(k) * lane_count;
+            if (!collective.gather(index, "expert_lane_terms_batch", lane_terms.floats(), lane_wire.floats(),
+                                   {count, count, count}, stream, err)) return false;
+            // The existing exact finalizer consumes [rank][row][output][operand]; expert is row here.
+            tp::finish_down_lanes(lane_wire.floats(), layer.layout.d_type, int(geometry.n_ff),
+                                  int(geometry.n_embd), int(k), valid, parts, stream);
+            return true;
+        }
         for (int64_t i = 0; i < k; ++i) {
             const auto expert = std::size_t(readback.ids[i]);
             layer.gate_view.data = layer.gate.byte() + expert * layer.gu_bytes;
@@ -326,9 +367,10 @@ struct NativeRoutedExperts::Impl {
 
 NativeRoutedExperts::NativeRoutedExperts(std::string pack, std::string native, const core::ModelGeometry& geometry,
                                        int rank, LayerCollectives& collective, std::array<uint64_t, 3> valid,
-                                       uint32_t readback_timeout_ms, ExpertDownPolicy down_policy)
+                                       uint32_t readback_timeout_ms, ExpertDownPolicy down_policy,
+                                       ExpertCollectivePolicy collective_policy)
     : impl_(std::make_unique<Impl>(std::move(pack), std::move(native), geometry, rank, collective, valid,
-                                   readback_timeout_ms, down_policy)) {}
+                                   readback_timeout_ms, down_policy, collective_policy)) {}
 NativeRoutedExperts::~NativeRoutedExperts() = default;
 bool NativeRoutedExperts::initialize(std::string& err) {
     try { impl_->initialize(); return true; } catch (const std::exception& e) { err = e.what(); return false; }

@@ -458,6 +458,43 @@ void deadline_expiry_names_the_operation() {
     check(idle.polls == 0, "and it asked the library for nothing");
 }
 
+void zero_poll_interval_preserves_completion_and_failure_checks() {
+    std::printf("zero poll interval yields while keeping completion and failure checks\n");
+    FakeClock clock;
+    FakeBackend backend(kTpWorld, 0, clock);
+    backend.completes_after_polls = 4;
+    GuardedTransport transport(backend, clock);
+    transport.set_poll_interval_ms(0);
+    check(!transport.all_reduce_sum(buf_a(4, ScalarType::fp32), buf_b(4, ScalarType::fp32), op(1), nullptr),
+          "zero interval accepts the agreed collective");
+    check(!transport.wait(Deadline{clock.now() + std::chrono::milliseconds(10)}) && backend.polls == 4,
+          "zero interval keeps polling until the backend completes");
+    check(!transport.check_health() && backend.abort_calls == 0,
+          "successful zero interval completion leaves the transport healthy");
+
+    backend.polls = 0;
+    backend.completes_after_polls = 1000000;
+    check(!transport.all_reduce_sum(buf_a(4, ScalarType::fp32), buf_b(4, ScalarType::fp32), op(2), nullptr),
+          "another collective may follow zero interval completion");
+    const Failure expired = transport.wait(Deadline{clock.now() + std::chrono::milliseconds(3)});
+    check(expired.code == FailureCode::deadline_expired && backend.polls == 3 && backend.abort_calls == 1,
+          "zero interval terminates at the same deadline with bounded polls");
+    check(transport.wait(Deadline{clock.now()}).code == FailureCode::deadline_expired && backend.polls == 3,
+          "the zero interval deadline failure stays terminal");
+
+    FakeClock error_clock;
+    FakeBackend error_backend(kTpWorld, 0, error_clock);
+    GuardedTransport error_transport(error_backend, error_clock);
+    error_transport.set_poll_interval_ms(0);
+    check(!error_transport.all_reduce_sum(buf_a(4, ScalarType::fp32), buf_b(4, ScalarType::fp32), op(1), nullptr),
+          "the zero interval async-error case enqueues first");
+    error_backend.async_pending = true;
+    error_backend.async_failure = Failure::fail(FailureCode::async_error, "zero interval peer failure");
+    check(error_transport.wait(Deadline{error_clock.now() + std::chrono::milliseconds(10)}).code ==
+              FailureCode::async_error && error_backend.polls == 0 && error_backend.abort_calls == 1,
+          "zero interval checks asynchronous failure before polling");
+}
+
 void abort_is_idempotent() {
     std::printf("abort: the first reason wins, and it is safe to say twice\n");
     FakeClock clock;
@@ -630,6 +667,7 @@ int main() {
     enqueue_failure_is_final();
     pending_async_error_is_reported();
     deadline_expiry_names_the_operation();
+    zero_poll_interval_preserves_completion_and_failure_checks();
     abort_is_idempotent();
     library_approval_is_checked_before_a_communicator();
     backend_gates_every_call();

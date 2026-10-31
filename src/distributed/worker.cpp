@@ -100,6 +100,14 @@ Failure Worker::validate(const StepCommand& command) const {
         case StepPhase::commit:
             if (state_ != WorkerState::pending) return reject("commit requires a completed candidate");
             break;
+        case StepPhase::checkpoint:
+            if (state_ != WorkerState::active || committed_positions_ == 0)
+                return reject("checkpoint requires a committed active request");
+            break;
+        case StepPhase::rollback:
+            if ((state_ != WorkerState::active && state_ != WorkerState::pending) || checkpoint_step_ == 0)
+                return reject("rollback requires an active request with a committed checkpoint");
+            break;
         case StepPhase::reset:
         case StepPhase::cancel:
             if (state_ != WorkerState::active && state_ != WorkerState::pending) {
@@ -118,8 +126,9 @@ Failure Worker::validate(const StepCommand& command) const {
             return reject("command belongs to another request");
         }
     }
-    if (command.phase == StepPhase::abort && !command.expected_collective_schedule.empty()) {
-        return reject("abort cannot carry a collective schedule");
+    if ((command.phase == StepPhase::abort || command.phase == StepPhase::checkpoint ||
+         command.phase == StepPhase::rollback) && !command.expected_collective_schedule.empty()) {
+        return reject("abort/checkpoint/rollback cannot carry a collective schedule");
     }
     return validate_schedule(command, next_collective_);
 }
@@ -135,6 +144,9 @@ std::string Worker::digest() const {
            std::to_string(config_.manifest_hash.size()) + ":" + config_.manifest_hash + ":" +
            std::to_string(request_.size()) + ":" + request_ + ":" +
            std::to_string(backend_digest_.size()) + ":" + backend_digest_;
+    if (checkpoint_step_ != 0)
+        value += ":checkpoint=" + std::to_string(checkpoint_step_) + ":" +
+                 std::to_string(checkpoint_positions_) + ":" + std::to_string(checkpoint_decoding_);
     value += ":" + std::to_string(retired_requests_.size());
     for (const auto& request : retired_requests_) value += ":" + std::to_string(request.size()) + ":" + request;
     return value;
@@ -149,6 +161,8 @@ StepResult Worker::fail(Failure failure) {
     retired_requests_.clear();
     backend_digest_.clear();
     pending_positions_ = committed_positions_ = 0;
+    checkpoint_step_ = checkpoint_positions_ = 0;
+    checkpoint_decoding_ = false;
     return {StepStatus::failed, failure_, {}, false};
 }
 
@@ -166,6 +180,8 @@ StepResult Worker::execute(const StepCommand& command) {
         retired_requests_.clear();
         backend_digest_.clear();
         pending_positions_ = committed_positions_ = 0;
+        checkpoint_step_ = checkpoint_positions_ = 0;
+        checkpoint_decoding_ = false;
         return {StepStatus::aborted, failure_, {}, false};
     }
 
@@ -200,6 +216,10 @@ StepResult Worker::execute(const StepCommand& command) {
             case StepPhase::init: state_ = WorkerState::idle; break;
             case StepPhase::prefill:
             case StepPhase::decode:
+                if (state_ == WorkerState::idle) {
+                    checkpoint_step_ = checkpoint_positions_ = 0;
+                    checkpoint_decoding_ = false;
+                }
                 request_ = command.request;
                 pending_positions_ = committed_positions_ + command.tokens.size();
                 pending_decode_ = command.phase == StepPhase::decode;
@@ -213,12 +233,26 @@ StepResult Worker::execute(const StepCommand& command) {
                 state_ = WorkerState::active;
                 output_ready = config_.rank == 0;
                 break;
+            case StepPhase::checkpoint:
+                checkpoint_positions_ = committed_positions_;
+                checkpoint_decoding_ = decoding_;
+                checkpoint_step_ = command.step;
+                break;
+            case StepPhase::rollback:
+                committed_positions_ = checkpoint_positions_;
+                decoding_ = checkpoint_decoding_;
+                pending_positions_ = 0;
+                pending_decode_ = false;
+                state_ = WorkerState::active;
+                break;
             case StepPhase::reset:
             case StepPhase::cancel:
                 retired_requests_.push_back(request_);
                 request_.clear();
                 committed_positions_ = pending_positions_ = 0;
                 decoding_ = pending_decode_ = false;
+                checkpoint_step_ = checkpoint_positions_ = 0;
+                checkpoint_decoding_ = false;
                 state_ = WorkerState::idle;
                 break;
             case StepPhase::abort: break;  // Handled before backend execution.

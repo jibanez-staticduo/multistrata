@@ -15,12 +15,16 @@ class SessionCollectives;
 // decoder. It covers every StepCommand field including route labels and complete collective shapes.
 Failure canonical_step_command(const StepCommand&, std::string& out);
 Failure model_forward_schedule(const StepCommand&, const core::ModelGeometry&, uint64_t first_sequence,
-                               std::vector<ScheduledCollective>& out);
+                               std::vector<ScheduledCollective>& out, bool batched_expert_collectives = false);
 
 struct ModelWorkerConfig {
     WorkerConfig worker;
     void* stream = nullptr;
     int32_t position_base = 0;
+    bool batched_expert_collectives = false;
+    // Checkpoints allocate only on the explicit phase. Zero byte cap disables capture.
+    uint64_t checkpoint_max_bytes = uint64_t(1) << 30;
+    uint64_t checkpoint_max_context = 0;
 };
 
 // CUDA C1 uncaptured bridge. Borrowed model, collectives, session, transport and stream outlive this
@@ -42,7 +46,7 @@ class ModelWorkerBackend final : public ExecutionBackend {
     void discard_session() noexcept override;
 
     // Host logits, rank zero only, valid until the next accepted command or destruction. Null before
-    // commit, after cancellation/reset/failure, or on followers. The coordinator alone samples/writes.
+    // commit, after rollback/cancellation/reset/failure, or on followers. The coordinator alone samples/writes.
     const float* committed_logits() const;
     size_t logits_size() const;
 

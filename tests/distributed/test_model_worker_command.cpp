@@ -52,6 +52,14 @@ void canonical_fields() {
     a.session.assign(1024 * 1024 + 1, 'x');
     check(canonical_step_command(a, left).code == FailureCode::oversized_frame && left.empty(),
           "oversized command rejected without partial payload");
+    a = baseline; a.phase = static_cast<StepPhase>(uint32_t(StepPhase::rollback) + 1);
+    check(bool(canonical_step_command(a, left)) && left.empty(), "phase above appended rollback rejected");
+    a = baseline; a.phase = StepPhase::checkpoint;
+    b = baseline; b.phase = StepPhase::rollback;
+    check(!canonical_step_command(a, left) && !canonical_step_command(b, right) && left != right,
+          "checkpoint and rollback participate distinctly in exact agreement");
+    check(uint32_t(StepPhase::abort) == 6 && uint32_t(StepPhase::checkpoint) == 7 &&
+          uint32_t(StepPhase::rollback) == 8, "new phases append without changing existing wire values");
 }
 void model_schedule() {
     StepCommand command{"session", "request", 0, 3, StepPhase::prefill, {4}, {0}, "manifest", {}};
@@ -69,11 +77,40 @@ void model_schedule() {
     check(out[2].route == "expert_hidden_0" && out[2].descriptor.valid_counts == std::vector<uint64_t>{256, 192, 192} &&
           out[21].route == "expert_lane_terms_9" &&
           out[21].descriptor.valid_counts == std::vector<uint64_t>{327680,327680,327680}, "all expert route slots in order");
+    std::vector<ScheduledCollective> batched;
+    check(!model_forward_schedule(command, g, 100, batched, true) && batched.size() == 48 * 4,
+          "batched schedule has two expert collectives per layer");
+    check(batched[2].route == "expert_hidden_batch" && batched[2].descriptor.elements == 2560 &&
+          batched[2].descriptor.valid_counts == std::vector<uint64_t>{2560,2560,2560},
+          "batched hidden transport includes every padded expert slot");
+    check(batched[3].route == "expert_lane_terms_batch" && batched[3].descriptor.elements == 3276800 &&
+          batched[3].descriptor.valid_counts == std::vector<uint64_t>{3276800,3276800,3276800},
+          "batched exact operand transport retains all expert lanes");
+    check(batched.front().descriptor.operation.sequence == 100 &&
+          batched.back().descriptor.operation.sequence == 291 &&
+          batched[3 * 4].route == "qsa_gated_reference", "batched layer order and sequences");
+    auto sequential_command = command; sequential_command.expected_collective_schedule = out;
+    auto batched_command = command; batched_command.expected_collective_schedule = batched;
+    std::string sequential_bytes, batched_bytes;
+    check(!canonical_step_command(sequential_command, sequential_bytes) &&
+          !canonical_step_command(batched_command, batched_bytes) && sequential_bytes != batched_bytes,
+          "collective policy participates in exact command agreement");
     command.tokens.push_back(5); command.positions.push_back(1);
     check(!model_forward_schedule(command, g, 1, out) && out.size() == 2 * 48 * 22 &&
           out[48 * 22].descriptor.operation.layer == 0, "multi token prefill restarts all layers without reset sequence");
+    check(!model_forward_schedule(command, g, 1, batched, true) && batched.size() == 2 * 48 * 4 &&
+          batched[48 * 4].descriptor.operation.layer == 0 &&
+          batched[48 * 4].descriptor.operation.sequence == 193, "batched prefill preserves token boundaries");
     command.phase = StepPhase::commit;
     check(!model_forward_schedule(command, g, 1, out) && out.empty(), "commit replays no model collective");
+    for (auto phase : {StepPhase::checkpoint, StepPhase::rollback}) {
+        command.phase = phase;
+        check(!model_forward_schedule(command, g, 1, out) && out.empty() &&
+              !model_forward_schedule(command, g, 1, batched, true) && batched.empty(),
+              "checkpoint and rollback have zero collectives under either expert policy");
+    }
+    command.phase = static_cast<StepPhase>(99);
+    check(bool(model_forward_schedule(command, g, 1, out)), "unknown schedule phase rejected");
     command.phase = StepPhase::prefill;
     auto bad_geometry = g; bad_geometry.n_layers = 47;
     check(bool(model_forward_schedule(command, bad_geometry, 1, out)), "unsupported geometry rejected");

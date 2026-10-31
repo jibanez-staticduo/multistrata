@@ -47,6 +47,10 @@ class BoundaryBackend final : public ExecutionBackend {
     int discards = 0;
     uint64_t first_sequence = 1;
     std::function<void()> observe_finish;
+    std::vector<int32_t> model_tokens;
+    std::vector<int32_t> saved_tokens;
+    bool fail_capture = false;
+    bool fail_restore = false;
 
     bool model_driven_collectives() const override { return internally_driven; }
 
@@ -66,6 +70,18 @@ class BoundaryBackend final : public ExecutionBackend {
     Failure agree(const StepCommand&) override { return enter("agree"); }
     Failure begin(const StepCommand& command) override {
         if (auto f = enter("begin")) return f;
+        if (command.phase == StepPhase::prefill || command.phase == StepPhase::decode)
+            model_tokens.insert(model_tokens.end(), command.tokens.begin(), command.tokens.end());
+        else if (command.phase == StepPhase::checkpoint) {
+            if (fail_capture) return Failure::fail(FailureCode::comm_failed, "capture failed");
+            saved_tokens = model_tokens;
+        } else if (command.phase == StepPhase::rollback) {
+            if (fail_restore) return Failure::fail(FailureCode::comm_failed, "restore failed");
+            model_tokens = saved_tokens;
+        } else if (command.phase == StepPhase::reset || command.phase == StepPhase::cancel) {
+            model_tokens.clear();
+            saved_tokens.clear();
+        }
         if (internally_driven) {
             for (const auto& item : command.expected_collective_schedule)
                 if (auto f = collective(item)) return f;
@@ -82,7 +98,7 @@ class BoundaryBackend final : public ExecutionBackend {
         return enter("finish");
     }
     void abort() noexcept override { ++aborts; }
-    void discard_session() noexcept override { ++discards; }
+    void discard_session() noexcept override { ++discards; model_tokens.clear(); saved_tokens.clear(); }
 };
 
 struct Fixture {
@@ -289,6 +305,79 @@ void model_driven_no_replay() {
           "model-driven boundary executes each scheduled collective once without worker replay");
     f.commit();
 }
+
+void checkpoint_rollback() {
+    Fixture f; f.init();
+    f.expect_rejected(f.command(StepPhase::checkpoint), "idle checkpoint rejected");
+    f.prefill();
+    f.expect_rejected(f.command(StepPhase::checkpoint), "pending checkpoint rejected");
+    f.expect_rejected(f.command(StepPhase::rollback), "rollback without snapshot rejected");
+    f.commit();
+    auto result = f.run(StepPhase::checkpoint);
+    check(result.status == StepStatus::completed && !result.output_ready &&
+          f.backend.saved_tokens == std::vector<int32_t>{4, 9}, "checkpoint saves committed model state without output");
+    auto stale_checkpoint = f.command(StepPhase::checkpoint); --stale_checkpoint.step;
+    f.expect_rejected(stale_checkpoint, "stale checkpoint step rejected");
+    auto bad = f.command(StepPhase::rollback); bad.request = "foreign";
+    f.expect_rejected(bad, "snapshot cannot restore foreign request");
+    bad = f.command(StepPhase::checkpoint); bad.tokens = {1};
+    f.expect_rejected(bad, "checkpoint cannot inject tokens");
+    bad = f.command(StepPhase::rollback); bad.expected_collective_schedule = {operation(3, f.step, "illegal")};
+    f.expect_rejected(bad, "rollback cannot carry collectives");
+    check(f.run(StepPhase::decode, "request-A", {8}, {2}).status == StepStatus::completed,
+          "post checkpoint decode staged");
+    f.commit();
+    const auto step_before = f.worker.next_step();
+    const auto sequence_before = f.backend.first_sequence;
+    result = f.run(StepPhase::rollback);
+    check(result.status == StepStatus::completed && !result.output_ready && f.worker.state() == WorkerState::active &&
+          f.backend.model_tokens == std::vector<int32_t>{4, 9}, "rollback restores committed state and closes output gate");
+    check(f.worker.next_step() == step_before + 1 && f.backend.first_sequence == sequence_before,
+          "rollback advances command step without rewinding collective sequence");
+    check(f.run(StepPhase::prefill, "request-A", {7, 8}, {2, 3}).status == StepStatus::completed,
+          "rollback restores prefill mode and exact next position");
+    result = f.run(StepPhase::rollback);
+    check(result.status == StepStatus::completed && !result.output_ready &&
+          f.backend.model_tokens == std::vector<int32_t>{4, 9}, "pending rollback discards candidate model state");
+    f.expect_rejected(f.command(StepPhase::commit), "rolled back candidate cannot commit");
+    check(f.run(StepPhase::decode, "request-A", {8}, {2}).status == StepStatus::completed,
+          "same token replays at snapshot position");
+    f.commit();
+    check(f.backend.model_tokens == std::vector<int32_t>{4, 9, 8}, "replay reconstructs original sequence");
+    check(f.run(StepPhase::checkpoint).status == StepStatus::completed, "checkpoint replacement after committed decode");
+    check(f.run(StepPhase::decode, "request-A", {1}, {3}).status == StepStatus::completed,
+          "decode after replacement checkpoint");
+    check(f.run(StepPhase::rollback).status == StepStatus::completed, "replacement snapshot restores pending decode");
+    f.expect_rejected(f.command(StepPhase::prefill, "request-A", {1}, {3}), "rollback restores saved decode mode exactly");
+    check(f.run(StepPhase::reset).status == StepStatus::completed, "reset invalidates snapshot");
+    f.expect_rejected(f.command(StepPhase::rollback), "reset snapshot cannot be restored");
+    check(f.run(StepPhase::prefill, "request-B", {2}, {0}).status == StepStatus::completed, "new request after snapshot reset");
+    check(f.run(StepPhase::commit, "request-B").status == StepStatus::completed, "new request committed");
+    f.expect_rejected(f.command(StepPhase::rollback, "request-B"), "new request cannot restore prior snapshot");
+    check(f.run(StepPhase::checkpoint, "request-B").status == StepStatus::completed, "new request snapshot");
+    check(f.run(StepPhase::cancel, "request-B").status == StepStatus::cancelled, "cancel invalidates snapshot");
+    f.expect_rejected(f.command(StepPhase::rollback, "request-B"), "cancelled snapshot cannot be restored");
+}
+
+void checkpoint_failures() {
+    for (const auto phase : {StepPhase::checkpoint, StepPhase::rollback}) {
+        for (const bool partial_commit : {false, true}) {
+            Fixture f; f.init(); f.prefill(); f.commit();
+            if (phase == StepPhase::rollback)
+                check(f.run(StepPhase::checkpoint).status == StepStatus::completed, "rollback failure fixture snapshot");
+            f.backend.fail_capture = !partial_commit && phase == StepPhase::checkpoint;
+            f.backend.fail_restore = !partial_commit && phase == StepPhase::rollback;
+            f.backend.committed = !partial_commit;
+            const auto result = f.run(phase);
+            check(result.status == StepStatus::failed && !result.output_ready && result.state_digest.empty() &&
+                  f.worker.state() == WorkerState::failed && f.backend.aborts == 1 && f.backend.discards == 1 &&
+                  f.backend.saved_tokens.empty(), "capture/restore failure or partial all-rank agreement poisons session");
+            const auto calls = f.backend.calls.size();
+            check(f.run(StepPhase::rollback).status == StepStatus::failed && f.backend.calls.size() == calls,
+                  "failed checkpoint operation cannot retry or restore old state");
+        }
+    }
+}
 }  // namespace
 
 int main() {
@@ -298,6 +387,8 @@ int main() {
     cancel_abort_and_follower();
     prefill_chunks_and_reset();
     model_driven_no_replay();
+    checkpoint_rollback();
+    checkpoint_failures();
     std::printf("worker protocol boundary: %d checks, %d failures (no model/GPU execution)\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }

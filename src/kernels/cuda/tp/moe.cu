@@ -89,6 +89,28 @@ void finish_projection(float* reduced, int rows, int width, const float* scale, 
     detail::check(cudaGetLastError());
 }
 
+void unpack_expert_batch(const distributed::ActivationContract& c, const float* wire, int experts,
+                         float* logical, void* stream) {
+    detail::contract(c);
+    detail::require(c.gather == "all_gather_padded" && c.wire_slots > 0 && !c.valid_counts.empty() &&
+                    experts > 0 && experts <= 15 && wire && logical && wire != logical && stream,
+                    "TP CUDA: invalid expert batch gather");
+    int64_t width = 0;
+    for (auto n : c.valid_counts) {
+        detail::require(n >= 0 && n <= c.wire_slots, "TP CUDA: invalid expert batch valid count");
+        width += n;
+    }
+    detail::require(width > 0, "TP CUDA: empty expert batch gather");
+    int64_t offset = 0;
+    for (std::size_t rank = 0; rank < c.valid_counts.size(); ++rank) {
+        const auto n = c.valid_counts[rank];
+        if (n) detail::check(cudaMemcpy2DAsync(logical + offset, std::size_t(width) * sizeof(float),
+            wire + rank * std::size_t(experts) * c.wire_slots, std::size_t(c.wire_slots) * sizeof(float),
+            std::size_t(n) * sizeof(float), experts, cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream)));
+        offset += n;
+    }
+}
+
 void combine(const float* parts, const float* weights, const float* scales, const float* shared,
              float* output, int rows, int width, int k, float* scratch, void* stream) {
     detail::require(parts && weights && output && rows > 0 && rows <= 65535 && width > 0 && k > 0 && k <= 15 && stream &&

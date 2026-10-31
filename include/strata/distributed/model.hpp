@@ -6,6 +6,7 @@
 #include "strata/distributed/worker.hpp"
 #include "strata/distributed/state_evidence.hpp"
 #include "strata/distributed/parity_trace.hpp"
+#include "strata/distributed/model_checkpoint.hpp"
 
 #include <array>
 #include <memory>
@@ -80,6 +81,15 @@ public:
     const core::ModelGeometry& geometry() const;
     int64_t next_position() const;
     std::vector<GdnStateSource> state_sources() const;
+    // Explicit request switching/rollback, outside graph capture. The caller
+    // serializes stream access and supplies the frozen model/request identity.
+    bool capture_checkpoint(ModelCheckpoint&, ModelCheckpointIdentity, uint64_t max_bytes,
+                            void* stream, CheckpointDeadline, std::string& err);
+    bool restore_checkpoint(const ModelCheckpoint&, ModelCheckpointIdentity,
+                            void* stream, CheckpointDeadline, std::string& err);
+    // If true, the worker must exit without unwinding device/session owners:
+    // a timed-out DMA can still reference borrowed SessionState allocations.
+    bool requires_process_exit() const noexcept;
     void invalidate() noexcept;
 private:
     bool mixer(int64_t, int64_t, int32_t, const float*, float*, void*, std::string&) override;

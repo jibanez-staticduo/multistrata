@@ -8,7 +8,7 @@
 
 namespace strata::distributed {
 
-enum class StepPhase : uint32_t { init, prefill, decode, commit, reset, cancel, abort };
+enum class StepPhase : uint32_t { init, prefill, decode, commit, reset, cancel, abort, checkpoint, rollback };
 enum class WorkerState : uint32_t { fresh, idle, active, pending, failed, aborted };
 enum class StepStatus : uint32_t { completed, rejected, failed, cancelled, aborted };
 
@@ -22,7 +22,7 @@ struct StepCommand {
     std::string session;
     std::string request;
     uint32_t slot = 0;  // C1: only slot zero exists.
-    uint64_t step = 0;  // Starts at one and advances across requests, including reset/cancel.
+    uint64_t step = 0;  // Starts at one; advances across requests and checkpoint/rollback/reset/cancel.
     StepPhase phase = StepPhase::init;
     std::vector<int32_t> tokens;
     std::vector<uint64_t> positions;
@@ -77,6 +77,7 @@ struct WorkerConfig {
 
 // Single thread, C1, one synchronous command at a time. Cancellation is a scheduled command BETWEEN
 // execute calls: it cannot interrupt a collective or skip any remaining operations of a prior command.
+// One checkpoint belongs to the active request; rollback restores committed state and drops pending output.
 // The backend outlives the worker. A failed/aborted worker can never initialize or reuse state again.
 class Worker {
  public:
@@ -109,6 +110,9 @@ class Worker {
     std::string backend_digest_;
     bool decoding_ = false;
     bool pending_decode_ = false;
+    uint64_t checkpoint_positions_ = 0;
+    uint64_t checkpoint_step_ = 0;
+    bool checkpoint_decoding_ = false;
 };
 
 }  // namespace strata::distributed

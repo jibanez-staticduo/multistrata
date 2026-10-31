@@ -7,6 +7,7 @@
 #include "strata/distributed/model_worker.hpp"
 #include "strata/distributed/autoregressive.hpp"
 #include "strata/distributed/parity_trace_writer.hpp"
+#include "strata/distributed/process_exit_guard.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -28,6 +29,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstring>
+#include <cstdlib>
 #include <fcntl.h>
 #include <poll.h>
 #include <random>
@@ -283,7 +285,8 @@ int main(int argc, char** argv) {
         const std::set<std::string> allowed = {"rank", "rank0-address", "port", "session-uuid",
             "library-path", "nccl-version", "library-provenance", "model-hash", "config-fingerprint",
             "pack", "native", "ple", "context", "logits-dir", "timeout-ms",
-            "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode"};
+            "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
+            "expert-collectives"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) || args.contains(key.substr(2)))
@@ -316,6 +319,11 @@ int main(int argc, char** argv) {
                        "state options require state-dir");
         const uint64_t rank = number("rank", 3), port = number("port", 0);
         const auto timeout = number("timeout-ms", 60000), context = number("context", 256);
+        const auto poll_interval = number("poll-interval-ms", 1);
+        require(poll_interval <= 1000, "poll interval must be in [0, 1000] ms");
+        const auto expert_collectives = args.contains("expert-collectives") ? args.at("expert-collectives") : "sequential";
+        require(expert_collectives == "sequential" || expert_collectives == "batched", "invalid expert collective policy");
+        const bool batched_experts = expert_collectives == "batched";
         const auto mode = args.contains("mode") ? args.at("mode") : "teacher-forced";
         require(mode == "teacher-forced" || mode == "autoregressive", "invalid distributed mode");
         const bool autoregressive = mode == "autoregressive";
@@ -418,11 +426,13 @@ int main(int argc, char** argv) {
         nccl_config.initialize_ms = std::min(config.budgets.initialize_ms, session.roster().budgets.initialize_ms);
         NcclBackend nccl_backend(std::move(api), nccl_config, {version, provenance});
         GuardedTransport transport(nccl_backend, clock);
+        transport.set_poll_interval_ms(uint32_t(poll_interval));
         require(nccl_backend.init());
         try {
             SessionCollectives collectives(session, transport, clock, uint32_t(timeout));
             NativeRoutedExperts experts(pack, native, geometry, int(rank), collectives,
-                                         {256, 192, 192}, uint32_t(timeout));
+                                         {256, 192, 192}, uint32_t(timeout), ExpertDownPolicy::ExactLaneReference,
+                                         batched_experts ? ExpertCollectivePolicy::Batched : ExpertCollectivePolicy::Sequential);
             std::cerr << "LOAD rank=" << rank << " stage=expert-shards" << std::endl;
             require(experts.initialize(err), err);
             std::cerr << "LOAD rank=" << rank << " stage=expert-shards-complete bytes=" << experts.owned_weight_bytes() << std::endl;
@@ -437,8 +447,11 @@ int main(int argc, char** argv) {
                 });
             }
             WorkerConfig worker_config{join.session_uuid, join.model_hash, uint32_t(rank)};
-            ModelWorkerBackend execution({worker_config, stream.value, 0}, model, collectives, session, transport);
+            ModelWorkerConfig model_worker_config{worker_config, stream.value, 0, batched_experts};
+            model_worker_config.checkpoint_max_context = uint64_t(state.max_cells);
+            ModelWorkerBackend execution(model_worker_config, model, collectives, session, transport);
             Worker worker(worker_config, execution);
+            PendingDmaExitGuard checkpoint_lifetime(model);
             uint64_t step = 1;
             uint64_t request_sequence = 0;
             auto execute = [&](StepPhase phase, std::vector<int32_t> tokens = {}, std::vector<uint64_t> positions = {}) {
@@ -521,6 +534,17 @@ int main(int argc, char** argv) {
             std::string line;
             while (std::getline(std::cin, line)) {
                 if (line == "QUIT") { if (state_last) dump_state(false); break; }
+                if (line == "CHECKPOINT") {
+                    execute(StepPhase::checkpoint);
+                    std::cout << "CHECKPOINT_OK position=" << model.next_position() << '\n';
+                    continue;
+                }
+                if (line == "ROLLBACK") {
+                    execute(StepPhase::rollback);
+                    require(execution.committed_logits() == nullptr, "rollback exposed stale logits");
+                    std::cout << "ROLLBACK_OK position=" << model.next_position() << '\n';
+                    continue;
+                }
                 if (line == "RESET") {
                     if (state_last) dump_state(false);
                     execute(StepPhase::reset); ++request_sequence;

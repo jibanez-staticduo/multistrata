@@ -68,6 +68,20 @@ def test_dry_run_does_not_open_credentials_or_launch(config, monkeypatch):
     assert "private testing credential" not in json.dumps(result)
 
 
+def test_explicit_batched_polling_policy_and_64k_bounds(config):
+    args = list(config["args"])
+    args[args.index("--context") + 1] = "65536"
+    args += ["--expert-collectives", "batched", "--poll-interval-ms", "0"]
+    options = runner.validated(dict(config, args=args))["options"]
+    assert options["context"] == "65536" and options["poll-interval-ms"] == "0"
+    for flag, value in (("--context", "65537"), ("--poll-interval-ms", "1001"),
+                        ("--expert-collectives", "unknown")):
+        wrong = list(args)
+        wrong[wrong.index(flag) + 1] = value
+        with pytest.raises(runner.RunnerError):
+            runner.validated(dict(config, args=wrong))
+
+
 def test_execute_redaction_exact_input_and_hashes(config, tmp_path, monkeypatch):
     calls = fake_process(monkeypatch, config)
     monkeypatch.setenv("NCCL_NET", "Socket")

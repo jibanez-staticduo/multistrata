@@ -409,3 +409,14 @@ def test_http_health_reports_group_failure_and_expired_lease(make_engine):
         status, body = request(port, "/api/health")
         assert status == 503
         assert json.loads(body)["loaded"] is False
+
+
+def test_http_failed_distributed_group_requires_explicit_restart(make_engine):
+    engine = make_engine("death")
+    with http_service(engine) as port:
+        status, body = request(port, "/v1/chat/completions",
+                               {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1})
+    assert status == 503
+    message = json.loads(body)["error"]["message"]
+    assert "restart the distributed group" in message
+    assert "next request restarts" not in message

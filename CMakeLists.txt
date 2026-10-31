@@ -2838,9 +2838,10 @@ if(STRATA_BUILD_DISTRIBUTED)
                  src/distributed/session.cpp src/distributed/control_tcp.cpp
                  src/distributed/state_evidence.cpp src/distributed/parity_trace_writer.cpp
                  src/distributed/serve_protocol.cpp src/distributed/autoregressive.cpp
-                 src/distributed/model_checkpoint.cpp)
+                 src/distributed/model_checkpoint.cpp src/distributed/model_state.cpp)
   target_compile_definitions(strata-distributed PRIVATE STRATA_BUILD_DISTRIBUTED
-                             STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE)
+                             STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE
+                             STRATA_MODEL_CHECKPOINT_WITH_CUDA)
   target_include_directories(strata-distributed PRIVATE include src ${STRATA_NCCL_INCLUDE_DIR}
                             ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata-distributed PRIVATE strata_engine strata_tp_cuda strata_kernels_cpu
@@ -2858,6 +2859,12 @@ if(STRATA_BUILD_DISTRIBUTED)
   target_link_libraries(parity_trace_writer_test PRIVATE Threads::Threads)
   add_test(NAME distributed_parity_trace_writer COMMAND parity_trace_writer_test
            ${CMAKE_CURRENT_BINARY_DIR}/parity-trace-writer-test-output)
+
+  add_executable(test_model_state tests/distributed/test_model_state.cpp src/distributed/model_state.cpp
+                 src/distributed/model_checkpoint.cpp src/distributed/state_evidence.cpp)
+  target_include_directories(test_model_state PRIVATE include src ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(test_model_state PRIVATE strata_warnings)
+  add_test(NAME distributed_model_state COMMAND test_model_state)
 endif()
 
 if(STRATA_BUILD_DISTRIBUTED_TESTS)
@@ -2914,6 +2921,11 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_include_directories(test_model_checkpoint PRIVATE include)
   target_link_libraries(test_model_checkpoint PRIVATE strata_warnings)
   add_test(NAME test_model_checkpoint COMMAND test_model_checkpoint)
+
+  add_executable(test_process_exit_guard tests/distributed/test_process_exit_guard.cpp)
+  target_include_directories(test_process_exit_guard PRIVATE include)
+  target_link_libraries(test_process_exit_guard PRIVATE strata_warnings)
+  add_test(NAME test_process_exit_guard COMMAND test_process_exit_guard)
 
   add_executable(test_model_worker_command tests/distributed/test_model_worker_command.cpp
                                           src/distributed/model_worker.cpp)

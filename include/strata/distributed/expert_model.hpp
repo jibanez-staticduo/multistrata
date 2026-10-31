@@ -9,6 +9,7 @@
 namespace strata::distributed {
 
 enum class ExpertDownPolicy { ExactLaneReference, PartialReduce };
+enum class ExpertCollectivePolicy { Sequential, Batched };
 // ExactLaneReference gathers native FMA operands before the original warp sum;
 // PartialReduce keeps the measured reassociation path for component benchmarks.
 
@@ -22,7 +23,8 @@ public:
                         const core::ModelGeometry&, int rank, LayerCollectives&,
                         std::array<uint64_t, 3> valid = {256, 192, 192},
                         uint32_t readback_timeout_ms = 60000,
-                        ExpertDownPolicy down_policy = ExpertDownPolicy::ExactLaneReference);
+                        ExpertDownPolicy down_policy = ExpertDownPolicy::ExactLaneReference,
+                        ExpertCollectivePolicy collective_policy = ExpertCollectivePolicy::Sequential);
     ~NativeRoutedExperts();
     NativeRoutedExperts(const NativeRoutedExperts&) = delete;
     NativeRoutedExperts& operator=(const NativeRoutedExperts&) = delete;

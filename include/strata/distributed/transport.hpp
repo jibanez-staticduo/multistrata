@@ -502,7 +502,8 @@ class GuardedTransport final : public Transport {
 
     // How long a poll waits before looking again, and how long `wait` may poll at all.  The poll interval is
     // a real sleep between looks at the library, so it is only used when the backend reports "not yet".
-    void set_poll_interval_ms(uint32_t ms) { poll_interval_ms_ = ms == 0 ? 1u : ms; }
+    // Zero opts into yielding without a timed sleep; the default remains one millisecond.
+    void set_poll_interval_ms(uint32_t ms) { poll_interval_ms_ = ms; }
 
  private:
     Failure health_unlocked() const;
@@ -594,6 +595,8 @@ inline Failure GuardedTransport::wait(Deadline at) {
         }
         if (poll_interval_ms_ > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(poll_interval_ms_));
+        } else {
+            std::this_thread::yield();
         }
     }
 }
