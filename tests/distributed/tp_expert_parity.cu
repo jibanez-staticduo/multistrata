@@ -95,6 +95,8 @@ std::vector<uint8_t> random_plane(int ty, int rows, int width, std::mt19937& rng
 struct Options {
     bool measure = true;
     bool inspect = false;
+    bool roundoff_bound = false;
+    bool roundoff_selftest = false;
     double atol = 0, rtol = 0;
     int layer = 0, expert = 0;
     std::vector<std::string> gguf;
@@ -106,6 +108,8 @@ Options options(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--measure-only") { o.measure = true; continue; }
         if (arg == "--inspect-sample") { o.inspect = true; continue; }
+        if (arg == "--roundoff-bound") { o.roundoff_bound = true; continue; }
+        if (arg == "--roundoff-selftest") { o.roundoff_selftest = true; continue; }
         require(i + 1 < argc, "missing argument value");
         const std::string v = argv[++i];
         if (arg == "--atol") { o.atol = std::stod(v); atol = true; }
@@ -125,23 +129,36 @@ Options options(int argc, char** argv) {
 struct Metrics {
     int failures = 0;
     const Options& o;
-    void compare(const char* label, const std::vector<float>& ref, const std::vector<float>& got, bool exact = false) {
+    void compare(const char* label, const std::vector<float>& ref, const std::vector<float>& got, bool exact = false,
+                 const std::vector<double>* bounds = nullptr, const std::vector<double>* norm = nullptr) {
         require(ref.size() == got.size(), "comparison size mismatch");
         double max_abs = 0, err2 = 0, ref2 = 0;
         std::size_t bad = 0;
         bool all_finite = true;
+        std::size_t worst = 0, bound_bad = 0;
+        double max_ratio = 0;
         for (std::size_t i = 0; i < ref.size(); ++i) {
             const double e = std::abs(double(got[i]) - ref[i]);
             const bool finite = std::isfinite(ref[i]) && std::isfinite(got[i]);
             all_finite = all_finite && finite;
             max_abs = std::max(max_abs, finite ? e : std::numeric_limits<double>::infinity());
+            const double limit = bounds ? (*bounds)[i] : o.atol + o.rtol * std::abs(double(ref[i]));
+            const double ratio = limit > 0 ? e / limit : (e ? std::numeric_limits<double>::infinity() : 0);
+            if (ratio > max_ratio) { max_ratio = ratio; worst = i; }
+            if (bounds && (!finite || e > limit)) ++bound_bad;
             err2 += e * e; ref2 += double(ref[i]) * ref[i];
             if (!finite || (exact ? std::memcmp(&got[i], &ref[i], sizeof(float)) != 0 :
                               e > o.atol + o.rtol * std::abs(double(ref[i])))) ++bad;
         }
         std::printf("%s max_abs=%.9g rms=%.9g relative_l2=%.9g outside_limits=%zu exact=%d\n",
                     label, max_abs, std::sqrt(err2 / ref.size()), std::sqrt(err2 / std::max(ref2, 1e-300)), bad, exact);
-        if (!all_finite || (bad && (exact || !o.measure))) ++failures;
+        if (bad || bounds) std::printf("  worst_lane=%zu expected=%.9g got=%.9g magnitude=%.9g limit=%.9g error_over_limit=%.9g derived_bound=%d outside_bound=%zu\n",
+            worst, double(ref[worst]), double(got[worst]), std::max(std::abs(double(ref[worst])), std::abs(double(got[worst]))),
+            bounds ? (*bounds)[worst] : o.atol + o.rtol * std::abs(double(ref[worst])), max_ratio, bounds != nullptr, bound_bad);
+        if (norm) std::printf("  worst_lane_sum_abs_terms=%.17g cancellation_condition=%.9g\n", (*norm)[worst],
+            (*norm)[worst] / std::max(std::abs(double(ref[worst])), 1e-300));
+        const auto rejected = bounds && o.roundoff_bound && !exact ? bound_bad : bad;
+        if (!all_finite || (rejected && (exact || !o.measure))) ++failures;
     }
 };
 
@@ -215,6 +232,93 @@ std::vector<uint8_t> expert_rows(const Tensor& t, int expert) {
 }
 
 struct Sample { int gu, down, input, ff; std::vector<uint8_t> blob; };
+
+double half_value(const uint8_t* bytes) {
+    const unsigned h = unsigned(bytes[0]) | unsigned(bytes[1]) << 8;
+    const unsigned exponent = (h >> 10) & 31, mantissa = h & 1023;
+    require(exponent != 31, "nonfinite scale in independent roundoff analysis");
+    const double magnitude = exponent ? std::ldexp(double(1024 + mantissa), int(exponent) - 25)
+                                      : std::ldexp(double(mantissa), -24);
+    return h & 0x8000 ? -magnitude : magnitude;
+}
+double gamma(int depth) {
+    const double nu = depth * std::ldexp(1.0, -24);
+    require(nu < 1, "invalid floating point error depth");
+    return nu / (1 - nu);
+}
+struct DownRoundoff { std::vector<double> norm, error; std::vector<float> scalar; };
+DownRoundoff down_roundoff(const Sample& s, const k::NativeExpertLayout& layout,
+                          const std::vector<uint8_t>& activation, int rows) {
+    // Independent scalar interpretation of ORIGINAL GGUF codes and Q8_1 bytes.
+    // Each exact dot term has an integer sum (<= 16/32*127*127), two half
+    // scales whose product is exact in float, then one rounded multiply/FMA.
+    // The error of each summation DAG is gamma_depth * sum(abs(exact terms)).
+    // Monolithic: ceil(calls/32) lane additions + 5 butterfly adds + product.
+    // TP: same maximum depth, plus two rank additions. Comparing both DAGs
+    // gives (gamma_d + gamma_(d+2))*A. No observed output/error sets this bound.
+    static constexpr int table[] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+    const int qk = block(s.down), calls = s.ff / qk * 2;
+    const int depth = (calls + 31) / 32 + 5 + 1;
+    DownRoundoff result{std::vector<double>(std::size_t(rows) * s.input),
+                        std::vector<double>(std::size_t(rows) * s.input),
+                        std::vector<float>(std::size_t(rows) * s.input)};
+    for (int token = 0; token < rows; ++token) for (int out = 0; out < s.input; ++out) {
+        double norm = 0;
+        double exact_sum = 0;
+        const auto* wrow = s.blob.data() + layout.down_off + std::size_t(out) * layout.d_row;
+        for (int call = 0; call < calls; ++call) {
+            const int b = call / 2, part = call % 2;
+            const auto* w = wrow + std::size_t(b) * k::iq_row_bytes(s.down, qk);
+            const auto* a = activation.data() + std::size_t(token) * (s.ff / 32) * 36;
+            int integer_dot = 0;
+            if (s.down == 20) {
+                a += b * 36;
+                for (int j = 0; j < 16; ++j) {
+                    const int lane = part * 8 + j % 8 + (j / 8) * 16;
+                    const int code = (w[2 + lane % 16] >> (lane / 16 * 4)) & 15;
+                    integer_dot += table[code] * int(static_cast<int8_t>(a[4 + lane]));
+                }
+            } else {
+                a += (b * 2 + part) * 36;
+                for (int j = 0; j < 32; ++j) {
+                    const int lane = part * 32 + j;
+                    const int code = (w[2 + lane / 4] >> ((lane % 4) * 2)) & 3;
+                    integer_dot += (code - 1) * int(static_cast<int8_t>(a[4 + j]));
+                }
+            }
+            const double term = half_value(w) * half_value(a) * integer_dot;
+            norm += std::abs(term); exact_sum += term;
+        }
+        const auto i = std::size_t(token) * s.input + out;
+        result.norm[i] = norm;
+        result.error[i] = (gamma(depth) + gamma(depth + 2)) * norm;
+        result.scalar[i] = float(exact_sum);
+    }
+    std::printf("roundoff-policy calls=%d lane_plus_tree_product_depth=%d rank_additions=2 u=2^-24 formula=(gamma(d)+gamma(d+2))*sum_abs_original_terms\n",
+                calls, depth);
+    return result;
+}
+void roundoff_selftest() {
+    for (int type : {20, 42}) {
+        const auto l = k::native_expert_layout(21, type, 256, 192);
+        Sample s{21, type, 256, 192, std::vector<uint8_t>(l.bytes, 0)};
+        for (std::size_t o = l.down_off; o < l.bytes; o += k::iq_row_bytes(type, block(type))) {
+            s.blob[o] = 0; s.blob[o + 1] = 0x3c;
+        }
+        std::vector<uint8_t> a(6 * 36, 0);
+        for (int b = 0; b < 6; ++b) {
+            a[b * 36 + 1] = 0x3c;
+            std::fill(a.begin() + b * 36 + 4, a.begin() + (b + 1) * 36, 1);
+        }
+        const auto result = down_roundoff(s, l, a, 1);
+        const double expected = 192 * (type == 20 ? -127.0 : -1.0);
+        for (std::size_t i = 0; i < result.scalar.size(); ++i) {
+            require(result.scalar[i] == expected && result.norm[i] == -expected && result.error[i] > 0,
+                    "independent original-code scalar/bound selftest failed");
+        }
+    }
+    std::puts("independent-roundoff-host-selftest passed GPU_NOT_RUN");
+}
 Sample sample_real(const Options& o) {
     std::vector<Tensor> all;
     for (const auto& p : o.gguf) { const auto ts = tensors(p); all.insert(all.end(), ts.begin(), ts.end()); }
@@ -404,7 +508,9 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
     ck(cudaGetLastError()); ck(cudaStreamSynchronize(stream.s));
     std::printf("case gu=%s down=%s width=%d ff=%d rows=%d path=%s\n", codec(sample.gu), codec(sample.down),
                 width, ff, rows, rows == 1 ? "decode" : "prefill-mmvq-reference");
-    metrics.compare("rank-sum-vs-native-expert", oracle.read(), reduced.read());
+    auto roundoff = down_roundoff(sample, layout, hq.read(), rows);
+    metrics.compare("independent-scalar-original-block-dot", roundoff.scalar, oracle.read(), false, &roundoff.error, &roundoff.norm);
+    metrics.compare("rank-sum-vs-native-expert", oracle.read(), reduced.read(), false, &roundoff.error, &roundoff.norm);
 
     // Ordered top-k10, per-expert scales, a nonzero shared contribution, a zero
     // part and an unselected route (weight zero), independent native combine.
@@ -420,9 +526,13 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
     auto projected_ref = oracle.read();
     for (std::size_t i = 0; i < projected_ref.size(); ++i)
         projected_ref[i] = projected_ref[i] * .75f + bs[i % width];
+    for (std::size_t i = 0; i < roundoff.error.size(); ++i) {
+        roundoff.norm[i] = .75 * roundoff.norm[i] + std::abs(double(bs[i % width]));
+        roundoff.error[i] = .75 * roundoff.error[i] + 2 * gamma(2) * roundoff.norm[i];
+    }
     tp::finish_projection(reduced.p, rows, width, scale.p, bias.p, stream.s);
     ck(cudaStreamSynchronize(stream.s));
-    metrics.compare("expert-scale-bias-after-rank-sum", projected_ref, reduced.read());
+    metrics.compare("expert-scale-bias-after-rank-sum", projected_ref, reduced.read(), false, &roundoff.error, &roundoff.norm);
     oracle.upload(projected_ref);
     fill_parts<<<unsigned((n + 255) / 256), 256, 0, stream.s>>>(reduced.p, parts.p, n, width);
     fill_parts<<<unsigned((n + 255) / 256), 256, 0, stream.s>>>(oracle.p, reference_parts.p, n, width);
@@ -438,7 +548,14 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
     k::native_moe_combine_multi(reference_parts.p, route.p, shared.p, ref_combined.p, width, 10, rows, stream.s);
     ck(cudaStreamSynchronize(stream.s));
     auto ref = ref_combined.read();
-    metrics.compare("moe-topk10-scales-shared-zero-route", ref, combined.read());
+    for (std::size_t i = 0; i < roundoff.error.size(); ++i) {
+        double coefficient = 0;
+        for (int expert = 0; expert < 10; ++expert) if (expert != 8)
+            coefficient += std::abs(double(rw[(i / width) * 10 + expert]) * sv[expert]);
+        const double norm = coefficient * roundoff.norm[i] + std::abs(double(sh[i]));
+        roundoff.error[i] = coefficient * roundoff.error[i] + 2 * gamma(12) * norm;
+    }
+    metrics.compare("moe-topk10-scales-shared-zero-route", ref, combined.read(), false, &roundoff.error);
 
     // Empty native groups must leave the destination untouched.
     groups.upload({0}); oracle.upload(sh);
@@ -451,6 +568,7 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
 int main(int argc, char** argv) {
     try {
         const Options o = options(argc, argv);
+        if (o.roundoff_selftest) { roundoff_selftest(); return 0; }
         // These environment-only experiments bypass the selected ordinary
         // grouped control before its public setters take effect.
         for (const char* name : {"STRATA_EXPERT_V2", "STRATA_EXPERT_V2K", "STRATA_DOWN_WS"}) {
@@ -486,8 +604,9 @@ int main(int argc, char** argv) {
             }
         }
         if (!o.gguf.empty()) { const auto real = sample_real(o); for (int rows : {1, 4, 17}) run(real, rows, metrics); }
-        std::printf("failures=%d mode=%s atol=%.9g rtol=%.9g real_sample=%d\n", metrics.failures,
-                    o.measure ? "measurement-only-not-qualified" : "frozen-limits", o.atol, o.rtol, !o.gguf.empty());
+        std::printf("failures=%d mode=%s atol=%.9g rtol=%.9g real_sample=%d derived_roundoff_gate=%d\n", metrics.failures,
+                    o.measure ? "measurement-only-not-qualified" : "frozen-limits", o.atol, o.rtol,
+                    !o.gguf.empty(), o.roundoff_bound);
         if (metrics.failures) return 1;
         return o.measure ? 77 : 0;
     } catch (const std::exception& e) {
