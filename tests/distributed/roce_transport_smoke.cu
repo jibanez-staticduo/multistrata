@@ -110,7 +110,9 @@ Options parse(int argc, char** argv) {
     if (args.contains("slot-bytes")) o.slot_bytes = number(args.at("slot-bytes"), UINT64_MAX);
     if (o.rank >= kTpWorld || o.fault_rank >= kTpWorld || o.stripes != 1 ||
         o.timeout_ms < 100 || o.timeout_ms > 60000 ||
-        (o.fault != "none" && o.fault != "missing-rank" && o.fault != "killed-peer")) {
+        (o.fault != "none" && o.fault != "missing-rank" && o.fault != "killed-peer" &&
+         o.fault != "graph-killed-peer") ||
+        (o.fault == "graph-killed-peer" && o.fault_rank != 2)) {
         throw std::runtime_error("invalid test configuration");
     }
     return o;
@@ -223,6 +225,14 @@ private:
         require(session_.complete_operation(op));
     }
 
+    Deadline graph_replay_deadline() {
+        Deadline at = deadline(session_);
+        if (options_.fault == "graph-killed-peer") {
+            at.end = std::min(at.end, std::chrono::steady_clock::now() + std::chrono::seconds(8));
+        }
+        return at;
+    }
+
     template <typename T>
     void reduce(size_t count, ScalarType type) {
         std::vector<T> input(count), output(count);
@@ -324,9 +334,19 @@ private:
         cuda_check(cudaStreamEndCapture(stream_.get(), &graph));
         if (!backend_.graph_capture_seen()) throw std::runtime_error("backend did not observe CUDA graph capture");
         cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        if (options_.fault == "graph-killed-peer") {
+            // All ranks finish capture and instantiation before any graph can touch the RoCE buffers.
+            require(session_.agree_control_payload("roce-graph-capture-ready-v1",
+                                                   "all_reduce_sum:fp32:256,512,1024", deadline(session_)));
+            if (options_.rank == options_.fault_rank) {
+                std::cout << "{\"event\":\"injected_graph_peer_exit\",\"rank\":" << options_.rank << "}\n";
+                std::cout.flush();
+                std::_Exit(86);
+            }
+        }
         for (uint32_t replay = 0; replay < 100; ++replay) {
             require(cuda_graph_launch(executable, stream_.get()));
-            require(backend_.wait_captured_replay(deadline(session_)));
+            require(backend_.wait_captured_replay(graph_replay_deadline()));
             for (size_t op_index = 0; op_index < counts.size(); ++op_index) {
                 std::vector<float> output(counts[op_index]);
                 cuda_check(cudaMemcpyAsync(output.data(), receives[op_index]->get(),
