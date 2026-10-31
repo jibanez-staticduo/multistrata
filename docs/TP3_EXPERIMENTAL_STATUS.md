@@ -169,7 +169,8 @@ All three ranks exit 0. [The size-eight receipt][prefill8] records nine exact
 full-vocabulary boundary logit rows and 3915 exact state comparisons against
 TP1. This is a short correctness gate, not a GEMM or speed result. Size two also passes twelve exact logit rows and 5022 state comparisons;
 size four passes ten rows and 4284 state comparisons. All three-rank receipts
-exit 0. Service integration remains under qualification.
+exit 0. The C1 service also runs the opt-in chunk path and returns measured host-phase
+prefill/decode timings. Its same-ID full-state comparison remains under qualification.
 
 ## Native RoCEnante transport checks
 
