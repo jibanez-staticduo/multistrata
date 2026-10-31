@@ -159,6 +159,17 @@ succeeds with both methods, so the driver's underlying cause remains unknown.
 The successful launch also advises away clean verified model file-cache pages
 after hashing; CUDA's resident-expert budget check remains enforced.
 
+## Exact native prefill chunks
+
+The opt-in layer-major prefill path groups GDN projections through the native
+multi-column MMVQ kernels while advancing recurrence, QSA and PLE causally.
+The first size-eight whole-model test processes variable chunks including
+8, 1, 7 and a final 8+2 remainder, then repeats the first chunk after RESET.
+All three ranks exit 0. [The size-eight receipt][prefill8] records nine exact
+full-vocabulary boundary logit rows and 3915 exact state comparisons against
+TP1. This is a short correctness gate, not a GEMM or speed result. Sizes two
+and four and service integration remain under qualification.
+
 ## Native RoCEnante transport checks
 
 The separate opt-in native CUDA/C proxy transport passes a three-host smoke:
@@ -229,7 +240,7 @@ the qualifying outputs. These failed attempts are not counted as passes.
 - Full 64K prompt C1 state/logit continuation, long resets and failure recovery.
 - A useful additional capacity case and complete per-rank warmup/prefill/decode accounting.
 - MTP acceptance probabilities, long rollback/reset and failure state against TP1; sampled distribution checks.
-- Full-model CUDA graphs, long replay/reset/timeout behavior and C4/C8 internal state isolation.
+- Full-model CUDA graphs and long replay/reset/timeout behavior; short C4/C8 state isolation passes as recorded.
 - Matched TP1/TP2/TP3 performance matrix and continuation thresholds; a separate Staticduo21/vLLM comparison when quantization differs.
 
 No upstream PR is implied. Maintainer scope agreement and the required backend
@@ -282,3 +293,5 @@ files with this report when sharing it; the links are not public downloads.
 [c8state]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/c8-check/result/comparison.json
 
 [c8allstate]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/c8-all-check/result/comparison.json
+
+[prefill8]: /home/staticduo/tmp/strata-tp3-20261031/prefill-batch8/independent-qualification.json
