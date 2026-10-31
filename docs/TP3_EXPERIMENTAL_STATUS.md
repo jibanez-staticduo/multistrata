@@ -389,6 +389,15 @@ cannot establish isolated capacity or performance. The offline telemetry report
 keeps host RSS/PSS separate and retains UNKNOWN for missing historical phases:
 `/home/staticduo/tmp/strata-tp3-20261031/capacity-accounting/phase-report.md`.
 
+The first isolated 4096-token C4 round also has a per-request, per-rank memory
+report. It covers four distinct slot/request IDs and all seven markers on each
+rank, excludes the separate 15-token warmup and uses the context-65792 C4 budget.
+All 84 corresponding host snapshots match within one second. The 4030-second
+group envelope is separate from each slot's active native phases. Allocator
+availability, RSS, PSS and formula allocations remain separate:
+`/home/staticduo/tmp/strata-tp3-20261031/capacity-accounting/c4-memory-report.md`.
+This does not demonstrate useful additional capacity.
+
 ## Sampled verifier control
 
 The distributed MTP correctness path samples the target directly and admits
