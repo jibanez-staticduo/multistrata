@@ -35,9 +35,9 @@
 //     `docs/userguide/source/examples.rst` (which stops on `checkTimeout()`), and it holds a handle to abort.
 //   * Enqueue is not completion.  `usage/streams.rst`: "The NCCL call returns when the operation has been
 //     effectively enqueued to the given stream ... The operation status can be queried using standard CUDA
-//     semantics, for example, calling cudaStreamSynchronize or using CUDA events."  So enqueue records a
-//     private event on the caller's stream after the collective, and `poll_completion` queries that event: it
-//     is the only thing in this file that says "the device is done".
+//     semantics, for example, calling cudaStreamSynchronize or using CUDA events." For ncclInProgress,
+//     api/comms.rst first requires async state to become ncclSuccess before any related CUDA call. Only then
+//     is the private completion event recorded; polling that event proves device completion.
 //   * Late errors come from `ncclCommGetAsyncError`.  `usage/communicators.rst`: "Some communication errors,
 //     and in particular network errors, are reported through the ncclCommGetAsyncError function.  Operations
 //     experiencing an asynchronous error will usually not progress and never complete."  Every poll asks, and
@@ -48,7 +48,8 @@
 //     that reason; this file can only do its half.  Kept honest: the same document asks that no thread be
 //     inside an NCCL call while `ncclCommAbort` runs.  The transport is one worker thread with one operation
 //     in flight, so the normal path (fail, then abort from the thread that failed) satisfies it.  Aborting
-//     from a watchdog thread rests on the non-blocking setting above and has not been run on hardware.
+//     from a watchdog is serialized with all NCCL calls by the same mutex. Abort itself is a blocking NCCL
+//     API and its runtime on failed hardware has not been measured here.
 //
 // Bootstrap id encoding.  `ncclUniqueId` is 128 opaque bytes; `NcclConfig::bootstrap_id` is a string because it
 // travels through the session roster.  The encoding is lowercase hex, 256 characters, no separators, and a
@@ -70,6 +71,10 @@
 #include <nccl.h>
 
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
 
 #include <array>
 #include <chrono>
@@ -226,6 +231,41 @@ inline bool sha256_of_file(const std::string& path, std::string& hex_out, std::s
     return true;
 }
 
+// A dladdr pathname can be replaced after dlopen. Hash an open descriptor only after its inode agrees
+// with the mapping containing the resolved symbol, and refuse a file modified while it is being read.
+bool mapped_library_hash(const std::string& path, const void* symbol, std::string& hash, std::string& err) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { err = "cannot open mapped NCCL library for provenance"; return false; }
+    struct stat before{}, after{};
+    bool matches = false;
+    if (::fstat(fd, &before) == 0) {
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line)) {
+            unsigned long start = 0, end = 0, offset = 0, inode = 0;
+            unsigned dev_major = 0, dev_minor = 0;
+            char perms[5]{};
+            if (std::sscanf(line.c_str(), "%lx-%lx %4s %lx %x:%x %lu", &start, &end, perms,
+                            &offset, &dev_major, &dev_minor, &inode) != 7) continue;
+            const auto address = reinterpret_cast<uintptr_t>(symbol);
+            if (address >= start && address < end) {
+                matches = inode == static_cast<unsigned long>(before.st_ino) &&
+                          dev_major == major(before.st_dev) && dev_minor == minor(before.st_dev);
+                break;
+            }
+        }
+    }
+    bool ok = matches && sha256_of_file("/proc/self/fd/" + std::to_string(fd), hash, err) &&
+              ::fstat(fd, &after) == 0 && before.st_size == after.st_size &&
+              before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
+              before.st_mtim.tv_nsec == after.st_mtim.tv_nsec &&
+              before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
+              before.st_ctim.tv_nsec == after.st_ctim.tv_nsec;
+    ::close(fd);
+    if (!ok) err = "NCCL mapped inode differs from the provenance file, or the file changed while hashing";
+    return ok;
+}
+
 inline std::string hex_of_id(const ncclUniqueId& id) {
     return sha256_ns::hex(reinterpret_cast<const uint8_t*>(id.internal), NCCL_UNIQUE_ID_BYTES);
 }
@@ -280,6 +320,13 @@ struct NcclSymbols {
     decltype(&ncclAllGather) all_gather = nullptr;
 };
 
+struct CudaCalls {
+    decltype(&cudaEventCreateWithFlags) event_create = &cudaEventCreateWithFlags;
+    decltype(&cudaEventRecord) event_record = &cudaEventRecord;
+    decltype(&cudaEventQuery) event_query = &cudaEventQuery;
+    decltype(&cudaEventDestroy) event_destroy = &cudaEventDestroy;
+};
+
 constexpr const char* kSymbolNames[10] = {"ncclGetVersion",
                                          "ncclGetUniqueId",
                                          "ncclCommInitRankConfig",
@@ -327,17 +374,15 @@ namespace {
 
 using detail::NcclSymbols;
 
-// The symbols of the library this process loaded, so an error can be named before any instance exists.
-NcclSymbols g_symbols;
-
 // The production `NcclApi`: one communicator, one completion event, one sticky async failure.
 class ProductionNcclApi final : public NcclApi {
  public:
-    ProductionNcclApi(NcclConfig config, void* dl, NcclSymbols symbols, std::string resolved_path)
+    ProductionNcclApi(NcclConfig config, void* dl, NcclSymbols symbols, std::string resolved_path,
+                      std::string provenance, detail::CudaCalls cuda = {})
         : config_(std::move(config)),
           dl_(dl),
           symbols_(symbols),
-          resolved_path_(std::move(resolved_path)) {}
+          resolved_path_(std::move(resolved_path)), cuda_(cuda), provenance_(std::move(provenance)) {}
 
     ProductionNcclApi(const ProductionNcclApi&) = delete;
     ProductionNcclApi& operator=(const ProductionNcclApi&) = delete;
@@ -356,14 +401,6 @@ class ProductionNcclApi final : public NcclApi {
         }
         version = detail::version_string(code);
         std::lock_guard<std::mutex> lock(mutex_);
-        if (provenance_.empty()) {
-            std::string hash;
-            std::string err;
-            if (!detail::sha256_of_file(resolved_path_, hash, err)) {
-                return Failure::fail(FailureCode::library_mismatch, err);
-            }
-            provenance_ = "sha256:" + hash;
-        }
         provenance = provenance_;
         return ok_failure();
     }
@@ -371,8 +408,13 @@ class ProductionNcclApi final : public NcclApi {
     // Where the hashed bytes came from, for the runner's report line.  Not part of the boundary.
     const std::string& resolved_library_path() const { return resolved_path_; }
 
-    // How long `comm_init` may poll before it gives up, leaving the handle abortable.
-    void set_init_deadline(std::chrono::steady_clock::time_point at) { init_deadline_ = at; }
+    bool bootstrap_id(std::string& out, std::string& err) {
+        ncclUniqueId id;
+        const ncclResult_t rc = symbols_.get_unique_id(&id);
+        if (rc != ncclSuccess) { err = "ncclGetUniqueId: " + describe_static(rc, nullptr); return false; }
+        out = detail::hex_of_id(id);
+        return true;
+    }
 
     // Form the communicator without ever blocking past the caller's patience.
     Failure comm_init(const NcclConfig& config) override {
@@ -389,6 +431,9 @@ class ProductionNcclApi final : public NcclApi {
                                  "rank " + std::to_string(config.rank) + " of " +
                                      std::to_string(config.world));
         }
+        if (config.initialize_ms == 0 || config.initialize_ms > 3600000u) {
+            return Failure::fail(FailureCode::invalid_config, "NCCL initialization needs a bounded budget");
+        }
         ncclUniqueId id;
         {
             std::string err;
@@ -403,75 +448,62 @@ class ProductionNcclApi final : public NcclApi {
         cfg.blocking = 0;
         cfg.commName = "strata-tp3";
 
-        ncclComm_t comm = nullptr;
+        const ncclResult_t rc = symbols_.comm_init_rank_config(&comm_, static_cast<int>(config.world), id,
+                                                               static_cast<int>(config.rank), &cfg);
+        if (rc != ncclSuccess && rc != ncclInProgress) {
+            return Failure::fail(FailureCode::comm_failed,
+                                 "ncclCommInitRankConfig returned " + describe_static(rc, nullptr));
+        }
+        if (comm_ == nullptr) {
+            return Failure::fail(FailureCode::comm_failed, "initialisation gave no communicator handle");
+        }
+        const auto init_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(config.initialize_ms);
+        // Publish the handle before unlocking, and initialize exactly once. Abort and every NCCL call are
+        // serialized by the same mutex; the poll loop never retains a stale local handle across an unlock.
         for (;;) {
-            if (aborted_) {
-                // Someone abandoned the session while the communicator was forming.  Nothing else is created.
-                if (comm != nullptr) symbols_.comm_abort(comm);
-                return Failure::fail(FailureCode::aborted,
-                                     "the backend was abandoned while the communicator was forming");
-            }
-            const ncclResult_t rc = symbols_.comm_init_rank_config(&comm, static_cast<int>(config.world), id,
-                                                                    static_cast<int>(config.rank), &cfg);
-            if (rc == ncclSuccess) break;
-            if (rc != ncclInProgress) {
-                if (comm != nullptr) {
-                    symbols_.comm_abort(comm);
-                }
-                return Failure::fail(FailureCode::comm_failed,
-                                     "ncclCommInitRankConfig returned " + describe_static(rc, nullptr));
-            }
-            if (comm == nullptr) {
-                // "In progress" with no handle is nothing to poll and nothing to abort.  A watchdog would have
-                // nothing to hold, so this is a failure, not a slow start.
-                return Failure::fail(FailureCode::comm_failed,
-                                     "initialisation is in progress but the library gave no handle to poll");
-            }
-            if (std::chrono::steady_clock::now() >= init_deadline_) {
-                // Keep the handle: the caller's next act is `abort()`, and an abortable half-formed
-                // communicator is the whole reason the communicator is non-blocking.
-                comm_ = comm;
-                return Failure::fail(FailureCode::deadline_expired,
-                                     "the communicator was still forming when the init deadline passed");
-            }
-            ncclResult_t state = ncclSuccess;
-            const ncclResult_t pr = symbols_.comm_get_async_error(comm, &state);
+            if (aborted_) return Failure::fail(FailureCode::aborted, "initialisation was abandoned");
+            ncclResult_t state = ncclInProgress;
+            const ncclResult_t pr = symbols_.comm_get_async_error(comm_, &state);
             if (pr != ncclSuccess && pr != ncclInProgress) {
-                symbols_.comm_abort(comm);
                 return Failure::fail(FailureCode::comm_failed,
                                      "initialisation reported " + describe_static(pr, nullptr));
             }
             if (state != ncclSuccess && state != ncclInProgress) {
-                symbols_.comm_abort(comm);
                 return Failure::fail(FailureCode::comm_failed,
                                      "initialisation reported " + describe_static(state, nullptr));
             }
-            // Sleep with the lock released: an init that polls for a minute must not be what keeps a watchdog
-            // from reaching `comm_abort()`.  Each NCCL call itself is made under the lock, so no two threads of
-            // this process are inside the library at once.
+            if (pr == ncclSuccess && state == ncclSuccess) break;
+            if (std::chrono::steady_clock::now() >= init_deadline) {
+                return Failure::fail(FailureCode::deadline_expired, "the communicator init deadline passed");
+            }
             lock.unlock();
             std::this_thread::sleep_for(std::chrono::milliseconds(kInitPollMs));
             lock.lock();
         }
+        const ncclComm_t comm = comm_;
 
         // The library's own idea of the world size.  A communicator with the wrong number of ranks means two
         // ranks joined two different sessions, and the sooner that is said, the fewer bytes go the wrong way.
         int ranks = 0;
         if (const ncclResult_t rc = symbols_.comm_count(comm, &ranks); rc != ncclSuccess) {
             symbols_.comm_abort(comm);
+            comm_ = nullptr;
             return Failure::fail(FailureCode::comm_failed,
                                  "ncclCommCount returned " + describe_static(rc, nullptr));
         }
         if (ranks != static_cast<int>(config.world)) {
             symbols_.comm_abort(comm);
+            comm_ = nullptr;
             return Failure::fail(FailureCode::comm_failed,
                                  "the communicator holds " + std::to_string(ranks) + " ranks, the roster says " +
                                      std::to_string(config.world));
         }
 
-        if (const cudaError_t ce = cudaEventCreateWithFlags(&event_, cudaEventDisableTiming);
+        if (const cudaError_t ce = cuda_.event_create(&event_, cudaEventDisableTiming);
             ce != cudaSuccess) {
             symbols_.comm_abort(comm);
+            comm_ = nullptr;
             event_ = nullptr;
             return Failure::fail(FailureCode::comm_failed,
                                  std::string("cudaEventCreateWithFlags: ") + cudaGetErrorString(ce));
@@ -492,7 +524,7 @@ class ProductionNcclApi final : public NcclApi {
             return Failure::fail(FailureCode::enqueue_failed,
                                  "ncclAllReduce returned " + describe(rc));
         }
-        return record_after_locked(stream, "all_reduce_sum");
+        return begin_completion_locked(stream, rc);
     }
 
     Failure enqueue_all_gather(const void* send, void* recv, uint64_t slot_elements, ScalarType type,
@@ -508,25 +540,33 @@ class ProductionNcclApi final : public NcclApi {
             return Failure::fail(FailureCode::enqueue_failed,
                                  "ncclAllGather returned " + describe(rc));
         }
-        return record_after_locked(stream, "all_gather_padded");
+        return begin_completion_locked(stream, rc);
     }
 
     Failure poll_completion(Deadline deadline) override {
         std::lock_guard<std::mutex> lock(mutex_);
         if (aborted_) return Failure::fail(FailureCode::aborted, "the communicator was abandoned");
         if (comm_ == nullptr) return Failure::fail(FailureCode::not_ready, "no communicator");
-        if (event_ == nullptr) {
+        if (!in_flight_ || event_ == nullptr) {
             return Failure::fail(FailureCode::not_ready, "nothing was enqueued to poll");
         }
         // Ask the library first: a network error shows up here and not in the event, and an operation that hit
         // one "will usually not progress and never complete".
-        if (auto f = async_error_unlocked()) return f;
-        const cudaError_t q = cudaEventQuery(event_);
-        if (q == cudaSuccess) return ok_failure();
+        ncclResult_t state = ncclInProgress;
+        if (auto f = async_error_unlocked(state)) return f;
+        if (state == ncclInProgress) {
+            return Failure::fail(FailureCode::deadline_expired, "NCCL is still enqueueing the collective");
+        }
+        if (!event_recorded_) {
+            if (auto f = record_after_locked(pending_stream_, "collective")) return f;
+            event_recorded_ = true;
+        }
+        const cudaError_t q = cuda_.event_query(event_);
+        if (q == cudaSuccess) {
+            in_flight_ = false;
+            return ok_failure();
+        }
         if (q == cudaErrorNotReady) {
-            // `cudaErrorNotReady` is not sticky, but clearing the last-error flag after a "not yet" is what
-            // the CUDA docs ask for, so a later CUDA call cannot read it as its own failure.
-            (void)cudaGetLastError();
             // The boundary asks for `deadline_expired` whenever the work is not done; saying which half of the
             // answer it is costs nothing and reads better in a log than the same sentence twice.
             const bool passed = std::chrono::steady_clock::now() >= deadline.end;
@@ -545,18 +585,9 @@ class ProductionNcclApi final : public NcclApi {
             return true;
         }
         if (comm_ == nullptr) return false;
-        // Nothing is stored here: `async_failure` is a question, and `poll_completion` is where a new error
-        // becomes sticky.  Asking must not be what decides a rank's session is fine.
-        ncclResult_t state = ncclSuccess;
-        const ncclResult_t rc = symbols_.comm_get_async_error(comm_, &state);
-        if (rc != ncclSuccess && rc != ncclInProgress) {
-            out = Failure::fail(FailureCode::async_error,
-                                "ncclCommGetAsyncError returned " + describe_static(rc, nullptr));
-            return true;
-        }
-        if (state != ncclSuccess && state != ncclInProgress) {
-            out = Failure::fail(FailureCode::async_error,
-                                "the communicator reports " + describe_static(state, nullptr));
+        ncclResult_t state = ncclInProgress;
+        if (auto f = async_error_unlocked(state)) {
+            out = f;
             return true;
         }
         return false;
@@ -580,7 +611,7 @@ class ProductionNcclApi final : public NcclApi {
             (void)symbols_.comm_abort(comm);
         }
         if (event != nullptr) {
-            (void)cudaEventDestroy(event);
+            (void)cuda_.event_destroy(event);
         }
     }
 
@@ -604,12 +635,20 @@ class ProductionNcclApi final : public NcclApi {
         }
         if (aborted_) return Failure::fail(FailureCode::aborted, "the communicator was abandoned");
         if (comm_ == nullptr) return Failure::fail(FailureCode::not_ready, "no communicator");
+        if (in_flight_) return Failure::fail(FailureCode::in_flight, "a collective is already in flight");
         return ok_failure();
     }
 
     // `ncclInProgress` from a non-blocking communicator means "accepted, not done".  It is not a failure, and
     // reading it as one would fail every collective on this build surface.
     static bool accepted(ncclResult_t rc) { return rc == ncclSuccess || rc == ncclInProgress; }
+
+    Failure begin_completion_locked(cudaStream_t stream, ncclResult_t rc) {
+        in_flight_ = true;
+        pending_stream_ = stream;
+        event_recorded_ = rc == ncclSuccess;
+        return event_recorded_ ? record_after_locked(stream, "collective") : ok_failure();
+    }
 
     Failure record_after_locked(cudaStream_t stream, const char* what) {
         // Called with `mutex_` held, straight after the enqueue it is measuring.
@@ -618,7 +657,7 @@ class ProductionNcclApi final : public NcclApi {
         }
         // Recorded after the collective, on the caller's stream: the event is complete exactly when the work
         // queued before it on that stream is complete.
-        const cudaError_t ce = cudaEventRecord(event_, stream);
+        const cudaError_t ce = cuda_.event_record(event_, stream);
         if (ce != cudaSuccess) {
             return Failure::fail(FailureCode::enqueue_failed,
                                  std::string(what) + ": cudaEventRecord: " + cudaGetErrorString(ce));
@@ -626,8 +665,9 @@ class ProductionNcclApi final : public NcclApi {
         return ok_failure();
     }
 
-    Failure async_error_unlocked() {
-        ncclResult_t state = ncclSuccess;
+    Failure async_error_unlocked(ncclResult_t& state) const {
+        if (sticky_) return sticky_failure_;
+        state = ncclInProgress;
         const ncclResult_t rc = symbols_.comm_get_async_error(comm_, &state);
         if (rc != ncclSuccess && rc != ncclInProgress) {
             sticky_ = true;
@@ -641,6 +681,7 @@ class ProductionNcclApi final : public NcclApi {
                                             "the communicator reports " + describe_static(state, nullptr));
             return sticky_failure_;
         }
+        if (rc == ncclInProgress) state = ncclInProgress;
         return ok_failure();
     }
 
@@ -648,13 +689,13 @@ class ProductionNcclApi final : public NcclApi {
     // here costs nothing: it does not clear what `ncclCommGetAsyncError` reported.
     std::string describe(ncclResult_t rc) const { return describe_static(rc, comm_); }
 
-    static std::string describe_static(ncclResult_t rc, ncclComm_t comm) {
+    std::string describe_static(ncclResult_t rc, ncclComm_t comm) const {
         std::string out = "unnamed result";
-        if (g_symbols.get_error_string != nullptr) {
-            if (const char* text = g_symbols.get_error_string(rc); text != nullptr) out = text;
+        if (symbols_.get_error_string != nullptr) {
+            if (const char* text = symbols_.get_error_string(rc); text != nullptr) out = text;
         }
-        if (comm != nullptr && g_symbols.get_last_error != nullptr) {
-            const char* last = g_symbols.get_last_error(comm);
+        if (comm != nullptr && symbols_.get_last_error != nullptr) {
+            const char* last = symbols_.get_last_error(comm);
             if (last != nullptr && *last != '\0') out += std::string("; last error: ") + last;
         }
         return out + " (ncclResult " + std::to_string(static_cast<int>(rc)) + ")";
@@ -664,16 +705,18 @@ class ProductionNcclApi final : public NcclApi {
     void* dl_ = nullptr;
     NcclSymbols symbols_{};
     std::string resolved_path_;
+    detail::CudaCalls cuda_;
 
     mutable std::mutex mutex_;
     ncclComm_t comm_ = nullptr;
     cudaEvent_t event_ = nullptr;
+    cudaStream_t pending_stream_ = nullptr;
+    bool in_flight_ = false;
+    bool event_recorded_ = false;
     bool aborted_ = false;
-    bool sticky_ = false;
-    Failure sticky_failure_{};
+    mutable bool sticky_ = false;
+    mutable Failure sticky_failure_{};
     mutable std::string provenance_;
-    std::chrono::steady_clock::time_point init_deadline_ =
-        std::chrono::steady_clock::now() + std::chrono::seconds(120);
     static constexpr uint32_t kInitPollMs = 5u;
 };
 
@@ -708,8 +751,6 @@ std::unique_ptr<NcclApi> make_production_nccl_api(const NcclConfig& config, std:
               "; this build needs every symbol of the pinned NCCL header";
         return nullptr;
     }
-    g_symbols = symbols;
-
     // Where the file really is.  A soname can resolve anywhere, and the provenance hash must be measured on
     // the bytes that were mapped, not on the string the caller happened to pass.
     std::string resolved = requested;
@@ -727,7 +768,21 @@ std::unique_ptr<NcclApi> make_production_nccl_api(const NcclConfig& config, std:
         return nullptr;
     }
 
-    return std::make_unique<ProductionNcclApi>(config, dl, symbols, std::move(resolved));
+    std::string hash;
+    if (!detail::mapped_library_hash(resolved, reinterpret_cast<void*>(symbols.get_version), hash, err)) {
+        dlclose(dl);
+        return nullptr;
+    }
+    return std::make_unique<ProductionNcclApi>(config, dl, symbols, std::move(resolved), "sha256:" + hash);
+}
+
+bool make_nccl_bootstrap_id(const std::string& library_path, std::string& out, std::string& err) {
+    out.clear();
+    NcclConfig config;
+    config.library_path = library_path;
+    auto api = make_production_nccl_api(config, err);
+    if (!api) return false;
+    return static_cast<ProductionNcclApi*>(api.get())->bootstrap_id(out, err);
 }
 
 }  // namespace strata::distributed::nccl

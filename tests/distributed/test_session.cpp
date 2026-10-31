@@ -238,6 +238,75 @@ std::vector<JoinInfo> good_roster() {
 
 // ---------------------------------------------------------------- the protocol, scripted
 
+std::string operation_payload(const CollectiveDescriptor& d) {
+    std::string signature, out;
+    canonical_collective(d, signature);
+    auto field = [&](const std::string& text) {
+        const uint32_t n = static_cast<uint32_t>(text.size());
+        for (int shift : {24, 16, 8, 0}) out.push_back(static_cast<char>((n >> shift) & 0xff));
+        out += text;
+    };
+    field(kUuid); field(signature);
+    return out;
+}
+
+void collective_agreement() {
+    const CollectiveDescriptor good{{1, 2, 3}, CollectiveKind::all_gather_padded, ScalarType::fp32,
+                                    256, {256, 192, 192}};
+    for (int mismatch = -1; mismatch < 6; ++mismatch) {
+        Harness h;
+        const auto ranks = good_roster();
+        h.channel.recv_frames.push_back(from(1, FrameKind::join, join_payload(good_join(1))));
+        h.channel.recv_frames.push_back(from(2, FrameKind::join, join_payload(good_join(2))));
+        h.channel.recv_frames.push_back(from(1, FrameKind::roster_ack, make_ack(kUuid, 1, roster_digest(ranks))));
+        h.channel.recv_frames.push_back(from(2, FrameKind::roster_ack, make_ack(kUuid, 2, roster_digest(ranks))));
+        Session session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "coordinator is ready for collective agreement");
+        auto peer = good;
+        if (mismatch == 0) ++peer.operation.sequence;
+        if (mismatch == 1) { peer.elements = 257; peer.valid_counts[0] = 257; }
+        if (mismatch == 2) peer.valid_counts[1] = 191;
+        if (mismatch == 3) peer.type = ScalarType::bf16;
+        if (mismatch == 4) { peer.kind = CollectiveKind::all_reduce_sum; peer.valid_counts.clear(); }
+        if (mismatch == 5) ++peer.operation.layer;
+        h.channel.recv_frames.push_back(from(1, FrameKind::operation, operation_payload(good)));
+        h.channel.recv_frames.push_back(from(2, FrameKind::operation, operation_payload(peer)));
+        const Deadline at{h.clock.now() + std::chrono::seconds(1)};
+        const Failure f = session.agree_operation(good, at);
+        if (mismatch >= 0) {
+            check(f.code == FailureCode::bad_operation && !session.ready(), "cross-rank metadata mismatch ends the session");
+            check(h.channel.sent_to(1, FrameKind::abort) && h.channel.sent_to(2, FrameKind::abort),
+                  "both peers receive an abort instead of an enqueue grant");
+        } else {
+            check(!f && h.channel.sent_to(1, FrameKind::operation_ack) && h.channel.sent_to(2, FrameKind::operation_ack),
+                  "identical metadata grants the collective on both peers");
+            check(!session.complete_operation(good.operation), "a waited collective releases the agreement slot");
+            auto second = good;
+            second.operation.sequence = 2;
+            h.channel.recv_frames.push_back(from(1, FrameKind::operation, operation_payload(second)));
+            h.channel.recv_frames.push_back(from(2, FrameKind::operation, operation_payload(second)));
+            check(!session.agree_operation(second, at), "the next sequence can agree after completion");
+            check(session.agree_operation(second, at).code == FailureCode::in_flight,
+                  "only one agreed operation may be in flight");
+        }
+    }
+    for (int mode = 0; mode < 3; ++mode) {
+        Harness h;
+        const auto ranks = good_roster();
+        h.channel.recv_frames.push_back(from(0, FrameKind::roster, roster_payload(ranks, PhaseBudgets{})));
+        h.channel.recv_frames.push_back(from(0, FrameKind::ready, make_ack(kUuid, 0, roster_digest(ranks))));
+        Session session = h.session(1, good_join(1), good_config(1));
+        check(!session.start(), "follower is ready for collective agreement");
+        auto ack = good;
+        if (mode == 1) ++ack.operation.step;
+        if (mode < 2) h.channel.recv_frames.push_back(from(0, FrameKind::operation_ack, operation_payload(ack)));
+        const Failure f = session.agree_operation(good, Deadline{h.clock.now() + std::chrono::seconds(1)});
+        if (mode == 0) check(!f && !session.complete_operation(good.operation), "follower checks the exact granted descriptor");
+        if (mode == 1) check(f.code == FailureCode::bad_operation && !session.ready(), "follower refuses an ack for different metadata");
+        if (mode == 2) check(f.code == FailureCode::deadline_expired && !session.ready(), "a missing operation ack ends at the deadline");
+    }
+}
+
 void coordinator_reaches_ready() {
     std::printf("rank 0 forms the session (scripted channel)\n");
     Harness h;
@@ -503,6 +572,23 @@ void a_roster_must_be_the_one_this_rank_said() {
     std::printf("a follower re-checks the roster instead of trusting rank 0\n");
     const std::vector<JoinInfo> ranks = good_roster();
     const PhaseBudgets budgets{1000, 2000, 3000, 4000};
+    {
+        Harness h;
+        auto rewritten = ranks;
+        rewritten[2].nccl_bootstrap_id = "a-different-communicator";
+        check(roster_digest(rewritten) != roster_digest(ranks), "bootstrap bytes participate in roster agreement");
+        h.channel.recv_frames.push_back(from(0, FrameKind::roster, roster_payload(rewritten, budgets)));
+        Session session = h.session(2, good_join(2), good_config(2));
+        check(session.start().code == FailureCode::roster_mismatch, "a rewritten local bootstrap is refused");
+    }
+    {
+        Harness h;
+        h.channel.recv_frames.push_back(from(1, FrameKind::join, join_payload(good_join(1))));
+        h.channel.recv_frames.push_back(from(2, FrameKind::join, join_payload(good_join(2))));
+        h.channel.recv_frames.push_back(from(1, FrameKind::roster_ack, make_ack(kUuid, 2, roster_digest(ranks))));
+        Session session = h.session(0, good_join(0), good_config(0));
+        check(session.start().code == FailureCode::bad_frame, "a roster ack cannot acknowledge another rank's slot");
+    }
     {
         Harness h;
         std::vector<JoinInfo> rewritten = ranks;
@@ -844,7 +930,10 @@ class RawPeer {
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (::connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) return false;
+        if (::connect(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) {
+            drop();
+            return false;
+        }
         timeval tv{1, 0};
         ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         return true;
@@ -865,6 +954,8 @@ class RawPeer {
         if (encode_frame(FrameKind::hello, credential, frame)) return false;
         return send_raw(frame);
     }
+
+    void finish_writes() { if (fd_ >= 0) ::shutdown(fd_, SHUT_WR); }
 
     void drop() {
         if (fd_ >= 0) {
@@ -972,6 +1063,117 @@ void three_ranks_over_real_tcp() {
     }
 }
 
+void collective_agreement_over_tcp() {
+    for (int mismatch = -1; mismatch < 3; ++mismatch) {
+        const uint16_t port = pick_free_port();
+        check(port != 0, "a TCP port for collective agreement");
+        if (!port) return;
+        std::atomic<int> finished{0};
+        FailureCode results[kTpWorld]{};
+        std::string details[kTpWorld];
+        std::vector<std::thread> threads;
+        for (uint32_t rank = 0; rank < kTpWorld; ++rank) {
+            threads.emplace_back([&, rank] {
+                SystemClock clock;
+                TcpChannelConfig wire;
+                wire.rank = rank;
+                wire.self = wire.rank0 = TcpEndpoint{"127.0.0.1", port};
+                wire.credential = kCredential;
+                std::string err;
+                auto channel = make_tcp_control_channel(wire, clock, err);
+                auto config = good_config(rank);
+                config.budgets = PhaseBudgets{3000, 3000, 3000, 3000};
+                Session session(config, good_join(rank), *channel, clock, [](std::string_view) {});
+                Failure f = session.start();
+                for (uint64_t sequence = 1; !f && sequence <= 3; ++sequence) {
+                    CollectiveDescriptor d{{sequence, 2, 3}, CollectiveKind::all_gather_padded,
+                                            ScalarType::fp32, 256, {256, 192, 192}};
+                    if (rank == 2 && mismatch == 0) ++d.operation.sequence;
+                    if (rank == 2 && mismatch == 1) --d.valid_counts[2];
+                    if (rank == 2 && mismatch == 2) { ++d.elements; ++d.valid_counts[0]; }
+                    f = session.agree_operation(d, Deadline{clock.now() + std::chrono::seconds(3)});
+                    if (!f) f = session.complete_operation(d.operation);
+                }
+                results[rank] = f.code;
+                details[rank] = f.detail;
+                ++finished;
+                const auto end = clock.now() + std::chrono::seconds(3);
+                while (finished != 3 && clock.now() < end) std::this_thread::yield();
+                session.close();
+            });
+        }
+        for (auto& thread : threads) thread.join();
+        for (uint32_t rank = 0; rank < kTpWorld; ++rank) {
+            const auto code = results[rank];
+            check(code == (mismatch < 0 ? FailureCode::none : FailureCode::bad_operation),
+                  mismatch < 0 ? "three TCP ranks agree repeated collective shapes" : "TCP metadata mismatch aborts every rank before enqueue");
+            if (code != (mismatch < 0 ? FailureCode::none : FailureCode::bad_operation))
+                std::printf("    mismatch %d rank %u: %s: %s\n", mismatch, rank,
+                            failure_code_name(code), details[rank].c_str());
+        }
+    }
+}
+
+void queued_abort_survives_tcp_reset() {
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t length = sizeof address;
+    const bool listening = listener >= 0 &&
+        ::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof address) == 0 &&
+        ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length) == 0 &&
+        ::listen(listener, 1) == 0;
+    check(listening, "a raw coordinator for the queued ABORT/reset regression");
+    if (!listening) { if (listener >= 0) ::close(listener); return; }
+    std::atomic<bool> reset_sent{false};
+    std::thread server([&] {
+        const int peer = ::accept(listener, nullptr, nullptr);
+        if (peer >= 0) {
+            std::string hello, abort_payload, abort_frame;
+            encode_frame(FrameKind::hello, kCredential, hello);
+            encode_abort(FailureCode::bad_operation, "metadata mismatch", abort_payload);
+            encode_frame(FrameKind::abort, abort_payload, abort_frame);
+            // Let open() finish its hello write before resetting the connection.
+            std::string client_hello(hello.size(), '\0');
+            size_t received = 0;
+            while (received < client_hello.size()) {
+                const ssize_t count = ::recv(peer, client_hello.data() + received,
+                                              client_hello.size() - received, 0);
+                if (count <= 0) break;
+                received += static_cast<size_t>(count);
+            }
+            const std::string frames = hello + abort_frame;
+            ::send(peer, frames.data(), frames.size(), MSG_NOSIGNAL);
+            // Force RST with readable frames queued at the client. No sleep or scheduler race is needed:
+            // recv below starts only once the reset has been sent.
+            const linger reset{1, 0};
+            ::setsockopt(peer, SOL_SOCKET, SO_LINGER, &reset, sizeof reset);
+            ::close(peer);
+        }
+        reset_sent = true;
+    });
+    SystemClock clock;
+    TcpChannelConfig config;
+    config.rank = 1;
+    config.rank0 = {"127.0.0.1", ntohs(address.sin_port)};
+    config.credential = kCredential;
+    std::string err;
+    auto channel = make_tcp_control_channel(config, clock, err);
+    const Deadline at{clock.now() + std::chrono::seconds(3)};
+    const Failure opened = channel->open(at);
+    while (!reset_sent) std::this_thread::yield();
+    server.join();
+    ::close(listener);
+    check(!opened, "the follower control link opened before the raw coordinator reset it");
+    if (opened) return;
+    ReceivedFrame received;
+    const Failure result = channel->recv(received, at);
+    check(!result && received.frame.kind == FrameKind::abort,
+          "a queued ABORT is decoded before a simultaneous POLLERR/reset");
+    channel->close();
+}
+
 void a_rank0_session_with_one_raw_peer(FailureCode expected, const std::string& what,
                                       const std::function<void(RawPeer&)>& script,
                                       std::vector<std::string>* lines = nullptr) {
@@ -1009,7 +1211,10 @@ void a_rank0_session_with_one_raw_peer(FailureCode expected, const std::string& 
 
     RawPeer peer;
     bool up = false;
-    for (int i = 0; i < 100 && !up; ++i) up = peer.connect(port);
+    for (int i = 0; i < 100 && !up; ++i) {
+        up = peer.connect(port);
+        if (!up) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     if (!up) {
         worker.join();
         check(false, "the raw peer could not reach the listener: " + what);
@@ -1069,6 +1274,25 @@ void a_phase_waits_its_own_length() {
 
 void raw_peers_over_real_tcp() {
     std::printf("raw peers over real loopback TCP\n");
+    a_rank0_session_with_one_raw_peer(
+        FailureCode::truncated_frame, "EOF inside a frame is reported as a truncated frame", [](RawPeer& peer) {
+            peer.send_hello(kCredential);
+            std::string frame;
+            encode_frame(FrameKind::join, join_payload(good_join(1)), frame);
+            frame.resize(frame.size() - 1);
+            peer.send_raw(frame);
+            peer.finish_writes();
+        });
+    a_rank0_session_with_one_raw_peer(
+        FailureCode::model_mismatch, "a complete frame larger than one recv survives immediate EOF", [](RawPeer& peer) {
+            peer.send_hello(kCredential);
+            JoinInfo info = good_join(1);
+            info.model_hash.assign(4096, 'x');
+            std::string frame;
+            encode_frame(FrameKind::join, join_payload(info), frame);
+            peer.send_raw(frame);
+            peer.finish_writes();
+        });
     a_rank0_session_with_one_raw_peer(
         FailureCode::oversized_frame, "a frame whose length is absurd is refused on the socket",
         [](RawPeer& peer) {
@@ -1182,6 +1406,7 @@ int main() {
     alarm(180);
     std::printf("session formation (CPU, real and scripted control channels, no GPU)\n");
     coordinator_reaches_ready();
+    collective_agreement();
     follower_reaches_ready();
     follower_adopts_the_smaller_budget();
     coordinator_refuses_a_group_that_does_not_agree();
@@ -1195,6 +1420,8 @@ int main() {
     frame_codec();
     tcp_factory_rules();
     three_ranks_over_real_tcp();
+    collective_agreement_over_tcp();
+    queued_abort_survives_tcp_reset();
     a_follower_starts_before_its_coordinator();
     raw_peers_over_real_tcp();
     a_phase_waits_its_own_length();

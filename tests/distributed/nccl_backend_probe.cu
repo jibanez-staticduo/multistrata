@@ -37,6 +37,9 @@
 #include <cstring>
 #include <string>
 #include <type_traits>
+#include <atomic>
+#include <fcntl.h>
+#include <sys/mman.h>
 
 namespace {
 
@@ -68,6 +71,141 @@ int g_failed = 0;
 void check(bool ok, const char* what) {
     std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
     if (!ok) ++g_failed;
+}
+
+namespace fake {
+std::atomic<int> init_calls{0}, polls{0}, aborts{0}, records{0};
+std::atomic<ncclResult_t> state{ncclSuccess};
+int pending_polls = 0;
+cudaError_t event_state = cudaErrorNotReady;
+void reset() {
+    init_calls = 0; polls = 0; aborts = 0; records = 0;
+    state = ncclSuccess; pending_polls = 0; event_state = cudaErrorNotReady;
+}
+ncclResult_t init(ncclComm_t* comm, int, ncclUniqueId, int, ncclConfig_t* cfg) {
+    ++init_calls;
+    *comm = reinterpret_cast<ncclComm_t>(uintptr_t{0x10});
+    return cfg->blocking == 0 ? ncclInProgress : ncclInvalidUsage;
+}
+ncclResult_t async(ncclComm_t, ncclResult_t* out) {
+    const int n = ++polls;
+    *out = n <= pending_polls ? ncclInProgress : state.load();
+    return ncclSuccess;
+}
+ncclResult_t count(ncclComm_t, int* out) { *out = 3; return ncclSuccess; }
+ncclResult_t abort(ncclComm_t) { ++aborts; return ncclSuccess; }
+ncclResult_t reduce(const void*, void*, size_t, ncclDataType_t, ncclRedOp_t, ncclComm_t, cudaStream_t) {
+    return ncclInProgress;
+}
+ncclResult_t gather(const void*, void*, size_t, ncclDataType_t, ncclComm_t, cudaStream_t) {
+    return ncclInProgress;
+}
+cudaError_t create(cudaEvent_t* event, unsigned) {
+    *event = reinterpret_cast<cudaEvent_t>(uintptr_t{0x20}); return cudaSuccess;
+}
+cudaError_t record(cudaEvent_t, cudaStream_t) {
+    ++records;
+    return state == ncclInProgress ? cudaErrorInvalidValue : cudaSuccess;
+}
+cudaError_t query(cudaEvent_t) { return event_state; }
+cudaError_t destroy(cudaEvent_t) { return cudaSuccess; }
+detail::NcclSymbols symbols() {
+    detail::NcclSymbols out;
+    out.comm_init_rank_config = &init; out.comm_get_async_error = &async;
+    out.comm_count = &count; out.comm_abort = &abort;
+    out.all_reduce = &reduce; out.all_gather = &gather;
+    return out;
+}
+detail::CudaCalls cuda() { return {&create, &record, &query, &destroy}; }
+NcclConfig config() {
+    NcclConfig out;
+    out.bootstrap_id.assign(NCCL_UNIQUE_ID_BYTES * 2, 'a');
+    out.initialize_ms = 100;
+    return out;
+}
+}
+
+void check_nonblocking_lifecycle() {
+    fake::reset();
+    fake::pending_polls = 3;
+    auto config = fake::config();
+    {
+        ProductionNcclApi api(config, nullptr, fake::symbols(), "fake", "sha256:fake", fake::cuda());
+        check(!api.comm_init(config) && fake::init_calls == 1 && fake::polls == 4,
+              "nonblocking init is called once, then only async state is polled");
+        const auto stream = reinterpret_cast<cudaStream_t>(uintptr_t{0x30});
+        float input = 1, output = 0;
+        fake::state = ncclInProgress;
+        check(!api.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream) && fake::records == 0,
+              "NCCL background enqueue does not record an event prematurely");
+        check(api.enqueue_all_gather(&input, &output, 1, ScalarType::fp32, stream).code == FailureCode::in_flight,
+              "the production backend refuses a second collective in flight");
+        const Deadline at{std::chrono::steady_clock::now() + std::chrono::seconds(1)};
+        check(api.poll_completion(at).code == FailureCode::deadline_expired && fake::records == 0,
+              "poll cannot complete or record while NCCL is enqueueing");
+        fake::state = ncclSuccess;
+        fake::event_state = cudaSuccess;
+        check(!api.poll_completion(at) && fake::records == 1,
+              "the completion event is recorded only after background enqueue succeeds");
+        fake::state = ncclInProgress;
+        check(!api.enqueue_all_gather(&input, &output, 1, ScalarType::fp32, stream) && fake::records == 1,
+              "all-gather uses the same deferred completion rule");
+        check(api.poll_completion(at).code == FailureCode::deadline_expired,
+              "a completed previous event cannot complete a new background all-gather");
+        fake::state = ncclRemoteError;
+        Failure failure;
+        check(api.async_failure(failure) && failure.code == FailureCode::async_error,
+              "a communicator error reaches health polling");
+        fake::state = ncclSuccess;
+        check(api.async_failure(failure), "an observed asynchronous failure stays sticky");
+        api.comm_abort(); api.comm_abort();
+        check(fake::aborts == 1, "abort is idempotent after an operation");
+    }
+    fake::reset();
+    fake::state = ncclInProgress;
+    {
+        ProductionNcclApi api(config, nullptr, fake::symbols(), "fake", "sha256:fake", fake::cuda());
+        config.initialize_ms = 10;
+        check(api.comm_init(config).code == FailureCode::deadline_expired && fake::init_calls == 1,
+              "an init stuck in background work returns at its deadline");
+        api.comm_abort();
+        check(fake::aborts == 1, "an init that timed out retains an abortable handle");
+    }
+    fake::reset();
+    fake::state = ncclInProgress;
+    {
+        ProductionNcclApi api(config, nullptr, fake::symbols(), "fake", "sha256:fake", fake::cuda());
+        config.initialize_ms = 1000;
+        Failure outcome;
+        std::thread worker([&] { outcome = api.comm_init(config); });
+        while (fake::polls == 0) std::this_thread::yield();
+        api.comm_abort();
+        worker.join();
+        check(outcome.code == FailureCode::aborted && fake::init_calls == 1 && fake::aborts == 1,
+              "watchdog abort reaches the published init handle without double abort or reinit");
+    }
+}
+
+void check_mapped_provenance() {
+    char name[] = "/tmp/strata-nccl-provenance-XXXXXX";
+    const int fd = ::mkstemp(name);
+    check(fd >= 0, "a file for mapped provenance regression");
+    if (fd < 0) return;
+    const char original[] = "original mapped library bytes";
+    ::write(fd, original, sizeof original);
+    void* mapped = ::mmap(nullptr, sizeof original, PROT_READ, MAP_PRIVATE, fd, 0);
+    std::string hash, err, reference;
+    detail::sha256_of_file(name, reference, err);
+    check(mapped != MAP_FAILED && detail::mapped_library_hash(name, mapped, hash, err) && hash == reference,
+          "provenance hashes the descriptor matching the mapped inode");
+    ::unlink(name);
+    const int replacement = ::open(name, O_CREAT | O_WRONLY | O_EXCL, 0600);
+    ::write(replacement, "replacement", 11);
+    ::close(replacement);
+    check(!detail::mapped_library_hash(name, mapped, hash, err),
+          "a replaced dladdr pathname cannot authenticate different mapped bytes");
+    if (mapped != MAP_FAILED) ::munmap(mapped, sizeof original);
+    ::close(fd); ::unlink(name);
 }
 
 // The FIPS 180-4 vectors, as published.  The 56-character one is the one that matters most: its length is
@@ -147,7 +285,8 @@ void check_dtype_mapping(cudaStream_t stream) {
 // rank's approved provenance string can be read off the library it will actually load, and checked against
 // `sha256sum` rather than trusted.
 int main(int argc, char** argv) {
-    if (argc > 1) {
+    const bool host_only = argc > 1 && std::strcmp(argv[1], "--host-only") == 0;
+    if (argc > 1 && !host_only) {
         std::string hex;
         std::string err;
         if (!detail::sha256_of_file(argv[1], hex, err)) {
@@ -160,6 +299,9 @@ int main(int argc, char** argv) {
     check_sha256_vectors();
     check_bootstrap_encoding();
     check_version_decoder();
+    check_nonblocking_lifecycle();
+    check_mapped_provenance();
+    if (host_only) return g_failed == 0 ? 0 : 1;
 
     // Real stream, real library: the part a CPU test cannot reach.  If no NCCL is installed, the factory says
     // so and the rest of the probe is skipped rather than pretending.

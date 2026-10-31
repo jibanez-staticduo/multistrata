@@ -30,6 +30,7 @@
 #include "strata/distributed/transport.hpp"
 
 #include <memory>
+#include <atomic>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -42,6 +43,7 @@ struct NcclConfig {
     uint32_t world = kTpWorld;
     std::string bootstrap_id;  // rank 0's id, from the verified roster; never written to a log line
     std::string library_path;  // the libnccl.so.2 this rank resolved, for provenance
+    uint32_t initialize_ms = 120000;  // bounded nonblocking initialization, relative to comm_init
 };
 
 // The library, as an interface.  One implementation loads the real NCCL; a test supplies another one.
@@ -126,9 +128,11 @@ class NcclBackend final : public Backend {
                                      approval_.provenance + "'");
         }
         if (auto f = api_->comm_init(config_)) {
+            api_->comm_abort();
             return Failure::fail(f.code == FailureCode::none ? FailureCode::comm_failed : f.code,
                                  "the communicator did not form: " + f.detail);
         }
+        if (aborted_) return Failure::fail(FailureCode::aborted, "the backend was abandoned during init");
         ready_ = true;
         return ok_failure();
     }
@@ -159,13 +163,12 @@ class NcclBackend final : public Backend {
     }
 
     void raw_abort() noexcept override {
-        if (api_ == nullptr || aborted_) return;
-        aborted_ = true;
+        if (api_ == nullptr || aborted_.exchange(true)) return;
         ready_ = false;
         api_->comm_abort();
     }
 
-    bool initialized() const { return ready_; }
+    bool initialized() const { return ready_ && !aborted_; }
 
  private:
     Failure usable() const {
@@ -178,13 +181,15 @@ class NcclBackend final : public Backend {
     std::unique_ptr<NcclApi> api_;
     NcclConfig config_;
     NcclApproval approval_;
-    bool ready_ = false;
-    bool aborted_ = false;
+    std::atomic<bool> ready_{false};
+    std::atomic<bool> aborted_{false};
 };
 
 // The real library, loaded the way the approved build says to load it.  Defined only in a build that has NCCL
 // (Task 3, CUDA/ARM64); naming it in a CPU link is a build-configuration error, and it will read as one.
 // The implementation resolves the file, opens it, and reports what it found through `NcclApi::identity()`.
+bool make_nccl_bootstrap_id(const std::string& library_path, std::string& out, std::string& err);
+
 std::unique_ptr<NcclApi> make_production_nccl_api(const NcclConfig& config, std::string& err);
 
 }  // namespace strata::distributed::nccl

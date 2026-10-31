@@ -383,10 +383,8 @@ inline Failure validate_all_gather_padded(const DeviceBuffer& input, const Devic
     return ok_failure();
 }
 
-// The ordered-collective bookkeeping: sequence must advance by exactly one, and only one operation may be in
-// flight.  Used by the transport for the data plane and by the session for its rank-0 ordering check, so a
-// step that issues collectives in a different order than it did on the previous step is caught by the rank
-// that can see all of them.
+// Local bookkeeping: sequence advances by exactly one, with one operation in flight. Session's
+// agree_operation separately compares metadata across ranks before the caller enqueues device work.
 class OperationTracker {
  public:
     explicit OperationTracker(uint64_t first_sequence = 1) : next_(first_sequence) {}

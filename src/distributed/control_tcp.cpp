@@ -29,6 +29,8 @@ const char* frame_kind_name(FrameKind kind) {
         case FrameKind::roster_ack: return "roster_ack";
         case FrameKind::ready: return "ready";
         case FrameKind::abort: return "abort";
+        case FrameKind::operation: return "operation";
+        case FrameKind::operation_ack: return "operation_ack";
     }
     return "unknown";
 }
@@ -63,7 +65,7 @@ uint32_t get_u32(const char* p) {
 Failure encode_frame(FrameKind kind, std::string_view payload, std::string& out) {
     const uint16_t raw_kind = static_cast<uint16_t>(kind);
     const bool known = raw_kind >= static_cast<uint16_t>(FrameKind::hello) &&
-                       raw_kind <= static_cast<uint16_t>(FrameKind::abort);
+                       raw_kind <= static_cast<uint16_t>(FrameKind::operation_ack);
     if (!known) {
         return Failure::fail(FailureCode::unknown_frame, "cannot encode a frame kind this build does not know");
     }
@@ -108,7 +110,7 @@ Failure FrameDecoder::feed(const char* data, size_t n, std::vector<DecodedFrame>
         }
         const uint16_t raw_kind = get_u16(buffer_.data() + 4);
         if (raw_kind < static_cast<uint16_t>(FrameKind::hello) ||
-            raw_kind > static_cast<uint16_t>(FrameKind::abort)) {
+            raw_kind > static_cast<uint16_t>(FrameKind::operation_ack)) {
             return Failure::fail(FailureCode::unknown_frame,
                                  "unknown control frame kind " + std::to_string(raw_kind));
         }
@@ -495,11 +497,13 @@ class TcpChannel final : public ControlChannel {
             return ok_failure();
         }
 
-        if (revents & (POLLERR | POLLNVAL)) {
+        if (revents & POLLNVAL) {
             report_closed(link);
             return ok_failure();
         }
 
+        // A reset can set POLLERR together with POLLIN while an already-delivered ABORT is still queued.
+        // Read that data before observing the reset, just as we drain pending bytes before EOF.
         char scratch[4096];
         const ssize_t n = ::recv(link.fd, scratch, sizeof scratch, 0);
         if (n > 0) {
@@ -541,7 +545,7 @@ class TcpChannel final : public ControlChannel {
                 got.frame = std::move(frame);
                 pending_.push_back(std::move(got));
             }
-            if (revents & POLLHUP) report_closed(link);
+            // POLLHUP can accompany more than one read of queued bytes. Only recv()==0 is EOF.
             return ok_failure();
         }
         if (n == 0) {
@@ -568,9 +572,10 @@ class TcpChannel final : public ControlChannel {
     void report_closed(Link& link) {
         if (!stream_failure_) {
             stream_failure_ = Failure::fail(
-                FailureCode::peer_closed,
-                link.has_rank ? "rank " + std::to_string(link.rank) + " closed its control connection"
-                              : "a peer closed its control connection before it said which rank it was");
+                link.decoder.buffered() ? FailureCode::truncated_frame : FailureCode::peer_closed,
+                link.decoder.buffered() ? "a peer closed its control connection inside a frame"
+                : link.has_rank ? "rank " + std::to_string(link.rank) + " closed its control connection"
+                                : "a peer closed its control connection before it said which rank it was");
         }
         drop(link);
     }

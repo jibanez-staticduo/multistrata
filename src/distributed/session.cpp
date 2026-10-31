@@ -130,6 +130,8 @@ std::string canonical_join(const JoinInfo& info) {
     out += "backend=" + info.backend_identity + "\n";
     out += "nccl=" + info.nccl_version_expected + "\n";
     out += "provenance=" + info.library_provenance + "\n";
+    // Bootstrap bytes are part of roster agreement even though each rank may supply a distinct id.
+    out += "bootstrap=" + info.nccl_bootstrap_id + "\n";
     return out;
 }
 
@@ -653,6 +655,9 @@ Failure Session::agree_roster() {
         if (rank >= config_.world) {
             return Failure::fail(FailureCode::rank_range, "a roster ack claims rank " + std::to_string(rank));
         }
+        if (rank != got.from_rank) {
+            return Failure::fail(FailureCode::bad_frame, "a roster ack names another rank's control link");
+        }
         if (rank == 0 || acked[rank]) {
             return Failure::fail(FailureCode::bad_frame,
                                  "rank " + std::to_string(rank) + " acknowledged the roster twice");
@@ -878,6 +883,90 @@ Failure Session::expect_operation(const Operation& operation) {
     }
     next_sequence_ = operation.sequence + 1;
     last_operation_ = operation;
+    return ok_failure();
+}
+
+Failure canonical_collective(const CollectiveDescriptor& d, std::string& out) {
+    if (scalar_type_bytes(d.type) == 0) return Failure::fail(FailureCode::bad_dtype, "collective dtype is invalid");
+    if (d.elements == 0 || d.elements > UINT64_MAX / (scalar_type_bytes(d.type) * kTpWorld)) {
+        return Failure::fail(FailureCode::bad_extent, "collective extent is empty or overflows");
+    }
+    if (d.kind == CollectiveKind::all_reduce_sum) {
+        if (!d.valid_counts.empty()) return Failure::fail(FailureCode::bad_counts, "reduction has gather counts");
+    } else if (d.kind == CollectiveKind::all_gather_padded) {
+        if (d.valid_counts.size() != kTpWorld ||
+            *std::max_element(d.valid_counts.begin(), d.valid_counts.end()) != d.elements) {
+            return Failure::fail(FailureCode::bad_counts, "gather counts do not describe the padded slot");
+        }
+    } else {
+        return Failure::fail(FailureCode::bad_operation, "unknown collective kind");
+    }
+    // Decimal unsigned fields and fixed separators are unambiguous; no rank-local pointer/clock crosses wire.
+    out = std::to_string(d.operation.sequence) + ":" + std::to_string(d.operation.layer) + ":" +
+          std::to_string(d.operation.step) + ":" + std::to_string(static_cast<uint32_t>(d.kind)) + ":" +
+          std::to_string(static_cast<uint32_t>(d.type)) + ":" + std::to_string(d.elements);
+    for (const uint64_t count : d.valid_counts) out += ":" + std::to_string(count);
+    return ok_failure();
+}
+
+Failure Session::agree_operation(const CollectiveDescriptor& descriptor, Deadline at) {
+    if (state_ != SessionState::ready) return Failure::fail(FailureCode::not_ready, "no collective agreement before READY");
+    if (operation_in_flight_) return fail(Failure::fail(FailureCode::in_flight, "a collective is already in flight"), true);
+    if (descriptor.operation.sequence != next_sequence_) {
+        return fail(Failure::fail(FailureCode::bad_operation, "collective sequence differs from the session"), true);
+    }
+    std::string signature;
+    if (auto f = canonical_collective(descriptor, signature)) return fail(f, true);
+    std::string payload;
+    if (auto f = put_field(payload, "session_uuid", config_.session_uuid)) return fail(f, true);
+    if (auto f = put_field(payload, "signature", signature)) return fail(f, true);
+    auto receive = [&](FrameKind kind, std::vector<bool>& seen) -> Failure {
+        ReceivedFrame got;
+        if (auto f = channel_.recv(got, at)) return f;
+        if (got.frame.kind == FrameKind::abort) return peer_abort(got);
+        if (got.frame.kind != kind || got.from_rank >= config_.world || seen[got.from_rank]) {
+            return Failure::fail(FailureCode::bad_operation, "unexpected or duplicate collective agreement frame");
+        }
+        FieldReader reader(got.frame.payload);
+        std::string uuid, peer_signature;
+        if (auto f = reader.field(uuid, "session_uuid")) return f;
+        if (auto f = reader.field(peer_signature, "signature")) return f;
+        if (auto f = reader.finish()) return f;
+        if (uuid != config_.session_uuid || peer_signature != signature) {
+            return Failure::fail(FailureCode::bad_operation, "ranks disagree on collective sequence, kind, dtype or layout");
+        }
+        seen[got.from_rank] = true;
+        return ok_failure();
+    };
+    if (config_.rank == 0) {
+        std::vector<bool> seen(config_.world, false);
+        seen[0] = true;
+        for (uint32_t i = 1; i < config_.world; ++i) {
+            if (auto f = receive(FrameKind::operation, seen)) return fail(f, true);
+        }
+        for (uint32_t i = 1; i < config_.world; ++i) {
+            if (auto f = channel_.send(i, FrameKind::operation_ack, payload, at)) return fail(f, true);
+        }
+    } else {
+        if (auto f = channel_.send(0, FrameKind::operation, payload, at)) return fail(f, true);
+        std::vector<bool> seen(config_.world, true);
+        seen[0] = false;
+        if (auto f = receive(FrameKind::operation_ack, seen)) return fail(f, true);
+    }
+    if (deadline_passed(clock_, at)) return fail(Failure::fail(FailureCode::deadline_expired, "collective agreement deadline passed"), true);
+    operation_in_flight_ = true;
+    last_operation_ = descriptor.operation;
+    return ok_failure();
+}
+
+Failure Session::complete_operation(const Operation& operation) {
+    if (state_ != SessionState::ready) return Failure::fail(FailureCode::not_ready, "the session is not ready");
+    if (!operation_in_flight_ || operation.sequence != last_operation_.sequence ||
+        operation.layer != last_operation_.layer || operation.step != last_operation_.step) {
+        return fail(Failure::fail(FailureCode::bad_operation, "completion does not name the agreed collective"), true);
+    }
+    operation_in_flight_ = false;
+    ++next_sequence_;
     return ok_failure();
 }
 

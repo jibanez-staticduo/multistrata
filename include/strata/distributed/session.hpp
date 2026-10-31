@@ -64,6 +64,8 @@ enum class FrameKind : uint16_t {
     roster_ack = 4,  // peer -> rank 0: this rank accepts that roster
     ready = 5,       // rank 0 -> peers: every rank accepted the same roster
     abort = 6,       // any -> peers: this session is over, and why
+    operation = 7,
+    operation_ack = 8,
 };
 
 const char* frame_kind_name(FrameKind kind);
@@ -116,8 +118,8 @@ struct JoinInfo {
     std::string nccl_bootstrap_id;    // opaque bootstrap id for the communicator; never logged
 };
 
-// The equality token for one join: every field that must match, in a fixed order, with the bootstrap id left
-// out (it is per-rank by nature).  A digest, in the sense of "the same string on every rank iff the joins
+// The equality token for one join: every field in a fixed order, including its per-rank bootstrap id.
+// A digest, in the sense of "the same string on every rank iff the joins
 // agree", not a cryptographic hash - the hashes that feed it are computed by whoever read the model.
 std::string canonical_join(const JoinInfo& info);
 
@@ -247,6 +249,18 @@ struct SessionConfig {
     uint32_t notify_ms = 250u;                 // how long an ABORT may try to reach the others
 };
 
+enum class CollectiveKind : uint32_t { all_reduce_sum = 1, all_gather_padded = 2 };
+
+struct CollectiveDescriptor {
+    Operation operation;
+    CollectiveKind kind = CollectiveKind::all_reduce_sum;
+    ScalarType type = ScalarType::fp32;
+    uint64_t elements = 0;  // reduction extent, or one padded gather slot
+    std::vector<uint64_t> valid_counts;  // empty for reduction, world entries for gather
+};
+
+Failure canonical_collective(const CollectiveDescriptor& descriptor, std::string& out);
+
 // A line the session wants recorded.  Every string reaching this already went through `Session::redact()`.
 using LogFn = std::function<void(std::string_view)>;
 
@@ -274,9 +288,12 @@ class Session {
     // this rank's own budget and what rank 0 advertised wins, so one rank cannot stretch a group-wide wait.
     Failure operation_deadline(Deadline& out) const;
 
-    // Rank 0's ordering check on the model's own metadata: the same sequence on every step, advancing by one.
-    // Catches a step that issued collectives in a different order at the rank that drives them.
+    // Legacy local sequence check. Device callers use agree_operation instead, which includes all ranks.
     Failure expect_operation(const Operation& operation);
+
+    // All ranks agree the entire wire shape before enqueue. Complete only after transport.wait succeeds.
+    Failure agree_operation(const CollectiveDescriptor& descriptor, Deadline at);
+    Failure complete_operation(const Operation& operation);
 
     // End the session and try to tell the others.  Idempotent; the first reason wins.
     void abort(std::string_view reason);
@@ -325,6 +342,7 @@ class Session {
     Roster roster_{};
     uint64_t next_sequence_ = 1;               // rank 0's ordering check on the model's own sequence numbers
     Operation last_operation_{};
+    bool operation_in_flight_ = false;
     bool notified_ = false;
 };
 
