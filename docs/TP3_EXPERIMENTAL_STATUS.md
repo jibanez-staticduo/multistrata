@@ -63,9 +63,9 @@ remaining acceptance checks open.
 | 3. Rank artifacts | Passed scope | [Materialized byte check][bytes] and source hashes; immutable original blocks/scales retained. |
 | 4. Native transport | Passed scope | [Window 1 report][transport], mismatch/missing/killed-peer receipts and later `NET/IB` logs; includes unequal padded gathers. |
 | 5. Projection and MoE | Partial | Exact expert gate and short whole-model parity pass after arithmetic fixes; short decode evidence does not qualify GEMM prefill. |
-| 6. GDN, QSA and PLE | Partial | All 48 layers represented in C1 state/trace checks; long continuation and chunk-boundary cases remain open. |
+| 6. GDN, QSA and PLE | Partial | All 48 layers represented in C1 state/trace checks; short 2/4/8 chunk-boundary and RESET parity now pass. Long continuation remains open. |
 | 7. Coordinator and C1 | Partial | Windows 4/6/7 exact logits, state, RESET and traces; 8192 is configured capacity, not an 8K-token prompt. The later 8K gate is recorded below; 64K prompt qualification remains open. |
-| 8. Capacity, MTP, graphs, C8 | Partial | Short MTP HTTP and mixed C8 checks, partial graphs and memory snapshots exist; useful extra capacity, full state/failure qualification and full-model graphs remain open. |
+| 8. Capacity, MTP, graphs, C8 | Partial | Short MTP/C4/C8 full-state replay and cancellation checks pass; partial graphs and memory accounting exist. Useful extra capacity, long feature/failure qualification and full-model graphs remain open. |
 | 9. Server and lifecycle | Partial | OpenAI/Anthropic streaming, tools, cancellation and failure-health artifacts; recorded restoration checks through window 7. No automatic rollout. |
 | 10. Performance decision | Partial | Profiling and resident TP1 control established; matched 4K/16K/64K, 256-output, C1/C4/C8, three paired rounds remain open. |
 
