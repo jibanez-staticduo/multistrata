@@ -53,6 +53,16 @@ Failure put_field(std::string& out, std::string_view name, std::string_view valu
     return ok_failure();
 }
 
+Failure put_bounded_field(std::string& out, std::string_view name, std::string_view value, size_t maximum) {
+    if (value.size() > maximum) {
+        return Failure::fail(FailureCode::oversized_frame,
+                             "field '" + std::string(name) + "' is too long for the control protocol");
+    }
+    put_u32(out, static_cast<uint32_t>(value.size()));
+    out.append(value);
+    return ok_failure();
+}
+
 // Reads a payload as exactly the fields its frame kind promises.  A field that does not fit is a truncated
 // frame; bytes left over are a payload this build does not understand.  Both end the session: a half-read join
 // is a rank whose identity is a guess.
@@ -68,9 +78,13 @@ class FieldReader {
     }
 
     Failure field(std::string& out, std::string_view name) {
+        return field(out, name, kControlMaxField);
+    }
+
+    Failure field(std::string& out, std::string_view name, size_t maximum) {
         uint32_t n = 0;
         if (auto f = u32(n)) return f;
-        if (n > kControlMaxField) {
+        if (n > maximum) {
             return Failure::fail(FailureCode::oversized_frame,
                                  "field '" + std::string(name) + "' claims more bytes than the cap allows");
         }
@@ -248,7 +262,7 @@ Failure encode_roster(const Roster& roster, std::string& out) {
     if (auto f = encode_budgets(roster.budgets, budgets)) return f;
     out.clear();
     out.append(budgets);
-    if (auto f = put_field(out, "digest", roster.digest)) return f;
+    if (auto f = put_bounded_field(out, "digest", roster.digest, kControlMaxRosterDigest)) return f;
     if (roster.ranks.size() != kTpWorld) {
         return Failure::fail(FailureCode::bad_frame, "a roster is offered for exactly three ranks or not at all");
     }
@@ -256,7 +270,11 @@ Failure encode_roster(const Roster& roster, std::string& out) {
     for (const auto& join : roster.ranks) {
         std::string payload;
         if (auto f = encode_join(join, payload)) return f;
-        if (auto f = put_field(out, "join", payload)) return f;
+        if (auto f = put_bounded_field(out, "join", payload, kControlMaxJoinRecord)) return f;
+    }
+    if (out.size() > kControlMaxPayload) {
+        return Failure::fail(FailureCode::oversized_frame,
+                             "the verified roster exceeds the control frame payload limit");
     }
     return ok_failure();
 }
@@ -266,7 +284,7 @@ Failure decode_roster(std::string_view payload, Roster& out) {
     if (auto f = decode_budgets(payload.substr(0, 16), roster.budgets)) return f;
     // The budgets are the first 16 bytes; read the rest with the same cursor.
     FieldReader rest(payload.substr(16));
-    if (auto f = rest.field(roster.digest, "digest")) return f;
+    if (auto f = rest.field(roster.digest, "digest", kControlMaxRosterDigest)) return f;
     uint32_t count = 0;
     if (auto f = rest.u32(count)) return f;
     if (count != kTpWorld) {
@@ -275,7 +293,7 @@ Failure decode_roster(std::string_view payload, Roster& out) {
     }
     for (uint32_t i = 0; i < count; ++i) {
         std::string join_payload;
-        if (auto f = rest.field(join_payload, "join")) return f;
+        if (auto f = rest.field(join_payload, "join", kControlMaxJoinRecord)) return f;
         JoinInfo info;
         if (auto f = decode_join(join_payload, info)) return f;
         if (info.rank != i) {
@@ -646,7 +664,7 @@ Failure Session::agree_roster() {
         std::string digest;
         if (auto f = r.field(uuid, "session_uuid")) return f;
         if (auto f = r.u32(rank)) return f;
-        if (auto f = r.field(digest, "digest")) return f;
+        if (auto f = r.field(digest, "digest", kControlMaxRosterDigest)) return f;
         if (auto f = r.finish()) return f;
 
         if (uuid != config_.session_uuid) {
@@ -678,7 +696,7 @@ Failure Session::agree_roster() {
     std::string ready_payload;
     if (auto f = put_field(ready_payload, "session_uuid", config_.session_uuid)) return f;
     put_u32(ready_payload, config_.rank);
-    if (auto f = put_field(ready_payload, "digest", roster_.digest)) return f;
+    if (auto f = put_bounded_field(ready_payload, "digest", roster_.digest, kControlMaxRosterDigest)) return f;
     const Deadline ready_at = deadline_after(config_.budgets.initialize_ms);
     for (uint32_t i = 1; i < config_.world; ++i) {
         if (auto f = channel_.send(i, FrameKind::ready, ready_payload, ready_at)) return f;
@@ -778,7 +796,7 @@ Failure Session::start_follower() {
     std::string ack;
     if (auto f = put_field(ack, "session_uuid", config_.session_uuid)) return f;
     put_u32(ack, config_.rank);
-    if (auto f = put_field(ack, "digest", roster_.digest)) return f;
+    if (auto f = put_bounded_field(ack, "digest", roster_.digest, kControlMaxRosterDigest)) return f;
     const Deadline ack_at = deadline_after(config_.budgets.initialize_ms);
     if (auto f = channel_.send(0, FrameKind::roster_ack, ack, ack_at)) return f;
     log("roster acknowledged");
@@ -807,7 +825,7 @@ Failure Session::start_follower() {
     std::string digest;
     if (auto f = r.field(uuid, "session_uuid")) return f;
     if (auto f = r.u32(rank)) return f;
-    if (auto f = r.field(digest, "digest")) return f;
+    if (auto f = r.field(digest, "digest", kControlMaxRosterDigest)) return f;
     if (auto f = r.finish()) return f;
     if (uuid != config_.session_uuid || rank != 0 || digest != roster_.digest) {
         return Failure::fail(FailureCode::roster_mismatch,

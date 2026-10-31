@@ -50,6 +50,10 @@ inline constexpr uint32_t kControlMaxPayload = 64u * 1024u;
 
 // The largest field inside a join.  Hashes and fingerprints are tens of bytes.
 inline constexpr uint32_t kControlMaxField = 4096u;
+// The exact roster keeps complete join records and an unhashed agreement token. These two
+// protocol containers may be larger than a single identity field, but remain frame bounded.
+inline constexpr uint32_t kControlMaxRosterDigest = 52u * 1024u;
+inline constexpr uint32_t kControlMaxJoinRecord = 16u * 1024u;
 
 // The largest phase budget a session may run.  A phase with no bound is not a phase, so a configured deadline
 // above an hour is refused rather than accepted as "effectively forever".

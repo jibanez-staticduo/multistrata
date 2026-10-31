@@ -1156,6 +1156,10 @@ void frame_codec() {
               "a payload with one byte more than the format defines is not swallowed quietly");
         check(decode_join(joined.substr(0, joined.size() - 6), back).code == FailureCode::truncated_frame,
               "and a payload that stops inside a field is a truncated frame, not a default");
+        JoinInfo oversized_field = good_join(1);
+        oversized_field.model_hash.assign(kControlMaxField + 1, 'x');
+        check(encode_join(oversized_field, extra).code == FailureCode::oversized_frame,
+              "ordinary identity fields remain capped at 4096 bytes");
         check(!is_canonical_uuid("not-a-uuid") && is_canonical_uuid(kUuid) &&
                   !is_canonical_uuid(std::string(kUuid) + "0"),
               "a session id is a fresh canonical UUID or it is not accepted");
@@ -1268,6 +1272,39 @@ TcpOutcome run_rank(uint32_t rank, uint16_t port, const std::string& digest_expe
     return outcome;
 }
 
+TcpOutcome run_rank_with_large_hybrid_bundle(uint32_t rank, uint16_t port) {
+    SystemClock clock;
+    TcpChannelConfig channel_config;
+    channel_config.rank = rank;
+    channel_config.world = kTpWorld;
+    channel_config.self = TcpEndpoint{"127.0.0.1", port};
+    channel_config.rank0 = channel_config.self;
+    channel_config.credential = kCredential;
+    std::string err;
+    auto channel = make_tcp_control_channel(channel_config, clock, err);
+    TcpOutcome outcome;
+    if (!channel) {
+        outcome.code = FailureCode::listen_failed;
+        outcome.failure_detail = err;
+        return outcome;
+    }
+    SessionConfig config = good_config(rank);
+    config.budgets = PhaseBudgets{4000, 6000, 6000, 6000};
+    JoinInfo join = good_join(rank);
+    join.backend_identity = "nccl+roce-v1";
+    // A real-size encoded RoCE bootstrap can be several KiB per rank; rank-local
+    // values are distinct and all must survive the exact roster comparison.
+    join.nccl_bootstrap_id.assign(1800, static_cast<char>('A' + rank));
+    Session session(config, std::move(join), *channel, clock, [](std::string_view) {});
+    const Failure failure = session.start();
+    outcome.code = failure.code;
+    outcome.failure_detail = failure.detail;
+    outcome.ready = session.ready();
+    if (session.ready()) outcome.digest = session.roster().digest;
+    session.close();
+    return outcome;
+}
+
 void a_follower_starts_before_its_coordinator() {
     std::printf("a rank that starts before rank 0 keeps trying, up to its deadline\n");
     const uint16_t port = pick_free_port();
@@ -1322,6 +1359,36 @@ void three_ranks_over_real_tcp() {
                       !outcomes[0].digest.empty(),
                   "and every rank holds the same verified roster");
         }
+    }
+}
+
+void large_hybrid_bootstrap_roster_over_tcp() {
+    std::printf("large hybrid bootstrap bundles over real loopback TCP\n");
+    const uint16_t port = pick_free_port();
+    check(port != 0, "a port for the large hybrid bootstrap handshake");
+    if (!port) return;
+    TcpOutcome outcomes[kTpWorld];
+    std::thread threads[kTpWorld];
+    for (uint32_t rank = 0; rank < kTpWorld; ++rank) {
+        threads[rank] = std::thread([&, rank] {
+            outcomes[rank] = run_rank_with_large_hybrid_bundle(rank, port);
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    bool all_ready = true;
+    for (const auto& outcome : outcomes) all_ready = all_ready && outcome.ready;
+    check(all_ready, "all ranks reach READY when the exact bootstrap roster exceeds 4096 bytes");
+    if (!all_ready) {
+        for (uint32_t rank = 0; rank < kTpWorld; ++rank) {
+            if (!outcomes[rank].ready) {
+                std::printf("    rank %u: %s %s\n", rank, failure_code_name(outcomes[rank].code),
+                            outcomes[rank].failure_detail.c_str());
+            }
+        }
+    }
+    if (all_ready) {
+        check(outcomes[0].digest == outcomes[1].digest && outcomes[1].digest == outcomes[2].digest,
+              "all ranks retain the same exact large roster digest");
     }
 }
 
@@ -1978,6 +2045,7 @@ int main() {
     frame_codec();
     tcp_factory_rules();
     three_ranks_over_real_tcp();
+    large_hybrid_bootstrap_roster_over_tcp();
     collective_agreement_over_tcp();
     preagreed_schedule_over_tcp();
     preagreed_local_gates();
