@@ -135,7 +135,10 @@ takes 120.2093 seconds and decode 13.3173 seconds; client wall time is 134.6547
 seconds. This is an execution check, not a paired long-prompt speed comparison.
 Fresh pinned C1 configs and recipe are staged on all three hosts at
 `/home/staticduo/tmp/strata-tp3-20261031/optimization/accelerated-ready/service.yaml`.
-They are opt-in and not running. Staticduo21 restoration is recorded separately.
+They are opt-in and not running. Staticduo21 is restored once at the end:
+`/health` returns 200, `/v1/models` lists `qwen3.8-flash-next`, and the chat check
+returns `OK`. The receipt is
+`/home/staticduo/tmp/strata-tp3-20261031/optimization/production-restore.json`.
 
 ## Completed Reference Measurements
 

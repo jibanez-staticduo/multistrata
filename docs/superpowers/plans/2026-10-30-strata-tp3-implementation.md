@@ -63,8 +63,11 @@ Implemented and tested on 31 October 2026:
   [the acceptance record](../../TP3_EXPERIMENTAL_STATUS.md#short-gpu-ab).
 
 The final accelerated execution passes with 923 prompt tokens and 128 output
-tokens, reset and all three ranks ready. Once-only Staticduo21 restoration is the
-remaining operational closing step. The exhaustive old matrix remains stopped.
+tokens, reset and all three ranks ready. Staticduo21 is restored once at the end;
+health 200, the expected model ID and a chat response `OK` pass. The revised GPU
+acceleration goal is complete within the measured C1 scope. The exhaustive old
+matrix remains stopped; combined MTP/multislot graphs and long-context graph
+qualification remain outside this delivered profile.
 
 **Architecture:** One CUDA process per host, a private control coordinator and NCCL tensor collectives. Preserve original GGUF geometry through explicit unequal tensor ownership; add RoCEnante only after a correct profiled baseline.
 
