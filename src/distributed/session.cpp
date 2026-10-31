@@ -970,6 +970,89 @@ Failure Session::complete_operation(const Operation& operation) {
     return ok_failure();
 }
 
+Failure Session::agree_control_payload(std::string_view label, std::string_view exact_payload, Deadline at) {
+    if (state_ != SessionState::ready) {
+        return Failure::fail(FailureCode::not_ready, "no control agreement before READY");
+    }
+    if (operation_in_flight_) {
+        return fail(Failure::fail(FailureCode::in_flight, "a collective is already in flight"), true);
+    }
+    // Subtractions keep hostile string_view lengths from overflowing before the allocation check.
+    constexpr size_t cap = std::min<size_t>(1024u * 1024u, kControlMaxPayload);
+    const size_t overhead = 4 + config_.session_uuid.size() + 8 + 4 + 4;
+    if (overhead > cap || label.size() > cap - overhead ||
+        exact_payload.size() > cap - overhead - label.size()) {
+        return fail(Failure::fail(FailureCode::oversized_frame, "control agreement exceeds the payload cap"), true);
+    }
+    if (next_control_sequence_ == UINT64_MAX) {
+        return fail(Failure::fail(FailureCode::overflow, "control agreement sequence is exhausted"), true);
+    }
+    auto check_deadline = [&]() -> Failure {
+        return deadline_passed(clock_, at)
+            ? Failure::fail(FailureCode::deadline_expired, "control agreement deadline passed")
+            : ok_failure();
+    };
+    if (auto f = check_deadline()) return fail(f, true);
+    std::string payload;
+    payload.reserve(overhead + label.size() + exact_payload.size());
+    if (auto f = put_field(payload, "session_uuid", config_.session_uuid)) return fail(f, true);
+    put_u32(payload, static_cast<uint32_t>(next_control_sequence_ >> 32));
+    put_u32(payload, static_cast<uint32_t>(next_control_sequence_));
+    put_u32(payload, static_cast<uint32_t>(label.size()));
+    payload.append(label);
+    put_u32(payload, static_cast<uint32_t>(exact_payload.size()));
+    payload.append(exact_payload);
+
+    auto send = [&](uint32_t rank, FrameKind kind) -> Failure {
+        if (auto f = check_deadline()) return f;
+        return channel_.send(rank, kind, payload, at);
+    };
+    auto receive = [&](FrameKind kind, std::vector<bool>& seen) -> Failure {
+        if (auto f = check_deadline()) return f;
+        ReceivedFrame got;
+        if (auto f = channel_.recv(got, at)) return f;
+        if (got.frame.kind == FrameKind::abort) return peer_abort(got);
+        if (got.frame.kind != kind || got.from_rank >= config_.world || seen[got.from_rank]) {
+            return Failure::fail(FailureCode::bad_operation, "unexpected or duplicate control agreement frame");
+        }
+        // Equality verifies the entire length-prefixed envelope, without parsing or logging caller bytes.
+        if (got.frame.payload != payload) {
+            return Failure::fail(FailureCode::bad_operation, "ranks disagree on control sequence, label or payload");
+        }
+        seen[got.from_rank] = true;
+        return ok_failure();
+    };
+    if (config_.rank == 0) {
+        std::vector<bool> seen(config_.world, false);
+        seen[0] = true;
+        for (uint32_t i = 1; i < config_.world; ++i) {
+            if (auto f = receive(FrameKind::control, seen)) return fail(f, true);
+        }
+        for (uint32_t i = 1; i < config_.world; ++i) {
+            if (auto f = send(i, FrameKind::control)) return fail(f, true);
+        }
+        seen.assign(config_.world, false);
+        seen[0] = true;
+        for (uint32_t i = 1; i < config_.world; ++i) {
+            if (auto f = receive(FrameKind::control_ack, seen)) return fail(f, true);
+        }
+        for (uint32_t i = 1; i < config_.world; ++i) {
+            if (auto f = send(i, FrameKind::control_ack)) return fail(f, true);
+        }
+    } else {
+        if (auto f = send(0, FrameKind::control)) return fail(f, true);
+        std::vector<bool> seen(config_.world, true);
+        seen[0] = false;
+        if (auto f = receive(FrameKind::control, seen)) return fail(f, true);
+        if (auto f = send(0, FrameKind::control_ack)) return fail(f, true);
+        seen[0] = false;
+        if (auto f = receive(FrameKind::control_ack, seen)) return fail(f, true);
+    }
+    if (auto f = check_deadline()) return fail(f, true);
+    ++next_control_sequence_;
+    return ok_failure();
+}
+
 void Session::abort(std::string_view reason) {
     if (state_ == SessionState::closed) return;
     if (state_ != SessionState::failed) {

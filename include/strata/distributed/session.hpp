@@ -2,8 +2,7 @@
 // byte moves: one bounded control conversation over TCP, then READY or nothing.
 //
 // TCP carries coordination only.  Tensor traffic is the transport's business (transport.hpp) and goes over
-// whatever the device library picks; the control channel never carries a payload, so it stays usable on a
-// congested data path and its frames stay small enough to reason about.
+// whatever the device library picks; the control channel carries only bounded coordination metadata.
 //
 // What the join settles, and what happens when it does not:
 //   * The same fresh session UUID on all three ranks.  A rank that kept yesterday's UUID is a rank from
@@ -66,6 +65,8 @@ enum class FrameKind : uint16_t {
     abort = 6,       // any -> peers: this session is over, and why
     operation = 7,
     operation_ack = 8,
+    control = 9,
+    control_ack = 10,
 };
 
 const char* frame_kind_name(FrameKind kind);
@@ -295,6 +296,11 @@ class Session {
     Failure agree_operation(const CollectiveDescriptor& descriptor, Deadline at);
     Failure complete_operation(const Operation& operation);
 
+    // Agree exact label and payload bytes (including embedded NULs) before compute or commit. The complete
+    // envelope must fit kControlMaxPayload. Independent of collective sequence; no collective may be in flight.
+    // All ranks acknowledge the same metadata before this returns. Any disagreement ends the session.
+    Failure agree_control_payload(std::string_view label, std::string_view payload, Deadline at);
+
     // End the session and try to tell the others.  Idempotent; the first reason wins.
     void abort(std::string_view reason);
 
@@ -341,6 +347,7 @@ class Session {
     std::vector<JoinInfo> joins_{};            // rank 0: the joins collected, indexed by rank
     Roster roster_{};
     uint64_t next_sequence_ = 1;               // rank 0's ordering check on the model's own sequence numbers
+    uint64_t next_control_sequence_ = 1;
     Operation last_operation_{};
     bool operation_in_flight_ = false;
     bool notified_ = false;

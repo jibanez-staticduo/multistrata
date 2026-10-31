@@ -250,6 +250,153 @@ std::string operation_payload(const CollectiveDescriptor& d) {
     return out;
 }
 
+std::string control_payload(uint64_t sequence, std::string_view label, std::string_view payload) {
+    std::string out;
+    auto put32 = [&](uint32_t v) {
+        for (int shift : {24, 16, 8, 0}) out.push_back(static_cast<char>((v >> shift) & 0xff));
+    };
+    auto field = [&](std::string_view value) {
+        put32(static_cast<uint32_t>(value.size()));
+        out.append(value);
+    };
+    field(kUuid);
+    put32(static_cast<uint32_t>(sequence >> 32));
+    put32(static_cast<uint32_t>(sequence));
+    field(label);
+    field(payload);
+    return out;
+}
+
+void queue_coordinator_ready(Harness& h) {
+    const auto ranks = good_roster();
+    h.channel.recv_frames.push_back(from(1, FrameKind::join, join_payload(good_join(1))));
+    h.channel.recv_frames.push_back(from(2, FrameKind::join, join_payload(good_join(2))));
+    for (uint32_t rank : {1u, 2u}) {
+        h.channel.recv_frames.push_back(from(rank, FrameKind::roster_ack,
+                                            make_ack(kUuid, rank, roster_digest(ranks))));
+    }
+}
+
+void control_payload_agreement() {
+    const std::string label("route\0order", 11), bytes("secret\0binary\xff", 14);
+    {
+        Harness h;
+        Session session = h.session(0, good_join(0), good_config(0));
+        check(session.agree_control_payload(label, bytes, {}).code == FailureCode::not_ready &&
+                  h.channel.sent.empty(), "control agreement requires READY before any wire byte");
+    }
+    // Mutate each envelope byte: length, session, sequence, label and payload are all compared exactly.
+    const std::string canonical = control_payload(1, label, bytes);
+    bool every_mismatch_failed = true, no_release = true, no_raw_log = true;
+    for (size_t byte = 0; byte < canonical.size(); ++byte) {
+        Harness h;
+        queue_coordinator_ready(h);
+        Session session = h.session(0, good_join(0), good_config(0));
+        if (session.start()) { every_mismatch_failed = false; break; }
+        std::string changed = canonical;
+        changed[byte] ^= 1;
+        h.channel.recv_frames.push_back(from(1, FrameKind::control, canonical));
+        h.channel.recv_frames.push_back(from(2, FrameKind::control, changed));
+        const auto f = session.agree_control_payload(label, bytes, {h.clock.now() + std::chrono::seconds(1)});
+        every_mismatch_failed &= f.code == FailureCode::bad_operation && !session.ready() &&
+            h.channel.sent_to(1, FrameKind::abort) && h.channel.sent_to(2, FrameKind::abort) &&
+            session.agree_control_payload(label, bytes, {}).code == FailureCode::not_ready;
+        no_release &= h.channel.sends_of(FrameKind::control_ack) == 0;
+        for (const auto& line : h.lines) no_raw_log &= line.find("secret") == std::string::npos &&
+                                                     line.find("route") == std::string::npos;
+    }
+    check(every_mismatch_failed, "every changed byte in control metadata aborts both peers terminally");
+    check(no_release, "no metadata mismatch grants a control ACK or compute release");
+    check(no_raw_log, "control mismatch logs contain no raw label or payload bytes");
+
+    for (int mode = 0; mode < 5; ++mode) {
+        Harness h;
+        const auto ranks = good_roster();
+        h.channel.recv_frames.push_back(from(0, FrameKind::roster, roster_payload(ranks, PhaseBudgets{})));
+        h.channel.recv_frames.push_back(from(0, FrameKind::ready, make_ack(kUuid, 0, roster_digest(ranks))));
+        Session session = h.session(1, good_join(1), good_config(1));
+        check(!session.start(), "follower is ready for exact control agreement");
+        std::string metadata = canonical, ack = canonical;
+        if (mode == 1) metadata.back() ^= 1;
+        if (mode == 2) ack.back() ^= 1;
+        h.channel.recv_frames.push_back(from(mode == 4 ? 2 : 0, FrameKind::control, metadata));
+        if (mode != 3) h.channel.recv_frames.push_back(from(0, FrameKind::control_ack, ack));
+        const Failure f = session.agree_control_payload(label, bytes,
+                                                        {h.clock.now() + std::chrono::seconds(1)});
+        check(mode == 0 ? !f && session.ready() :
+              f.code == (mode == 3 ? FailureCode::deadline_expired : FailureCode::bad_operation) &&
+                  !session.ready(), "follower requires exact coordinator metadata and final ACK from rank zero");
+        if (mode == 1 || mode == 4) check(h.channel.sends_of(FrameKind::control_ack) == 0,
+                                        "follower does not ACK invalid metadata or a different sender");
+    }
+
+    for (int failure = 0; failure < 7; ++failure) {
+        Harness h;
+        queue_coordinator_ready(h);
+        Session session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "coordinator is ready for control agreement failure case");
+        std::string peer = canonical;
+        if (failure == 0) {
+            // Same concatenation but different boundaries must never match.
+            peer = control_payload(1, label.substr(0, label.size() - 1),
+                                   label.substr(label.size() - 1) + bytes);
+        }
+        h.channel.recv_frames.push_back(from(1, FrameKind::control, peer));
+        h.channel.recv_frames.push_back(from(failure == 1 ? 1 : 2, FrameKind::control, canonical));
+        if (failure != 2) {
+            h.channel.recv_frames.push_back(from(1, FrameKind::control_ack, canonical));
+            std::string ack = canonical;
+            if (failure == 3) ack.back() ^= 1;
+            h.channel.recv_frames.push_back(from(2, FrameKind::control_ack, ack));
+        }
+        Deadline at{h.clock.now() + std::chrono::seconds(1)};
+        if (failure == 4) at.end = h.clock.now();
+        std::string large;
+        std::string_view local = bytes;
+        if (failure == 5) { large.assign(kControlMaxPayload, 'x'); local = large; }
+        if (failure == 6) {
+            CollectiveDescriptor d{{1, 2, 3}, CollectiveKind::all_reduce_sum, ScalarType::fp32, 1, {}};
+            h.channel.recv_frames.clear();
+            h.channel.recv_frames.push_back(from(1, FrameKind::operation, operation_payload(d)));
+            h.channel.recv_frames.push_back(from(2, FrameKind::operation, operation_payload(d)));
+            check(!session.agree_operation(d, at), "an agreed collective holds the in-flight slot");
+        }
+        const Failure f = session.agree_control_payload(label, local, at);
+        const FailureCode expected = failure == 2 || failure == 4 ? FailureCode::deadline_expired :
+            failure == 5 ? FailureCode::oversized_frame : failure == 6 ? FailureCode::in_flight :
+            FailureCode::bad_operation;
+        check(f.code == expected && !session.ready(), "control agreement refuses ambiguity, duplicate, missing ACK, expiry, cap or in-flight");
+        check(h.channel.sends_of(FrameKind::control_ack) == 0,
+              "failed control agreement does not release any follower");
+    }
+    {
+        Harness h;
+        queue_coordinator_ready(h);
+        Session session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "coordinator is ready for repeated exact control bytes");
+        bool exact = true;
+        for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
+            const auto envelope = control_payload(sequence, label, bytes);
+            for (const auto kind : {FrameKind::control, FrameKind::control_ack}) {
+                for (uint32_t rank : {1u, 2u}) h.channel.recv_frames.push_back(from(rank, kind, envelope));
+            }
+            const size_t sent_before = h.channel.sent.size();
+            exact &= !session.agree_control_payload(label, bytes, {h.clock.now() + std::chrono::seconds(1)});
+            for (size_t i = sent_before; i < h.channel.sent.size(); ++i) {
+                const auto& sent = h.channel.sent[i];
+                if (sent.kind == FrameKind::control || sent.kind == FrameKind::control_ack)
+                    exact &= sent.payload == envelope;
+            }
+        }
+        check(exact && h.channel.sends_of(FrameKind::control_ack) == 6,
+              "repeated binary control agreements retain exact embedded NUL bytes and independent sequence");
+        CollectiveDescriptor d{{1, 2, 3}, CollectiveKind::all_reduce_sum, ScalarType::fp32, 1, {}};
+        for (uint32_t rank : {1u, 2u}) h.channel.recv_frames.push_back(from(rank, FrameKind::operation, operation_payload(d)));
+        check(!session.agree_operation(d, {h.clock.now() + std::chrono::seconds(1)}) &&
+                  !session.complete_operation(d.operation), "control agreements do not consume collective sequence numbers");
+    }
+}
+
 void collective_agreement() {
     const CollectiveDescriptor good{{1, 2, 3}, CollectiveKind::all_gather_padded, ScalarType::fp32,
                                     256, {256, 192, 192}};
@@ -852,7 +999,7 @@ void frame_codec() {
     }
     {
         std::string unknown = frame;
-        unknown[5] = 0x09;  // a kind this build has no name for
+        unknown[5] = 0x0b;  // a kind this build has no name for
         FrameDecoder d;
         std::vector<DecodedFrame> frames;
         check(d.feed(unknown.data(), unknown.size(), frames).code == FailureCode::unknown_frame,
@@ -1110,6 +1257,83 @@ void collective_agreement_over_tcp() {
             if (code != (mismatch < 0 ? FailureCode::none : FailureCode::bad_operation))
                 std::printf("    mismatch %d rank %u: %s: %s\n", mismatch, rank,
                             failure_code_name(code), details[rank].c_str());
+        }
+    }
+}
+
+void control_payload_agreement_over_tcp() {
+    // The control protocol carries bytes, never floats or a lossy numerical digest.
+    for (int mismatch = -1; mismatch < 6; ++mismatch) {
+        const uint16_t port = pick_free_port();
+        check(port != 0, "a TCP port for exact control agreement");
+        if (!port) return;
+        std::atomic<int> finished{0};
+        FailureCode results[kTpWorld]{};
+        std::string details[kTpWorld];
+        uint32_t committed[kTpWorld]{};
+        std::vector<std::thread> threads;
+        for (uint32_t rank = 0; rank < kTpWorld; ++rank) {
+            threads.emplace_back([&, rank] {
+                SystemClock clock;
+                TcpChannelConfig wire;
+                wire.rank = rank;
+                wire.self = wire.rank0 = TcpEndpoint{"127.0.0.1", port};
+                wire.credential = kCredential;
+                std::string err;
+                auto channel = make_tcp_control_channel(wire, clock, err);
+                auto config = good_config(rank);
+                config.budgets = PhaseBudgets{3000, 3000, 3000, 3000};
+                Session session(config, good_join(rank), *channel, clock, [](std::string_view) {});
+                Failure f = session.start();
+                for (uint64_t sequence = 1; !f && sequence <= 4; ++sequence) {
+                    std::string label("route\0order", 11);
+                    // Exercise the full envelope cap, including fields much larger than the join field cap.
+                    const size_t overhead = 4 + std::strlen(kUuid) + 8 + 4 + label.size() + 4;
+                    std::string payload(kControlMaxPayload - overhead, '\0');
+                    payload.front() = static_cast<char>(sequence);
+                    payload.back() = static_cast<char>(0xff);
+                    if (mismatch >= 0 && sequence == 2) {
+                        if ((mismatch == 0 && rank == 1) || (mismatch == 1 && rank == 2) ||
+                            (mismatch == 2 && rank == 0)) payload[payload.size() / 2] ^= 1;
+                        if (mismatch == 3 && rank == 2) label[2] ^= 1;
+                        if (mismatch == 4 && rank == 2) {
+                            payload.insert(payload.begin(), label.back());
+                            label.pop_back();
+                        }
+                        if (mismatch == 5 && rank == 2) {
+                            session.close();
+                            f = Failure::fail(FailureCode::peer_closed, "deliberate test disconnect");
+                            break;
+                        }
+                    }
+                    f = session.agree_control_payload(label, payload,
+                                                     {clock.now() + std::chrono::seconds(3)});
+                    if (!f) ++committed[rank];
+                    if (!f) {
+                        CollectiveDescriptor d{{sequence, 2, 3}, CollectiveKind::all_reduce_sum,
+                                                ScalarType::fp32, 1, {}};
+                        f = session.agree_operation(d, {clock.now() + std::chrono::seconds(3)});
+                        if (!f) f = session.complete_operation(d.operation);
+                    }
+                }
+                results[rank] = f.code;
+                details[rank] = f.detail;
+                ++finished;
+                const auto end = clock.now() + std::chrono::seconds(3);
+                while (finished != 3 && clock.now() < end) std::this_thread::yield();
+                session.close();
+            });
+        }
+        for (auto& thread : threads) thread.join();
+        for (uint32_t rank = 0; rank < kTpWorld; ++rank) {
+            const FailureCode expected = mismatch < 0 ? FailureCode::none :
+                mismatch == 5 ? FailureCode::peer_closed : FailureCode::bad_operation;
+            check(results[rank] == expected && committed[rank] == (mismatch < 0 ? 4u : 1u),
+                  mismatch < 0 ? "three TCP ranks repeatedly agree exact maximum binary payload before compute" :
+                                 "TCP byte/label mismatch or disconnect aborts every rank before next compute");
+            if (results[rank] != expected)
+                std::printf("    mismatch %d rank %u: %s: %s\n", mismatch, rank,
+                            failure_code_name(results[rank]), details[rank].c_str());
         }
     }
 }
@@ -1407,6 +1631,7 @@ int main() {
     std::printf("session formation (CPU, real and scripted control channels, no GPU)\n");
     coordinator_reaches_ready();
     collective_agreement();
+    control_payload_agreement();
     follower_reaches_ready();
     follower_adopts_the_smaller_budget();
     coordinator_refuses_a_group_that_does_not_agree();
@@ -1421,6 +1646,7 @@ int main() {
     tcp_factory_rules();
     three_ranks_over_real_tcp();
     collective_agreement_over_tcp();
+    control_payload_agreement_over_tcp();
     queued_abort_survives_tcp_reset();
     a_follower_starts_before_its_coordinator();
     raw_peers_over_real_tcp();

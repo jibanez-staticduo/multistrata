@@ -31,6 +31,8 @@ const char* frame_kind_name(FrameKind kind) {
         case FrameKind::abort: return "abort";
         case FrameKind::operation: return "operation";
         case FrameKind::operation_ack: return "operation_ack";
+        case FrameKind::control: return "control";
+        case FrameKind::control_ack: return "control_ack";
     }
     return "unknown";
 }
@@ -65,7 +67,7 @@ uint32_t get_u32(const char* p) {
 Failure encode_frame(FrameKind kind, std::string_view payload, std::string& out) {
     const uint16_t raw_kind = static_cast<uint16_t>(kind);
     const bool known = raw_kind >= static_cast<uint16_t>(FrameKind::hello) &&
-                       raw_kind <= static_cast<uint16_t>(FrameKind::operation_ack);
+                       raw_kind <= static_cast<uint16_t>(FrameKind::control_ack);
     if (!known) {
         return Failure::fail(FailureCode::unknown_frame, "cannot encode a frame kind this build does not know");
     }
@@ -110,7 +112,7 @@ Failure FrameDecoder::feed(const char* data, size_t n, std::vector<DecodedFrame>
         }
         const uint16_t raw_kind = get_u16(buffer_.data() + 4);
         if (raw_kind < static_cast<uint16_t>(FrameKind::hello) ||
-            raw_kind > static_cast<uint16_t>(FrameKind::operation_ack)) {
+            raw_kind > static_cast<uint16_t>(FrameKind::control_ack)) {
             return Failure::fail(FailureCode::unknown_frame,
                                  "unknown control frame kind " + std::to_string(raw_kind));
         }
