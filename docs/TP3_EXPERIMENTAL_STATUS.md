@@ -205,6 +205,13 @@ logit rows against TP1 with zero error. [The C8 receipt][c8state] covers those
 short requests. A second eight-request batch cancels one client; the other seven
 finish and the group returns ready. Long-context C8 remains unqualified.
 
+The later complete-and-cancel batches also pass full-state replay: MTP covers
+two snapshots, C4 covers eight and C8 covers sixteen, including their cancelled
+requests. Each captured canonical input matches on all ranks. The
+[C8 combined receipt][c8allstate] compares 2736 logical state arrays and sixteen
+final logit rows with zero error. These checks concern short requests and state
+isolation; their overlapping run times are not benchmark results.
+
 ## Failed attempts retained
 
 Early component and whole-model runs failed numerical gates; their original
@@ -273,3 +280,5 @@ files with this report when sharing it; the links are not public downloads.
 [c4state]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/c4-check/result/comparison.json
 
 [c8state]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/c8-check/result/comparison.json
+
+[c8allstate]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/c8-all-check/result/comparison.json
