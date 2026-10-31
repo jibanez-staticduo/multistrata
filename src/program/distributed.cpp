@@ -6,6 +6,7 @@
 #include "strata/distributed/expert_model.hpp"
 #include "strata/distributed/model_worker.hpp"
 #include "strata/distributed/autoregressive.hpp"
+#include "strata/distributed/capture_positions.hpp"
 #include "strata/distributed/mtp_service.hpp"
 #include "strata/distributed/multislot_service.hpp"
 #include "strata/distributed/slot_pool.hpp"
@@ -22,6 +23,7 @@
 #include "strata/kernels/shared_expert.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <fstream>
 #include <filesystem>
 #include <iostream>
@@ -311,7 +313,7 @@ int main(int argc, char** argv) {
         std::map<std::string, std::string> args;
         const std::set<std::string> allowed = {"rank", "rank0-address", "port", "session-uuid",
             "library-path", "nccl-version", "library-provenance", "model-hash", "config-fingerprint",
-            "pack", "native", "ple", "context", "logits-dir", "timeout-ms",
+            "pack", "native", "ple", "context", "logits-dir", "logits-positions", "timeout-ms",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
             "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel"};
         for (int i = 1; i < argc; i += 2) {
@@ -390,6 +392,12 @@ int main(int argc, char** argv) {
         if (rank >= 3 || port < 1024 || port > 65535 || timeout < 100 || timeout > 600000 || context < 4 ||
             context > 65536u)
             throw std::runtime_error("invalid rank, port, deadline or context");
+        const bool selected_logits = args.contains("logits-positions");
+        require(!selected_logits || (args.contains("logits-dir") && !get("logits-dir").empty() &&
+                                    !autoregressive && !multislot),
+                "--logits-positions requires --logits-dir and teacher-forced mode");
+        const auto logits_positions = selected_logits ?
+            CapturePositions::parse(args.at("logits-positions"), context) : CapturePositions{};
         std::unique_ptr<JsonOutput> json;
         if (autoregressive || multislot) {
             require(!args.contains("trace-dir") && !args.contains("state-dir") && !args.contains("logits-dir"),
@@ -691,7 +699,10 @@ int main(int argc, char** argv) {
             std::cout << "READY rank=" << rank << " tp=3 pp=1 layers=48 c=1"
                       << " policy=native-original-v1-gather-reference"
                       << " grouped_v1=1 old_iq=1 expert_mode=0 expert_expdec=0"
-                      << " fused_gr=0 fused_gdn=0 fast_attn=0 flash_short=0 shared_early=1\n";
+                      << " fused_gr=0 fused_gdn=0 fast_attn=0 flash_short=0 shared_early=1";
+            if (selected_logits) std::cout << " logits_positions=" << args.at("logits-positions")
+                                           << " logits_last=gen-segment";
+            std::cout << '\n';
             std::string line;
             while (std::getline(std::cin, line)) {
                 if (line == "QUIT") { if (state_last) dump_state(false); break; }
@@ -717,11 +728,36 @@ int main(int argc, char** argv) {
                 std::string verb; input >> verb;
                 if (verb != "GEN") throw std::runtime_error("expected GEN <teacher-forced token IDs>, RESET or QUIT");
                 int64_t id;
+                std::vector<int32_t> tokens;
+                size_t token_index = 0;
+                if (selected_logits) {
+                    // Parse only the opt-in path ahead of execution, so "last" is
+                    // known without retaining logits or changing commit/readback.
+                    const auto position = uint64_t(model.next_position());
+                    require(position <= context, "position exceeds context");
+                    std::string token_word;
+                    while (input >> token_word) {
+                        const auto [end, status] = std::from_chars(token_word.data(),
+                            token_word.data() + token_word.size(), id);
+                        require(status == std::errc{} && end == token_word.data() + token_word.size() &&
+                                id >= 0 && id < geometry.n_vocab, "invalid token ID");
+                        require(tokens.size() < context - position, "GEN exceeds remaining context");
+                        tokens.push_back(int32_t(id));
+                    }
+                    require(!tokens.empty() && input.eof(), "GEN needs valid integer token IDs");
+                }
+                auto next_token = [&] {
+                    if (!selected_logits) return bool(input >> id);
+                    if (token_index == tokens.size()) return false;
+                    id = tokens[token_index++];
+                    return true;
+                };
                 bool any = false;
-                while (input >> id) {
+                while (next_token()) {
                     if (id < 0 || id >= geometry.n_vocab) throw std::runtime_error("invalid token ID");
                     any = true;
                     const auto pos = model.next_position();
+                    require(uint64_t(pos) < context, "GEN exceeds remaining context");
                     execute(StepPhase::prefill, {int32_t(id)}, {uint64_t(pos)});
                     const auto result = execute(StepPhase::commit);
                     if (state_positions.contains(uint64_t(pos))) dump_state(false);
@@ -729,7 +765,8 @@ int main(int argc, char** argv) {
                         const auto* logits = execution.committed_logits();
                         require(logits != nullptr, "commit did not publish logits");
                         const auto top = std::max_element(logits, logits + geometry.n_vocab) - logits;
-                        if (args.contains("logits-dir")) {
+                        if (args.contains("logits-dir") && logits_positions.contains(uint64_t(pos),
+                                selected_logits && token_index == tokens.size())) {
                             const auto directory = std::filesystem::path(args.at("logits-dir")) /
                                                    ("request-" + std::to_string(request_sequence));
                             std::filesystem::create_directories(directory);
@@ -741,7 +778,7 @@ int main(int argc, char** argv) {
                         std::cout << "TOKEN position=" << pos << " input=" << id << " argmax=" << top << '\n';
                     }
                 }
-                require(any && input.eof(), "GEN needs valid integer token IDs");
+                require(any && (selected_logits || input.eof()), "GEN needs valid integer token IDs");
             }
             }
             }

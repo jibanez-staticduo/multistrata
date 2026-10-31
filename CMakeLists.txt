@@ -2961,6 +2961,11 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_link_libraries(test_multislot_service PRIVATE strata_warnings)
   add_test(NAME test_multislot_service COMMAND test_multislot_service)
 
+  add_executable(test_capture_positions tests/distributed/test_capture_positions.cpp)
+  target_include_directories(test_capture_positions PRIVATE include)
+  target_link_libraries(test_capture_positions PRIVATE strata_warnings)
+  add_test(NAME test_capture_positions COMMAND test_capture_positions)
+
   add_executable(test_model_worker_command tests/distributed/test_model_worker_command.cpp
                                           src/distributed/model_worker.cpp)
   target_include_directories(test_model_worker_command PRIVATE include)

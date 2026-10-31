@@ -1,5 +1,6 @@
 // Independent, uncaptured C1 teacher-forcing oracle. No distributed model kernels.
 #include "strata/distributed/reference.hpp"
+#include "strata/distributed/capture_positions.hpp"
 #include "strata/distributed/parity_trace_writer.hpp"
 #include "strata/distributed/state_evidence.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -107,7 +108,7 @@ int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
         std::map<std::string, std::string> args;
-        const std::set<std::string> allowed = {"pack", "native", "ple", "context", "logits-dir",
+        const std::set<std::string> allowed = {"pack", "native", "ple", "context", "logits-dir", "logits-positions",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
@@ -127,6 +128,10 @@ int main(int argc, char** argv) {
             require(status == std::errc{} && end == text.data() + text.size(), "invalid --context");
         }
         require(context >= 4 && context <= 1048576, "context must be in [4, 1048576]");
+        const bool selected_logits = args.contains("logits-positions");
+        require(!selected_logits || args.contains("logits-dir"), "--logits-positions requires --logits-dir");
+        const auto logits_positions = selected_logits ?
+            CapturePositions::parse(args.at("logits-positions"), context) : CapturePositions{};
         require(!args.contains("state-positions") || args.contains("state-dir"),
                 "--state-positions requires --state-dir");
         require(!args.contains("state-max-bytes") || args.contains("state-dir"),
@@ -259,7 +264,10 @@ int main(int argc, char** argv) {
         std::cout << "READY rank=0 tp=1 pp=1 layers=48 c=1 oracle=monolithic staging=selected-experts"
                      " gdn=native-unfused qsa=gather-reference select=block gr=native-bf16-mmvf"
                      " expert-activation=Q8_1 grouped=v1 iq-kernels=old expert-mode=0 expdec=0"
-                     " benchmark=unsupported\n";
+                     " benchmark=unsupported";
+        if (selected_logits) std::cout << " logits_positions=" << args.at("logits-positions")
+                                       << " logits_last=gen-segment";
+        std::cout << '\n';
         std::string line;
         while (std::getline(std::cin, line)) {
             if (line == "QUIT") break;
@@ -275,16 +283,21 @@ int main(int argc, char** argv) {
             std::string word; input >> word;
             require(word == "GEN", "expected GEN <teacher-forced token IDs>, RESET or QUIT");
             std::vector<int32_t> tokens;
+            const auto position = uint64_t(model.next_position());
+            require(position <= context, "position exceeds context");
             while (input >> word) {
                 int32_t id = -1;
                 const auto [end, status] = std::from_chars(word.data(), word.data() + word.size(), id);
                 require(status == std::errc{} && end == word.data() + word.size() && id >= 0 &&
                         id < geometry.n_vocab, "invalid token ID");
+                require(tokens.size() < context - position, "GEN exceeds remaining context");
                 tokens.push_back(id);
             }
             require(!tokens.empty() && tokens.size() <= size_t(context - model.next_position()),
                     "GEN requires token IDs fitting the remaining context");
+            size_t token_index = 0;
             for (const auto id : tokens) {
+                ++token_index;
                 const auto pos = model.next_position();
                 require(model.token(id, pos, 0, static_cast<float*>(logits.pointer), stream.value, err), err);
                 // token() has completed its bounded event; this copy has no pending device producers.
@@ -293,7 +306,7 @@ int main(int argc, char** argv) {
                 require(std::all_of(host_logits.begin(), host_logits.end(), [](float x) { return std::isfinite(x); }),
                         "oracle produced non-finite logits");
                 const auto top = std::max_element(host_logits.begin(), host_logits.end()) - host_logits.begin();
-                if (args.contains("logits-dir")) {
+                if (args.contains("logits-dir") && logits_positions.contains(uint64_t(pos), token_index == tokens.size())) {
                     const auto directory = std::filesystem::path(args.at("logits-dir")) / request_id();
                     std::filesystem::create_directories(directory);
                     const auto path = directory / ("logits-" + std::to_string(pos) + ".f32");

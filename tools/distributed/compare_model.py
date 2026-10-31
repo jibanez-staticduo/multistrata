@@ -23,6 +23,9 @@ not opaque checksums. A full-model gate also requires policy.required_states:
 [{kind, name, dtype, shape}] listing every logical state expected at every row,
 including KV and GDN. Without that frozen inventory state validation is missing.
 State identity, dtype and shape must match exactly.
+Only policy.required_states may use the literal "{token_count}" in the first
+dimension of a kv shape. It resolves to that logits row's position + 1; all
+other dimensions and every artifact shape remain explicit positive integers.
 Integer arrays compare exactly, including 64-bit IDs (no float conversion).
 state_manifests: [{rank: 0|1|2, path}] imports C++ state_evidence manifests.
 axis_shard arrays reconstruct by explicit axis_indices only when all three ranks
@@ -109,7 +112,7 @@ def read_policy(path: Path) -> dict[str, Any]:
         require(key not in names, "duplicate required state")
         names.add(key)
         require(state.get("dtype") in STATE_DTYPES, "invalid required state dtype")
-        shape_size(state.get("shape"), state["dtype"])
+        required_shape(state, 1)
         require(state.get("layout", "logical") == "logical", "frozen inventory must declare logical arrays")
     return policy
 
@@ -120,6 +123,22 @@ def shape_size(shape: Any, dtype: str) -> int:
     size = math.prod(shape) * np.dtype(dtype).itemsize
     require(size <= sys.maxsize, "shape byte size overflow")
     return size
+
+
+def required_shape(state: dict, token_count: int) -> list[int]:
+    """Resolve the sole frozen shape symbol against a validated token row."""
+    shape = state.get("shape")
+    require(isinstance(shape, list), "invalid required state shape")
+    resolved = []
+    for axis, dimension in enumerate(shape):
+        if dimension == "{token_count}":
+            require(state["kind"] == "kv" and axis == 0,
+                    "token_count shape symbol is allowed only on the first kv axis")
+            resolved.append(token_count)
+        else:
+            resolved.append(dimension)
+    shape_size(resolved, state["dtype"])
+    return resolved
 
 
 def raw(path: Path, dtype: str, shape: list[int], files: dict[str, str]) -> np.ndarray:
@@ -197,7 +216,8 @@ def load(path: Path, policy_path: Path, policy: dict, files: dict) -> dict:
         require(manifest.get("phase", "token") == "token",
                 "reset manifests require a separate reset gate, not a logits row")
         key = identity(manifest)
-        require(key in arrays and manifest.get("token_count") == key[1] + 1, "state manifest identity mismatch")
+        require(key in arrays and integer(manifest.get("token_count")) and
+                manifest["token_count"] == key[1] + 1, "state manifest identity mismatch")
         require((*key, rank) not in manifest_ids, "duplicate state manifest rank")
         manifest_ids.add((*key, rank))
         declared = manifest.get("states")
@@ -347,12 +367,13 @@ def compare(baseline: Path, candidate: Path, policy_path: Path, *,
     missing = []
     for key in left["logits"]:
         for expected in inventory:
+            expected_shape = required_shape(expected, key[1] + 1)
             state_key = (*key, expected["kind"], expected["name"])
             if state_key not in left["states"]:
                 missing.append(dict(request_id=key[0], position=key[1], **expected))
             else:
                 dtype, shape, _ = left["states"][state_key]
-                require((dtype, shape) == (expected["dtype"], expected["shape"]),
+                require((dtype, shape) == (expected["dtype"], expected_shape),
                         "state dtype/shape differs from frozen inventory")
     inventory_complete = {"kv", "gdn"}.issubset({s["kind"] for s in inventory})
     partial = {"baseline": left["partial_states"], "candidate": right["partial_states"]}

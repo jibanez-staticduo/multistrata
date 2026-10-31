@@ -372,3 +372,122 @@ def test_float_state_nan_fails_full_gate(evidence):
     np.array([1, 2, 3, np.nan], dtype="<f2").tofile(evidence[1].parent / "state-1-gdn-1.bin")
     report, code = cm.compare(*evidence)
     assert code == 1 and report["state_validation"] == "failed"
+
+
+def make_dynamic_kv(evidence, *, last_position=8191, manifests=False, wrong_length=False):
+    a, b, policy = evidence
+    change(policy, lambda p: p["required_states"][0].update(shape=["{token_count}", 2]))
+    for side, path in enumerate((a, b)):
+        meta = json.loads(path.read_text())
+        meta.update(format="raw_f32_rows", policy_sha256=cm.sha256(policy),
+                    token_ids={"request-A": [1] * (last_position + 1)}, states=[], state_manifests=[])
+        meta["settings"]["context"] = last_position + 1
+        for row, position in zip(meta["rows"], (0, last_position)):
+            row.update(position=position, path=f"dynamic-logits-{side}-{position}.bin")
+            np.array([1, 3, 2, -1], dtype="<f4").tofile(path.parent / row["path"])
+            token_count = position + 1
+            length = token_count + (1 if wrong_length else 0)
+            states = []
+            for kind, shape in (("kv", [length, 2]), ("gdn", [2, 2])):
+                filename = f"dynamic-state-{side}-{kind}-{position}.bin"
+                np.ones(shape, dtype="<f2").tofile(path.parent / filename)
+                states.append(dict(request_id=row["request_id"], position=position, kind=kind,
+                                   name="layer.0", dtype="<f2", shape=shape, path=filename))
+            if manifests:
+                filename = f"dynamic-manifest-{side}-{position}.json"
+                manifest = dict(schema_version=1, complete=True, logical_complete=True,
+                                request_id=row["request_id"], position=position, token_count=token_count,
+                                total_bytes=sum(cm.shape_size(s["shape"], s["dtype"]) for s in states),
+                                required_states=[{k: v for k, v in s.items()
+                                                  if k not in ("path", "request_id", "position")}
+                                                 for s in states], states=states)
+                (path.parent / filename).write_text(json.dumps(manifest))
+                meta["state_manifests"].append(dict(rank=0, path=filename))
+            else:
+                meta["states"].extend(states)
+        path.write_text(json.dumps(meta))
+
+
+@pytest.mark.parametrize("last_position", [8191, 65535])
+@pytest.mark.parametrize("manifests", [False, True])
+def test_frozen_kv_token_count_shape_supports_sparse_long_context_rows(evidence, last_position, manifests):
+    make_dynamic_kv(evidence, last_position=last_position, manifests=manifests)
+    report, code = cm.compare(*evidence)
+    assert code == 0 and report["full_model_pass"]
+    assert [row["position"] for row in report["rows"]] == [0, last_position]
+    assert report["policy"]["required_states"][0]["shape"] == ["{token_count}", 2]
+
+
+@pytest.mark.parametrize("manifests", [False, True])
+def test_dynamic_kv_length_must_equal_row_position_plus_one_on_both_sides(evidence, manifests):
+    make_dynamic_kv(evidence, manifests=manifests, wrong_length=True)
+    with pytest.raises(cm.EvidenceError, match="state dtype/shape differs from frozen inventory"):
+        cm.compare(*evidence)
+
+
+@pytest.mark.parametrize("kind,shape", [("gdn", ["{token_count}", 2]),
+                                        ("kv", [2, "{token_count}"]),
+                                        ("kv", ["token_count", 2]),
+                                        ("kv", ["{token_count + 1}", 2]),
+                                        ("kv", ["{position}", 2])])
+def test_dynamic_shape_symbol_is_restricted_to_kv_first_axis(evidence, kind, shape):
+    change(evidence[2], lambda p: p["required_states"][0].update(kind=kind, shape=shape))
+    with pytest.raises(cm.EvidenceError, match="shape"):
+        cm.read_policy(evidence[2])
+
+
+def test_missing_dynamic_snapshot_cannot_claim_full_gate(evidence):
+    make_dynamic_kv(evidence, manifests=True)
+    for path in evidence[:2]:
+        change(path, lambda m: m["state_manifests"].pop())
+    report, code = cm.compare(*evidence)
+    assert code == 77 and not report["full_model_pass"]
+    assert len(report["missing_states"]) == 2
+
+
+def test_dynamic_manifest_token_count_cannot_override_row_position(evidence):
+    make_dynamic_kv(evidence, manifests=True)
+    manifest = evidence[1].parent / "dynamic-manifest-1-8191.json"
+    change(manifest, lambda m: m.update(token_count=8193))
+    with pytest.raises(cm.EvidenceError, match="state manifest identity mismatch"):
+        cm.compare(*evidence)
+
+
+@pytest.mark.parametrize("token_count", [True, 1.0])
+def test_manifest_token_count_requires_an_explicit_integer(evidence, token_count):
+    make_dynamic_kv(evidence, manifests=True)
+    manifest = evidence[1].parent / "dynamic-manifest-1-0.json"
+    change(manifest, lambda m: m.update(token_count=token_count))
+    with pytest.raises(cm.EvidenceError, match="state manifest identity mismatch"):
+        cm.compare(*evidence)
+
+
+@pytest.mark.parametrize("ranks,expected_code", [((0, 1, 2), 0), ((0, 1), 77)])
+def test_dynamic_kv_shards_require_complete_three_rank_coverage(evidence, ranks, expected_code):
+    make_dynamic_kv(evidence, manifests=True)
+    change(evidence[2], lambda p: p["required_states"][0].update(shape=["{token_count}", 3]))
+    for side, path in enumerate(evidence[:2]):
+        meta = json.loads(path.read_text())
+        meta.update(policy_sha256=cm.sha256(evidence[2]), state_manifests=[])
+        for position in (0, 8191):
+            original = json.loads((path.parent / f"dynamic-manifest-{side}-{position}.json").read_text())
+            for rank in ranks:
+                manifest = copy.deepcopy(original)
+                kv = manifest["states"][0]
+                kv.update(shape=[position + 1, 1], layout="axis_shard", logical_shape=[position + 1, 3],
+                          shard_axis=1, axis_indices=[rank], path=f"dynamic-shard-{side}-{position}-{rank}.bin")
+                np.ones(kv["shape"], dtype=kv["dtype"]).tofile(path.parent / kv["path"])
+                manifest.update(logical_complete=False,
+                                total_bytes=sum(cm.shape_size(s["shape"], s["dtype"]) for s in manifest["states"]),
+                                required_states=[{k: v for k, v in s.items()
+                                                  if k not in ("path", "request_id", "position")}
+                                                 for s in manifest["states"]])
+                filename = f"dynamic-shard-manifest-{side}-{position}-{rank}.json"
+                (path.parent / filename).write_text(json.dumps(manifest))
+                meta["state_manifests"].append(dict(rank=rank, path=filename))
+        path.write_text(json.dumps(meta))
+    report, code = cm.compare(*evidence)
+    assert code == expected_code
+    assert report["full_model_pass"] is (expected_code == 0)
+    if expected_code == 77:
+        assert all(state["ranks"] == [0, 1] for state in report["partial_states"]["candidate"])
