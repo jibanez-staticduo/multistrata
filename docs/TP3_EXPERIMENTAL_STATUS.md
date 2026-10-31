@@ -170,7 +170,9 @@ full-vocabulary boundary logit rows and 3915 exact state comparisons against
 TP1. This is a short correctness gate, not a GEMM or speed result. Size two also passes twelve exact logit rows and 5022 state comparisons;
 size four passes ten rows and 4284 state comparisons. All three-rank receipts
 exit 0. The C1 service also runs the opt-in chunk path and returns measured host-phase
-prefill/decode timings. Its same-ID full-state comparison remains under qualification.
+prefill/decode timings. Its same-ID full-state comparison also passes: 24 consumed IDs, all 171 logical
+state arrays and the final full-vocabulary logits agree exactly with TP1.
+[The service chunk receipt][servicebatch8] qualifies this short request only.
 
 ## Native RoCEnante transport checks
 
@@ -297,3 +299,5 @@ files with this report when sharing it; the links are not public downloads.
 [c8allstate]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/c8-all-check/result/comparison.json
 
 [prefill8]: /home/staticduo/tmp/strata-tp3-20261031/prefill-batch8/independent-qualification.json
+
+[servicebatch8]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/batch8-check/result/comparison.json
