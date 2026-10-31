@@ -199,7 +199,11 @@ canonical consumed IDs through TP1 matches 684 logical state arrays and four
 full-vocabulary final logit rows with zero error. [The C4 state receipt][c4state]
 qualifies this short state-isolation case. A second four-request run cancels one
 client while the other three finish and all workers return ready. It does not
-qualify 64K/C4 or C8.
+qualify 64K/C4. A separately configured C8 pool also completes eight mixed
+requests and matches 1368 logical state arrays and eight final full-vocabulary
+logit rows against TP1 with zero error. [The C8 receipt][c8state] covers those
+short requests. A second eight-request batch cancels one client; the other seven
+finish and the group returns ready. Long-context C8 remains unqualified.
 
 ## Failed attempts retained
 
@@ -267,3 +271,5 @@ files with this report when sharing it; the links are not public downloads.
 [mtpstate]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/mtp-check/result/comparison.json
 
 [c4state]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/c4-check/result/comparison.json
+
+[c8state]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/c8-check/result/comparison.json
