@@ -85,7 +85,13 @@ for line in sys.stdin:
     if mode == 'done_error':
         emit('done', request_id=rid, state='failed')
         continue
-    if mode == 'echo' or mode.startswith('timing'):
+    if mode == 'echo':
+        values = msg['ids']
+    elif mode == 'timing_eos':
+        values = list(b'</think>\n\nHello.') + [257]
+    elif mode == 'timing_stop':
+        values = list(b'</think>\n\nHello.STOPtail')
+    elif mode.startswith('timing'):
         values = msg['ids']
     else:
         values = list(b'</think>\n\nHello.') + [257]
@@ -95,7 +101,8 @@ for line in sys.stdin:
     if mode.startswith('timing'):
         done['timing'] = {
             'clock': 'host_steady_wall', 'queue_ns': 11, 'prefill_ns': 22,
-            'decode_ns': msg['ids'][0], 'sampling_ns': 44, 'mtp_draft_ns': 55,
+            'decode_ns': 1_500_000_000 if mode in ('timing_eos', 'timing_stop') else msg['ids'][0],
+            'sampling_ns': 44, 'mtp_draft_ns': 55,
             'mtp_checkpoint_ns': 66, 'mtp_rollback_ns': 77,
             'prompt_tokens': len(msg['ids']), 'generated_tokens': len(values[:msg['max_new']]),
         }
@@ -167,6 +174,26 @@ def test_native_done_timings_preserve_phases_and_convert_wall_units(make_engine)
             "prompt_tokens": 2, "generated_tokens": 2,
         },
     }
+
+
+def test_generator_close_after_native_done_keeps_terminal_timing(make_engine):
+    engine = make_engine("timing")
+    stream = engine.generate([101], 1, {}, threading.Event())
+    assert next(stream) == 101
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with engine._lock:
+            state = next(iter(engine._requests.values()), None)
+            if state is not None and state.done_received:
+                break
+        time.sleep(.005)
+    else:
+        pytest.fail("the fake coordinator did not deliver done")
+
+    stream.close()
+    assert engine.last["generated"] == 1
+    assert engine.last["decode_ms"] == 101 / 1_000_000
+    assert engine.last["native_phase_timing"]["generated_tokens"] == 1
 
 
 def test_multislot_native_timings_remain_request_thread_local(make_multislot):
@@ -471,6 +498,27 @@ def test_existing_http_apis_parse_adapter_tokens(make_engine, path, stream):
         body = json.loads(raw)
         text = (body["content"][0]["text"] if path.endswith("messages") else body["choices"][0]["message"]["content"])
     assert text == "Hello."
+
+
+@pytest.mark.parametrize("mode,extra", [("timing_eos", {}), ("timing_stop", {"stop": ["STOP"]})])
+def test_http_frontend_close_keeps_native_done_timings(make_engine, mode, extra):
+    engine = make_engine(mode)
+    svc = Service(engine, ByteTokenizer(), ChatTemplate(ROOT / "serve/chat_template.jinja"))
+    server = serve(svc, port=0)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            status, raw = request(server.server_address[1], "/v1/chat/completions", {
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 100, **extra,
+            })
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert status == 200
+    body = json.loads(raw)
+    assert body["choices"][0]["message"]["content"] == "Hello."
+    assert svc.last_timings is not None
+    assert svc.last_timings["predicted_ms"] == 1500.0
 
 
 def test_http_health_reports_group_failure_and_expired_lease(make_engine):

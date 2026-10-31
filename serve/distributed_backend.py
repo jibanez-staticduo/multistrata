@@ -171,6 +171,8 @@ class _Request:
     prompt_tokens: int
     events: queue.Queue = field(init=False)
     output_done: bool = False
+    done_received: bool = False
+    done_timing: dict | None = None
     cancel_sent: bool = False
     cancel_ack: bool = False
     received_tokens: int = 0
@@ -195,6 +197,22 @@ def _validate_native_timing(value: object, request: _Request) -> dict:
     if value["prompt_tokens"] != request.prompt_tokens or value["generated_tokens"] != request.received_tokens:
         raise ValueError("native timing token counts do not match the request")
     return dict(value)
+
+
+def _timing_last(timing: dict) -> dict:
+    """Translate native nanoseconds while keeping each measured phase separate."""
+    return {
+        "generated": timing["generated_tokens"],
+        "prompt_tokens": timing["prompt_tokens"],
+        "prompt_ms": timing["prefill_ns"] / 1_000_000,
+        "decode_ms": timing["decode_ns"] / 1_000_000,
+        "queue_ms": timing["queue_ns"] / 1_000_000,
+        "sampling_ms": timing["sampling_ns"] / 1_000_000,
+        "mtp_draft_ms": timing["mtp_draft_ns"] / 1_000_000,
+        "mtp_checkpoint_ms": timing["mtp_checkpoint_ns"] / 1_000_000,
+        "mtp_rollback_ms": timing["mtp_rollback_ns"] / 1_000_000,
+        "native_phase_timing": dict(timing),
+    }
 
 
 class DistributedEngine:
@@ -360,7 +378,9 @@ class DistributedEngine:
                             if request.output_done or (kind == "rejected" and request.received_tokens):
                                 raise ValueError
                             if kind == "done" and "timing" in msg:
-                                _validate_native_timing(msg["timing"], request)
+                                request.done_timing = _validate_native_timing(msg["timing"], request)
+                            if kind == "done":
+                                request.done_received = True
                             request.output_done = True
                         self._state = "busy" if any(not r.output_done for r in self._requests.values()) else "ready"
                         event = request.events
@@ -513,21 +533,7 @@ class DistributedEngine:
                             yield None
                         continue
                     if msg["type"] == "done":
-                        self.last = {"generated": count}
-                        if "timing" in msg:
-                            native = dict(msg["timing"])
-                            self.last = {
-                                **self.last,
-                                "prompt_tokens": native["prompt_tokens"],
-                                "prompt_ms": native["prefill_ns"] / 1_000_000,
-                                "decode_ms": native["decode_ns"] / 1_000_000,
-                                "queue_ms": native["queue_ns"] / 1_000_000,
-                                "sampling_ms": native["sampling_ns"] / 1_000_000,
-                                "mtp_draft_ms": native["mtp_draft_ns"] / 1_000_000,
-                                "mtp_checkpoint_ms": native["mtp_checkpoint_ns"] / 1_000_000,
-                                "mtp_rollback_ms": native["mtp_rollback_ns"] / 1_000_000,
-                                "native_phase_timing": native,
-                            }
+                        self.last = _timing_last(state.done_timing) if state.done_timing else {"generated": count}
                         complete = True
                         break
                     if msg["type"] == "rejected":
@@ -544,6 +550,10 @@ class DistributedEngine:
                     if submitted and not complete and self.alive():
                         self._cancel(request, state)
                 finally:
+                    with self._lock:
+                        native_timing = state.done_timing if state.done_received else None
+                    if native_timing is not None:
+                        self.last = _timing_last(native_timing)
                     with self._lock:
                         self._requests.pop(request, None)
                         if self._terminal is None:
