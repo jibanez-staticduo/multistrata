@@ -116,6 +116,14 @@ public:
                        const float* mixed, float* reduced, void* stream,
                        std::string& err) = 0;
 };
+
+enum class DistributedPrefillStage : int {
+    attention_read = 0,
+    mixer = 1,
+    attention_write = 2,
+    ffn_read = 3,
+    route = 4
+};
 #endif
 
 /// Buffers for the MoE block, on EVERY layer.
@@ -675,6 +683,17 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
                      , DistributedLayerHooks* distributed = nullptr
 #endif
                      );
+
+#ifdef STRATA_BUILD_DISTRIBUTED
+// Opt-in seams for a layer-major TP prefill. Each call runs one ordered stage
+// of block_layer_pre; the ordinary API and its default path remain unchanged.
+bool block_layer_prefill_stage(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos,
+                               int32_t pos_base, const GdnBuffers& gb, const QsaState& qst,
+                               const QsaBuffers& qb, const MoEBuffers& mb, int64_t k,
+                               const BlockBuffers& bb, void* stream, std::string& err,
+                               DistributedLayerHooks* distributed, const PleRun* ple,
+                               DistributedPrefillStage stage);
+#endif
 
 bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,
                       const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,

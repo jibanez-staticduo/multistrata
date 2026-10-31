@@ -1552,7 +1552,12 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
                        strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr);
     // layer-1's FFN write has not been applied to R yet - unless a control vector follows it, which needs R
     bool pending_ffn = fused && layer > 0 && !strata::kernels::cvec().covers(layer - 1);
+#ifdef STRATA_BUILD_DISTRIBUTED
+    if (ple != nullptr && ple->ready() && layer == 1 && (half == 0 || half == 1) &&
+        (stage_prefix >= 0 || stage_prefix == -1)) {
+#else
     if (ple != nullptr && ple->ready() && layer == 1 && (half == 0 || half == 1)) {
+#endif
         if (pending_ffn) {
             const strata::kernels::GrShapes gs0{g.n_embd, g.hc, g.hc_lr};
             gr_write(bb.R, bb.block_out, bb.inject2, gs0, bb.R, stream);
@@ -1599,11 +1604,27 @@ if (w_down[h]->kind != WeightKind::Bf16InF32 || w_up[h]->kind != WeightKind::Bf1
 float* R = bb.R;
     // R0.11: WHICH STAGES TO RUN.  `stage_prefix == 0` means "as `half` says", so every caller that predates
     // this parameter is bit-for-bit unaffected; `stage_prefix == k` runs stages 0..k-1 and ignores `half`.
+#ifdef STRATA_BUILD_DISTRIBUTED
+    const bool one_stage = stage_prefix < 0;
+    const int selected_stage = one_stage ? -stage_prefix - 1 : -1;
+    const bool run0 = one_stage ? selected_stage == 0 :
+                      stage_prefix > 0 ? (stage_prefix >= 1) : (half == 0 || half == 1);
+    const bool run1 = one_stage ? selected_stage == 1 :
+                      stage_prefix > 0 ? (stage_prefix >= 2) : (half == 0 || half == 1);
+    const bool run2 = one_stage ? selected_stage == 2 :
+                      stage_prefix > 0 ? (stage_prefix >= 3) : (half == 0 || half == 1);
+    const bool run3 = one_stage ? selected_stage == 3 :
+                      stage_prefix > 0 ? (stage_prefix >= 4) : (half == 0 || half == 2);
+    const bool run4 = one_stage ? selected_stage == 4 :
+                      stage_prefix > 0 ? (stage_prefix >= 5) : (half == 0 || half == 2);
+#else
     const bool run0 = stage_prefix > 0 ? (stage_prefix >= 1) : (half == 0 || half == 1);
     const bool run1 = stage_prefix > 0 ? (stage_prefix >= 2) : (half == 0 || half == 1);
     const bool run2 = stage_prefix > 0 ? (stage_prefix >= 3) : (half == 0 || half == 1);
     const bool run3 = stage_prefix > 0 ? (stage_prefix >= 4) : (half == 0 || half == 2);
-    const bool run4 = stage_prefix > 0 ? (stage_prefix >= 5) : (half == 0 || half == 2);        // R0.9: this is the MIXER half, and `half == 2` skips it entirely.  A `half` of 1 or 0 runs it,
+    const bool run4 = stage_prefix > 0 ? (stage_prefix >= 5) : (half == 0 || half == 2);
+#endif
+    // R0.9: this is the MIXER half, and `half == 2` skips it entirely. A half of 1 or 0 runs it.
     // and 0 is what every caller before this used.
     if (run0) {
 st_begin(layer, 0, stream);
@@ -1684,6 +1705,23 @@ uint64_t ple_run_scratch_bytes() {
     // Internal workspace followed by a disjoint normalized export used for the next history row.
     return strata::kernels::ple_block_scratch_bytes() + strata::kernels::NG_HC_DIM * sizeof(float);
 }
+
+#ifdef STRATA_BUILD_DISTRIBUTED
+bool block_layer_prefill_stage(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos,
+                               int32_t pos_base, const GdnBuffers& gb, const QsaState& qst,
+                               const QsaBuffers& qb, const MoEBuffers& mb, int64_t k,
+                               const BlockBuffers& bb, void* stream, std::string& err,
+                               DistributedLayerHooks* distributed, const PleRun* ple,
+                               DistributedPrefillStage stage) {
+    const int selected = static_cast<int>(stage);
+    if (selected < 0 || selected > 4) {
+        err = "block_layer_prefill_stage: invalid stage";
+        return false;
+    }
+    return block_layer_pre(tables, g, layer, pos, pos_base, gb, qst, qb, mb, k, bb, stream, err,
+                           nullptr, ple, 0, -selected - 1, distributed);
+}
+#endif
 
 bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,                      const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,                      std::string& err
 #ifdef STRATA_BUILD_DISTRIBUTED

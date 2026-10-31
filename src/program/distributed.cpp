@@ -3,6 +3,7 @@
 // autoregressive mode lets rank zero coordinate JSONL requests and sampled IDs.
 #include "distributed/nccl_transport.cpp"
 #include "strata/distributed/hybrid_backend.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
 #include "strata/distributed/roce_backend.hpp"
 #endif
@@ -408,7 +409,8 @@ int main(int argc, char** argv) {
             "pack", "native", "ple", "context", "logits-dir", "logits-positions", "timeout-ms",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
             "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel", "profile-dir",
-            "collective-agreement", "service-state-dir", "timing-file", "expert-operands", "request-timing"};
+            "collective-agreement", "service-state-dir", "timing-file", "expert-operands", "request-timing",
+            "prefill-batch-size"};
 #if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
         allowed.insert("gather-transport");
         allowed.insert("roce-hca-list");
@@ -481,6 +483,13 @@ int main(int argc, char** argv) {
         require(mode == "teacher-forced" || mode == "autoregressive" || mode == "multislot", "invalid distributed mode");
         const bool autoregressive = mode == "autoregressive";
         const bool multislot = mode == "multislot";
+        const auto prefill_batch_size = number("prefill-batch-size", 1);
+        require(prefill_batch_size >= 1 && prefill_batch_size <= 8 &&
+                    (prefill_batch_size == 1 || mode == "teacher-forced"),
+                "--prefill-batch-size 2..8 currently requires teacher-forced qualification mode");
+        require(prefill_batch_size == 1 || (!args.contains("timing-file") && args.contains("logits-positions")),
+                "batched prefill qualification requires explicit --logits-positions and no per-token timing");
+        if (prefill_batch_size > 1) kernels::native_mmvq_set_multi_exact(true);
         const auto request_timing_value = args.contains("request-timing") ? args.at("request-timing") : "0";
         require((request_timing_value == "0" || request_timing_value == "1") &&
                     (request_timing_value == "0" || autoregressive || multislot),
@@ -624,6 +633,8 @@ int main(int argc, char** argv) {
         if (multislot) join.config_fingerprint += ":multislot-v1:slots=" + std::to_string(parallel) +
                                                   ":context=" + std::to_string(context);
         if (compact_expert_operands) join.config_fingerprint += ":expert-operands-v1:compact";
+        if (prefill_batch_size > 1)
+            join.config_fingerprint += ":prefill-batch-exactnative-v1:rows=" + std::to_string(prefill_batch_size);
         join.backend_identity = hybrid_roce ? std::string(kHybridBackendIdentity) : "nccl";
         if (hybrid_roce) join.config_fingerprint += ":gather-transport=hybrid-roce-v1";
         join.nccl_version_expected = version; join.library_provenance = provenance;
@@ -808,8 +819,9 @@ int main(int argc, char** argv) {
                     if (type == "ready") event.insert(event.size() - 1, ",\"slots\":" + std::to_string(parallel));
                     json->emit(event);
                 };
-                if (request_timing) callbacks.emit_timing = [&](std::string_view request, const RequestTiming& timing) {
-                    auto event = serve_event("done", request, -1, uint32_t(context), "ready");
+                if (request_timing) callbacks.emit_timing = [&](std::string_view type, std::string_view request,
+                                                               const RequestTiming& timing) {
+                    auto event = serve_event(type, request, -1, uint32_t(context), "ready");
                     event.insert(event.size() - 1, ",\"timing\":" + request_timing_json(timing));
                     json->emit(event);
                 };
@@ -835,6 +847,7 @@ int main(int argc, char** argv) {
                                                    experts.down_codecs()};
             model_worker_config.checkpoint_max_context = uint64_t(state.max_cells);
             model_worker_config.preagreed_collectives = preagreed_collectives;
+            model_worker_config.prefill_batch_exactnative = prefill_batch_size > 1;
             ModelWorkerBackend execution(model_worker_config, model, collectives, session, transport);
             Worker worker(worker_config, execution);
             PendingDmaExitGuard checkpoint_lifetime(model);
@@ -1012,6 +1025,39 @@ int main(int argc, char** argv) {
                     return true;
                 };
                 bool any = false;
+                if (prefill_batch_size > 1) {
+                    for (size_t begin = 0; begin < tokens.size();) {
+                        const size_t count = std::min(size_t(prefill_batch_size), tokens.size() - begin);
+                        const auto first = uint64_t(model.next_position());
+                        const auto last = first + count - 1;
+                        for (uint64_t inner = first; inner < last; ++inner)
+                            require(!logits_positions.contains(inner, false) && !state_positions.contains(inner),
+                                    "batched qualification captures must be at chunk boundaries");
+                        std::vector<int32_t> chunk(tokens.begin() + begin, tokens.begin() + begin + count);
+                        std::vector<uint64_t> positions;
+                        for (size_t row = 0; row < count; ++row) positions.push_back(first + row);
+                        execute(StepPhase::prefill, chunk, positions);
+                        const auto result = execute(StepPhase::commit);
+                        if (state_positions.contains(last)) dump_state(false);
+                        if (rank == 0 && result.output_ready) {
+                            const auto* logits = execution.committed_logits();
+                            require(logits != nullptr, "batch commit did not publish logits");
+                            if (args.contains("logits-dir") && logits_positions.contains(last, begin + count == tokens.size())) {
+                                const auto directory = std::filesystem::path(args.at("logits-dir")) /
+                                                       ("request-" + std::to_string(request_sequence));
+                                std::filesystem::create_directories(directory);
+                                std::ofstream file(directory / ("logits-" + std::to_string(last) + ".f32"), std::ios::binary);
+                                file.write(reinterpret_cast<const char*>(logits), geometry.n_vocab * sizeof(float));
+                                require(bool(file), "cannot write batched logits artifact");
+                            }
+                            const auto top = std::max_element(logits, logits + geometry.n_vocab) - logits;
+                            std::cout << "CHUNK first=" << first << " count=" << count << " last=" << last
+                                      << " argmax=" << top << '\n';
+                        }
+                        begin += count;
+                    }
+                    continue;
+                }
                 while (next_token()) {
                     if (id < 0 || id >= geometry.n_vocab) throw std::runtime_error("invalid token ID");
                     any = true;

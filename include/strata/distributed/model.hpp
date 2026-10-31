@@ -98,12 +98,16 @@ public:
     ModelForward(const ModelForward&) = delete;
     ModelForward& operator=(const ModelForward&) = delete;
     bool initialize(std::string& err);
+    bool configure_prefill_batch_exactnative(bool enabled, std::string& err);
     void native_head(const core::NativeHead* head);
     // Optional uncaptured diagnostics; an empty observer performs no copies.
     void parity_observer(ParityObserver observer);
     bool reset(void* stream, std::string& err);
     bool token(int32_t token, int64_t position, int32_t position_base,
                float* logits, void* stream, std::string& err);
+    // Layer-major exact-native prompt chunk. Writes logits for the final row.
+    bool tokens(const std::vector<int32_t>& tokens, int64_t position, int32_t position_base,
+                float* logits, void* stream, std::string& err);
     const core::ModelGeometry& geometry() const;
     int64_t next_position() const;
     std::vector<GdnStateSource> state_sources() const;

@@ -56,7 +56,8 @@ Failure canonical_step_command(const StepCommand& command, std::string& out) {
 
 Failure model_forward_schedule(const StepCommand& command, const core::ModelGeometry& g, uint64_t sequence,
                                std::vector<ScheduledCollective>& out, bool batched_expert_collectives,
-                               const ExpertOperandSchedule& expert_operands) {
+                               const ExpertOperandSchedule& expert_operands,
+                               bool layer_major_prefill_batch) {
     out.clear();
     if (static_cast<uint32_t>(command.phase) > static_cast<uint32_t>(StepPhase::rollback))
         return bad("unknown model step phase");
@@ -90,40 +91,52 @@ Failure model_forward_schedule(const StepCommand& command, const core::ModelGeom
         }
         out.push_back({std::move(d), std::move(stage)});
     };
-    for (size_t token = 0; token < command.tokens.size(); ++token) {
-        for (int64_t layer = 0; layer < g.n_layers; ++layer) {
-            const bool qsa = core::is_qsa_layer(g, layer);
-            append(layer, qsa ? "qsa_gated_reference" : "gdn_values",
-                   qsa ? std::vector<uint64_t>{2048, 2048, 2048} : std::vector<uint64_t>{2304, 1920, 1920});
-            append(layer, qsa ? "qsa_output_rank_zero_reference" : "mixer", {});
-            if (batched_expert_collectives) {
-                // Transport includes each row's padding; logical valid counts remain 256/192/192.
-                const uint64_t hidden = uint64_t(g.n_expert_used) * 256;
-                uint64_t lane_width = 128;
-                if (expert_operands.compact) {
-                    try {
-                        lane_width = uint64_t(compact_down_payload_width(expert_operands.down_codecs[size_t(layer)],
-                                                                        int(g.n_ff), expert_operands.valid_counts));
-                    } catch (...) { return bad("invalid compact expert schedule"); }
-                }
-                const uint64_t lanes = uint64_t(g.n_expert_used) * uint64_t(g.n_embd) * lane_width;
-                append(layer, "expert_hidden_batch", {hidden, hidden, hidden});
-                append(layer, "expert_lane_terms_batch", {lanes, lanes, lanes});
-            } else for (int64_t slot = 0; slot < g.n_expert_used; ++slot) {
-                append(layer, "expert_hidden_" + std::to_string(slot),
-                       expert_operands.compact ?
-                           std::vector<uint64_t>(expert_operands.valid_counts.begin(), expert_operands.valid_counts.end()) :
-                           std::vector<uint64_t>{256, 192, 192});
-                uint64_t lane_width = 128;
-                if (expert_operands.compact) {
-                    try {
-                        lane_width = uint64_t(compact_down_payload_width(expert_operands.down_codecs[size_t(layer)],
-                                                                        int(g.n_ff), expert_operands.valid_counts));
-                    } catch (...) { return bad("invalid compact expert schedule"); }
-                }
-                const uint64_t lanes = uint64_t(g.n_embd) * lane_width;
-                append(layer, "expert_lane_terms_" + std::to_string(slot), {lanes, lanes, lanes});
+    Failure append_failure;
+    auto append_layer = [&](int64_t layer) {
+        const bool qsa = core::is_qsa_layer(g, layer);
+        append(layer, qsa ? "qsa_gated_reference" : "gdn_values",
+               qsa ? std::vector<uint64_t>{2048, 2048, 2048} : std::vector<uint64_t>{2304, 1920, 1920});
+        append(layer, qsa ? "qsa_output_rank_zero_reference" : "mixer", {});
+        if (batched_expert_collectives) {
+            // Transport includes each row's padding; logical valid counts remain 256/192/192.
+            const uint64_t hidden = uint64_t(g.n_expert_used) * 256;
+            uint64_t lane_width = 128;
+            if (expert_operands.compact) {
+                try {
+                    lane_width = uint64_t(compact_down_payload_width(expert_operands.down_codecs[size_t(layer)],
+                                                                    int(g.n_ff), expert_operands.valid_counts));
+                } catch (...) { append_failure = bad("invalid compact expert schedule"); return; }
             }
+            const uint64_t lanes = uint64_t(g.n_expert_used) * uint64_t(g.n_embd) * lane_width;
+            append(layer, "expert_hidden_batch", {hidden, hidden, hidden});
+            append(layer, "expert_lane_terms_batch", {lanes, lanes, lanes});
+        } else for (int64_t slot = 0; slot < g.n_expert_used; ++slot) {
+            append(layer, "expert_hidden_" + std::to_string(slot),
+                   expert_operands.compact ?
+                       std::vector<uint64_t>(expert_operands.valid_counts.begin(), expert_operands.valid_counts.end()) :
+                       std::vector<uint64_t>{256, 192, 192});
+            uint64_t lane_width = 128;
+            if (expert_operands.compact) {
+                try {
+                    lane_width = uint64_t(compact_down_payload_width(expert_operands.down_codecs[size_t(layer)],
+                                                                    int(g.n_ff), expert_operands.valid_counts));
+                } catch (...) { append_failure = bad("invalid compact expert schedule"); return; }
+            }
+            const uint64_t lanes = uint64_t(g.n_embd) * lane_width;
+            append(layer, "expert_lane_terms_" + std::to_string(slot), {lanes, lanes, lanes});
+        }
+    };
+    const bool layer_major = layer_major_prefill_batch && command.phase == StepPhase::prefill &&
+                             command.tokens.size() > 1;
+    if (layer_major) {
+        for (int64_t layer = 0; layer < g.n_layers; ++layer) {
+            for (size_t token = 0; token < command.tokens.size(); ++token)
+                { (void)token; append_layer(layer); if (append_failure) return append_failure; }
+        }
+    } else {
+        for (size_t token = 0; token < command.tokens.size(); ++token) {
+            for (int64_t layer = 0; layer < g.n_layers; ++layer)
+                { (void)token; append_layer(layer); if (append_failure) return append_failure; }
         }
     }
     return {};
@@ -251,8 +264,14 @@ Failure ModelWorkerBackend::plan(const StepCommand& command, std::vector<Schedul
             command.positions[i] > uint64_t(std::numeric_limits<int32_t>::max()))
             return bad("model token or position outside supported range");
     }
+    if (p.config.prefill_batch_exactnative && command.phase == StepPhase::prefill) {
+        for (size_t i = 1; i < command.positions.size(); ++i)
+            if (command.positions[i] != command.positions[i - 1] + 1)
+                return bad("layer-major prefill requires consecutive token positions");
+    }
     return model_forward_schedule(command, p.model.geometry(), p.collectives.sequence(), out,
-                                  p.config.batched_expert_collectives, p.config.expert_operands);
+                                  p.config.batched_expert_collectives, p.config.expert_operands,
+                                  p.config.prefill_batch_exactnative);
 }
 
 Failure ModelWorkerBackend::agree(const StepCommand& command) {
@@ -293,7 +312,8 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
         if (auto f = cuda_failure(cudaMalloc(reinterpret_cast<void**>(&p.device_logits), count))) return f;
         if (auto f = cuda_failure(cudaHostAlloc(reinterpret_cast<void**>(&p.host_logits), count, cudaHostAllocDefault))) return f;
         if (auto f = cuda_failure(cudaEventCreateWithFlags(&p.completion, cudaEventDisableTiming))) return f;
-        if (!p.model.initialize(err) || !p.model.reset(p.config.stream, err)) return bad(err);
+        if (!p.model.configure_prefill_batch_exactnative(p.config.prefill_batch_exactnative, err) ||
+            !p.model.initialize(err) || !p.model.reset(p.config.stream, err)) return bad(err);
         p.initialized = true;
     } else if (command.phase == StepPhase::prefill || command.phase == StepPhase::decode) {
         if (!p.initialized || p.candidate) return bad("forward requires initialized model without pending candidate");
@@ -301,10 +321,17 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
             p.clear_checkpoint();
             p.request = command.request;
         }
-        for (size_t i = 0; i < command.tokens.size(); ++i) {
-            if (!p.model.token(command.tokens[i], int64_t(command.positions[i]), p.config.position_base,
-                               p.device_logits, p.config.stream, err)) return bad(err);
+        if (p.config.prefill_batch_exactnative && command.phase == StepPhase::prefill &&
+            command.tokens.size() > 1) {
+            if (!p.model.tokens(command.tokens, int64_t(command.positions.front()), p.config.position_base,
+                                p.device_logits, p.config.stream, err)) return bad(err);
             if (auto f = p.finite_logits()) return f;
+        } else {
+            for (size_t i = 0; i < command.tokens.size(); ++i) {
+                if (!p.model.token(command.tokens[i], int64_t(command.positions[i]), p.config.position_base,
+                                   p.device_logits, p.config.stream, err)) return bad(err);
+                if (auto f = p.finite_logits()) return f;
+            }
         }
         p.candidate = true;
     } else if (command.phase == StepPhase::reset || command.phase == StepPhase::cancel) {

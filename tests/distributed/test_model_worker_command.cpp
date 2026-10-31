@@ -67,6 +67,7 @@ void canonical_fields() {
 void model_schedule() {
     ModelWorkerConfig default_config;
     check(!default_config.preagreed_collectives, "step agreement is opt-in with unchanged default");
+    check(!default_config.prefill_batch_exactnative, "layer-major exact-native prefill is opt-in");
     StepCommand command{"session", "request", 0, 3, StepPhase::prefill, {4}, {0}, "manifest", {}};
     std::vector<ScheduledCollective> out;
     const strata::core::ModelGeometry g;
@@ -144,6 +145,27 @@ void model_schedule() {
     check(!model_forward_schedule(command, g, 1, batched, true) && batched.size() == 2 * 48 * 4 &&
           batched[48 * 4].descriptor.operation.layer == 0 &&
           batched[48 * 4].descriptor.operation.sequence == 193, "batched prefill preserves token boundaries");
+    std::vector<ScheduledCollective> layer_major;
+    check(!model_forward_schedule(command, g, 1, layer_major, false, {}, true) &&
+          layer_major.size() == 2 * 48 * 22 && layer_major[0].descriptor.operation.layer == 0 &&
+          layer_major[22].descriptor.operation.layer == 0 &&
+          layer_major[44].descriptor.operation.layer == 1 &&
+          layer_major[44].descriptor.operation.sequence == 45,
+          "exact-native prefill schedule is layer-major and complete");
+    auto single = command;
+    single.tokens.resize(1);
+    single.positions.resize(1);
+    std::vector<ScheduledCollective> single_layer_major;
+    check(!model_forward_schedule(single, g, 1, single_layer_major, false, {}, true) &&
+          single_layer_major.size() == 48 * 22 &&
+          single_layer_major.front().descriptor.operation.layer == 0,
+          "exact-native schedule leaves a single prefill row unchanged");
+    auto decode = command;
+    decode.phase = StepPhase::decode;
+    std::vector<ScheduledCollective> decode_layer_major;
+    check(!model_forward_schedule(decode, g, 1, decode_layer_major, false, {}, true) &&
+          decode_layer_major[48 * 22].descriptor.operation.layer == 0,
+          "exact-native policy leaves decode token-major");
     command.phase = StepPhase::commit;
     check(!model_forward_schedule(command, g, 1, out) && out.empty(), "commit replays no model collective");
     for (auto phase : {StepPhase::checkpoint, StepPhase::rollback}) {

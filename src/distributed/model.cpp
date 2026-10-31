@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <stdexcept>
 #include <vector>
 
@@ -198,11 +199,19 @@ struct ModelForward::Impl {
     LayerCollectives& collectives;
     RoutedExperts& experts;
     DeviceMemory memory;
+    DeviceMemory batch_memory;
     std::array<kernels::tp::cuda::GdnTpMap, 3> maps;
     float *qkv = nullptr, *conv = nullptr, *alpha = nullptr, *beta = nullptr;
     float *dt = nullptr, *a = nullptr, *z = nullptr, *gate = nullptr, *local_y = nullptr;
     float *conv_raw = nullptr, *norm_qkv = nullptr, *readout = nullptr;
     float *wire = nullptr, *global_y = nullptr, *embedding = nullptr, *parts = nullptr;
+    float *batch_input = nullptr, *batch_qkv = nullptr, *batch_z = nullptr;
+    float *batch_alpha = nullptr, *batch_beta = nullptr, *batch_projected = nullptr;
+    void* batch_q8_1 = nullptr;
+    std::array<core::BlockBuffers, 8> batch_blocks{};
+    bool batch_projections_active = false;
+    int batch_projection_row = 0;
+    bool batch_enabled = false;
     float* states = nullptr;
     float* qsa_partial = nullptr;
     float* qsa_global = nullptr;
@@ -243,23 +252,60 @@ struct ModelForward::Impl {
         } else throw std::runtime_error("TP projection requires original native GGUF or BF16 weights");
     }
 
-    bool gdn(int64_t layer, const float* x, float* output, void* stream, std::string& err) {
+    void project_multi(const core::WeightRef& w, const float* x, void* q8_1, float* compact,
+                       float* output, int output_stride, int output_offset, int row_begin,
+                       int rows, int ncols, void* stream) {
+        if (w.ne0 <= 0 || w.ne0 > INT_MAX || rows <= 0 || ncols < 2 || ncols > 8)
+            throw std::runtime_error("invalid exact multirow projection geometry");
+        if (w.native_data && q8_1) {
+            const auto stride = kernels::native_mmvq_weight_bytes(w.native_type, int(w.ne0), 1);
+            kernels::native_quantize_q8_1(x, q8_1, int(w.ne0), ncols, stream);
+            kernels::native_mmvq(w.native_type,
+                static_cast<const uint8_t*>(w.native_data) + size_t(row_begin) * stride,
+                q8_1, compact, int(w.ne0), rows, ncols, stream);
+        } else if (w.kind == core::WeightKind::Bf16InF32 && w.data) {
+            kernels::bf16_gemv_fp32_mmvf_multi(x, w.ne0,
+                static_cast<const uint16_t*>(w.data) + size_t(row_begin) * size_t(w.ne0),
+                compact, rows, w.ne0, rows, ncols, stream);
+        } else throw std::runtime_error("TP batch projection requires original native GGUF or BF16 weights");
+        for (int row = 0; row < ncols; ++row)
+            checked(cudaMemcpyAsync(output + size_t(row) * output_stride + output_offset,
+                                    compact + size_t(row) * rows, size_t(rows) * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream)));
+    }
+
+    void project_gdn_batch(int64_t layer, int ncols, void* stream) {
         using namespace kernels::tp::cuda;
         const auto& m = maps[rank];
         const int hk = m.key_heads(), hv = m.value_heads(), s = m.state_size;
+        const int channels = m.channels();
         const auto& q = weight(layer, "attn_qkv.weight");
         const auto& zw = weight(layer, "attn_gate.weight");
         const auto& aw = weight(layer, "ssm_alpha.weight");
         const auto& bw = weight(layer, "ssm_beta.weight");
-        project(q, x, qkv, m.key_begin * s, hk * s, stream);
-        project(q, x, qkv + hk * s, (16 + m.key_begin) * s, hk * s, stream);
+        float* temp = batch_projected;
+        auto projection = [&](const core::WeightRef& w, int first, int count, float* destination,
+                              int stride, int offset) {
+            project_multi(w, batch_input, batch_q8_1, temp, destination, stride, offset,
+                          first, count, ncols, stream);
+        };
+        projection(q, m.key_begin * s, hk * s, batch_qkv, channels, 0);
+        projection(q, (16 + m.key_begin) * s, hk * s, batch_qkv, channels, hk * s);
         for (int run = 0; run < 3; ++run) {
             const int first = run * 16 + m.key_begin;
-            project(q, x, qkv + (2 * hk + run * hk) * s, (32 + first) * s, hk * s, stream);
-            project(zw, x, z + run * hk * s, first * s, hk * s, stream);
-            project(aw, x, alpha + run * hk, first, hk, stream);
-            project(bw, x, beta + run * hk, first, hk, stream);
+            projection(q, (32 + first) * s, hk * s, batch_qkv, channels, (2 * hk + run * hk) * s);
+            projection(zw, first * s, hk * s, batch_z, hv * s, run * hk * s);
+            projection(aw, first, hk, batch_alpha, 3 * hk, run * hk);
+            projection(bw, first, hk, batch_beta, 3 * hk, run * hk);
         }
+    }
+
+    bool gdn_projected(int64_t layer, const float* x, float* output, const float* qkv_input,
+                       const float* z_input, const float* alpha_input, const float* beta_input,
+                       void* stream, std::string& err) {
+        using namespace kernels::tp::cuda;
+        const auto& m = maps[rank];
+        const int hk = m.key_heads(), hv = m.value_heads(), s = m.state_size;
         tp_gdn_compact(m, GdnTpLayout::Qkv, 1, 4,
                        {static_cast<const float*>(weight(layer, "ssm_conv1d.weight").data), size_t(10240 * 4)},
                        {conv, size_t(m.channels() * 4)}, stream);
@@ -267,15 +313,21 @@ struct ModelForward::Impl {
                        {static_cast<const float*>(weight(layer, "ssm_dt.bias").data), 48}, {dt, size_t(hv)}, stream);
         tp_gdn_compact(m, GdnTpLayout::Values, 1, 1,
                        {static_cast<const float*>(weight(layer, "ssm_a").data), 48}, {a, size_t(hv)}, stream);
-        kernels::native_gdn_beta_gate(beta, hv, stream);
-        kernels::native_gdn_gate(alpha, dt, a, gate, hv, stream);
+        float* beta_values = const_cast<float*>(beta_input);
+        if (beta_values != beta) {
+            checked(cudaMemcpyAsync(beta, beta_values, size_t(hv) * sizeof(float), cudaMemcpyDeviceToDevice,
+                                    static_cast<cudaStream_t>(stream)));
+            beta_values = beta;
+        }
+        kernels::native_gdn_beta_gate(beta_values, hv, stream);
+        kernels::native_gdn_gate(alpha_input, dt, a, gate, hv, stream);
         const size_t one_state = m.state_elements() + m.history_elements();
         const int64_t ordinal = layer - layer / geometry.qsa_interval;
         GdnTpState st{{states + ordinal * one_state, m.state_elements()},
                       {states + ordinal * one_state + m.state_elements(), m.history_elements()}};
         tp_gdn_token(m, GdnTpArithmetic::Native, st,
-                     {qkv, size_t(m.channels())}, {conv, size_t(m.channels() * 4)},
-                     {gate, size_t(hv)}, {beta, size_t(hv)}, {z, size_t(hv * s)},
+                     {qkv_input, size_t(m.channels())}, {conv, size_t(m.channels() * 4)},
+                     {gate, size_t(hv)}, {beta_values, size_t(hv)}, {z_input, size_t(hv * s)},
                      {static_cast<const float*>(weight(layer, "ssm_norm.weight").data), size_t(s)},
                      float(geometry.rms_eps), {{conv_raw, size_t(m.channels())},
                      {norm_qkv, size_t(m.channels())}, {readout, size_t(hv * s)}},
@@ -292,6 +344,25 @@ struct ModelForward::Impl {
         else checked(cudaMemsetAsync(output, 0, size_t(geometry.n_embd) * sizeof(float),
                                      static_cast<cudaStream_t>(stream)));
         return collectives.reduce(layer, "mixer", output, output, size_t(geometry.n_embd), stream, err);
+    }
+
+    bool gdn(int64_t layer, const float* x, float* output, void* stream, std::string& err) {
+        const auto& m = maps[rank];
+        const int hk = m.key_heads(), hv = m.value_heads(), s = m.state_size;
+        const auto& q = weight(layer, "attn_qkv.weight");
+        const auto& zw = weight(layer, "attn_gate.weight");
+        const auto& aw = weight(layer, "ssm_alpha.weight");
+        const auto& bw = weight(layer, "ssm_beta.weight");
+        project(q, x, qkv, m.key_begin * s, hk * s, stream);
+        project(q, x, qkv + hk * s, (16 + m.key_begin) * s, hk * s, stream);
+        for (int run = 0; run < 3; ++run) {
+            const int first = run * 16 + m.key_begin;
+            project(q, x, qkv + (2 * hk + run * hk) * s, (32 + first) * s, hk * s, stream);
+            project(zw, x, z + run * hk * s, first * s, hk * s, stream);
+            project(aw, x, alpha + run * hk, first, hk, stream);
+            project(bw, x, beta + run * hk, first, hk, stream);
+        }
+        return gdn_projected(layer, x, output, qkv, z, alpha, beta, stream, err);
     }
 };
 
@@ -429,9 +500,48 @@ bool ModelForward::initialize(std::string& err) {
         p.wire = take(3 * 18 * 128); p.global_y = take(6144);
         p.qsa_partial = take(2560); p.qsa_global = take(6144);
         p.embedding = take(2560); p.parts = take(size_t(p.state.k) * 2560);
+        if (p.batch_enabled) {
+            const auto block_bytes = core::block_buffers_bytes(p.geometry);
+            const size_t q8_bytes = kernels::native_q8_1_bytes(int(p.geometry.n_embd), 8);
+            const size_t batch_bytes = size_t(8) * block_bytes +
+                size_t(8 * p.geometry.n_embd) * sizeof(float) +
+                size_t(8 * m.channels()) * sizeof(float) +
+                size_t(8 * m.value_heads() * m.state_size) * sizeof(float) +
+                size_t(8 * 3 * m.key_heads()) * sizeof(float) * 2 +
+                size_t(8 * 2304) * sizeof(float) + q8_bytes + 256;
+            p.batch_memory.allocate(batch_bytes);
+            uint8_t* batch_next = static_cast<uint8_t*>(p.batch_memory.data);
+            for (auto& block : p.batch_blocks) {
+                const auto used = core::block_buffers_init(p.geometry, batch_next, block);
+                batch_next += (used + 15) & ~size_t(15);
+            }
+            auto take_batch = [&batch_next](size_t count) {
+                auto* result = reinterpret_cast<float*>(batch_next);
+                batch_next += count * sizeof(float);
+                return result;
+            };
+            p.batch_input = take_batch(size_t(8) * size_t(p.geometry.n_embd));
+            p.batch_qkv = take_batch(size_t(8) * size_t(m.channels()));
+            p.batch_z = take_batch(size_t(8) * size_t(m.value_heads() * m.state_size));
+            p.batch_alpha = take_batch(size_t(8) * size_t(3 * m.key_heads()));
+            p.batch_beta = take_batch(size_t(8) * size_t(3 * m.key_heads()));
+            p.batch_projected = take_batch(size_t(8 * 2304));
+            batch_next = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(batch_next) + 15) & ~uintptr_t(15));
+            p.batch_q8_1 = batch_next;
+        }
         p.ready = true;
         return true;
     } catch (const std::exception& e) { err = e.what(); return false; }
+}
+
+bool ModelForward::configure_prefill_batch_exactnative(bool enabled, std::string& err) {
+    auto& p = *impl_;
+    if (p.ready || p.failed) {
+        err = "prefill batch mode must be configured before model initialization";
+        return false;
+    }
+    p.batch_enabled = enabled;
+    return true;
 }
 
 bool ModelForward::reset(void* stream, std::string& err) {
@@ -472,6 +582,15 @@ bool ModelForward::mixer(int64_t layer, int64_t pos, int32_t base, const float* 
                             p.state.qsa_states[layer / 4], p.state.qsa_bufs,
                             input, output, {p.rank, QsaAttentionPolicy::GatherReference, QsaOutputPolicy::RankZeroReference},
                             {p.qsa_global, 6144, p.qsa_partial, 2560}, p.collectives, stream, err);
+    } else if (p.batch_projections_active) {
+        const size_t row = size_t(p.batch_projection_row);
+        const auto& map = p.maps[p.rank];
+        ok = p.gdn_projected(layer, input, output,
+                             p.batch_qkv + row * size_t(map.channels()),
+                             p.batch_z + row * size_t(map.value_heads() * map.state_size),
+                             p.batch_alpha + row * size_t(3 * map.key_heads()),
+                             p.batch_beta + row * size_t(3 * map.key_heads()),
+                             stream, err);
     } else ok = p.gdn(layer, input, output, stream, err);
     return ok && (!p.observer || p.observer({"mixer_output", layer, pos, output, size_t(p.geometry.n_embd)}, stream, err));
 }
@@ -533,6 +652,165 @@ bool ModelForward::token(int32_t token, int64_t pos, int32_t base,
         p.checkpoint_position_base = base;
         return true;
     } catch (const std::exception& e) { p.failed = true; err = e.what(); return false; }
+}
+
+bool ModelForward::tokens(const std::vector<int32_t>& tokens, int64_t pos, int32_t base,
+                          float* logits, void* stream, std::string& err) {
+    auto& p = *impl_;
+    if (!p.ready || p.failed || !p.batch_enabled || !stream || !logits ||
+        !kernels::native_mmvq_multi_exact() || tokens.size() < 2 || tokens.size() > 8 ||
+        pos != p.next_position || pos < 0 || pos + int64_t(tokens.size()) > p.state.max_cells ||
+        base < 0 || base % 4 || int64_t(base) + pos + int64_t(tokens.size()) > p.state.max_cells) {
+        err = "TP exact-native prefill requires enabled model, exact MMVQ, 2..8 rows and valid context";
+        return false;
+    }
+    for (size_t row = 0; row < tokens.size(); ++row) {
+        if (tokens[row] < 0 || tokens[row] >= p.geometry.n_vocab) {
+            err = "TP exact-native prefill contains an invalid token";
+            return false;
+        }
+    }
+    try {
+        const size_t rows = tokens.size();
+        const size_t residual_floats = size_t(p.geometry.hc * p.geometry.n_embd);
+        for (size_t row = 0; row < rows; ++row) {
+            auto& block = p.batch_blocks[row];
+            if (!core::embed_row(p.weights, p.geometry, tokens[row], p.embedding, stream, err)) {
+                p.failed = true;
+                return false;
+            }
+            for (int64_t c = 0; c < p.geometry.hc; ++c)
+                checked(cudaMemcpyAsync(block.R + c * p.geometry.n_embd, p.embedding,
+                                        size_t(p.geometry.n_embd) * sizeof(float), cudaMemcpyDeviceToDevice,
+                                        static_cast<cudaStream_t>(stream)));
+        }
+
+        for (int64_t layer = 0; layer < p.geometry.n_layers; ++layer) {
+            const bool qsa = core::is_qsa_layer(p.geometry, layer);
+            for (size_t row = 0; row < rows; ++row) {
+                auto& block = p.batch_blocks[row];
+                const int64_t row_pos = pos + int64_t(row);
+                if (p.observer && !p.observer({"residual_pre", layer, row_pos, block.R,
+                                               residual_floats}, stream, err)) {
+                    p.failed = true;
+                    err = "layer " + std::to_string(layer) + ": " + err;
+                    return false;
+                }
+                if (layer == 1) {
+                    p.state.ple_token = tokens[row];
+                    if (!core::ple_stage_token(p.state.ple, stream, err)) {
+                        p.failed = true;
+                        err = "layer 1: " + err;
+                        return false;
+                    }
+                }
+                const auto& qs = p.state.qsa_states[layer / p.geometry.qsa_interval];
+                if (!core::block_layer_prefill_stage(
+                        p.weights, p.geometry, layer, row_pos, base, p.state.gdn, qs,
+                        p.state.qsa_bufs, p.state.moe, p.state.k, block, stream, err, this,
+                        layer == 1 ? &p.state.ple : nullptr, core::DistributedPrefillStage::attention_read)) {
+                    p.failed = true;
+                    err = "layer " + std::to_string(layer) + ": " + err;
+                    return false;
+                }
+                if (layer == 1) {
+                    p.state.ple_prev[0] = p.state.ple_prev[1];
+                    p.state.ple_prev[1] = tokens[row];
+                }
+            }
+
+            if (!qsa) {
+                for (size_t row = 0; row < rows; ++row)
+                    checked(cudaMemcpyAsync(p.batch_input + row * size_t(p.geometry.n_embd),
+                                            p.batch_blocks[row].mixed,
+                                            size_t(p.geometry.n_embd) * sizeof(float),
+                                            cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream)));
+                p.project_gdn_batch(layer, int(rows), stream);
+            }
+
+            for (size_t row = 0; row < rows; ++row) {
+                auto& block = p.batch_blocks[row];
+                const int64_t row_pos = pos + int64_t(row);
+                p.batch_projection_row = int(row);
+                p.batch_projections_active = !qsa;
+                if (qsa) {
+                    auto& q = p.state.qsa_states[layer / p.geometry.qsa_interval];
+                    kernels::qsa_step_fill(q.host_step, row_pos, core::qsa_shapes(p.geometry));
+                    for (int64_t h = 0; h < p.geometry.n_head; ++h)
+                        q.host_pos[h] = int32_t(base + row_pos);
+                }
+                if (!core::block_layer_prefill_stage(
+                        p.weights, p.geometry, layer, row_pos, base, p.state.gdn,
+                        p.state.qsa_states[layer / p.geometry.qsa_interval], p.state.qsa_bufs,
+                        p.state.moe, p.state.k, block, stream, err, this, nullptr,
+                        core::DistributedPrefillStage::mixer) ||
+                    !core::block_layer_prefill_stage(
+                        p.weights, p.geometry, layer, row_pos, base, p.state.gdn,
+                        p.state.qsa_states[layer / p.geometry.qsa_interval], p.state.qsa_bufs,
+                        p.state.moe, p.state.k, block, stream, err, this, nullptr,
+                        core::DistributedPrefillStage::attention_write) ||
+                    !core::block_layer_prefill_stage(
+                        p.weights, p.geometry, layer, row_pos, base, p.state.gdn,
+                        p.state.qsa_states[layer / p.geometry.qsa_interval], p.state.qsa_bufs,
+                        p.state.moe, p.state.k, block, stream, err, this, nullptr,
+                        core::DistributedPrefillStage::ffn_read) ||
+                    !core::block_layer_prefill_stage(
+                        p.weights, p.geometry, layer, row_pos, base, p.state.gdn,
+                        p.state.qsa_states[layer / p.geometry.qsa_interval], p.state.qsa_bufs,
+                        p.state.moe, p.state.k, block, stream, err, this, nullptr,
+                        core::DistributedPrefillStage::route) ||
+                    (p.observer && !p.observer({"expert_input", layer, row_pos, block.mixed,
+                                                size_t(p.geometry.n_embd)}, stream, err)) ||
+                    !p.collectives.agree_routes(layer, p.state.moe.ids, p.state.k, stream, err) ||
+                    !p.experts.forward(layer, block.mixed, p.state.moe.ids, p.state.k, p.parts,
+                                       stream, err) ||
+                    (p.observer && !p.observer({"expert_output", layer, row_pos, p.parts,
+                                                size_t(p.state.k * p.geometry.n_embd)}, stream, err)) ||
+                    !core::block_layer_post(p.weights, p.geometry, layer, p.state.k, p.state.moe,
+                                            block, p.parts, stream, err, this) ||
+                    (p.observer && !p.observer({"residual_post", layer, row_pos, block.R,
+                                                residual_floats}, stream, err))) {
+                    p.failed = true;
+                    err = "layer " + std::to_string(layer) + ": " + err;
+                    return false;
+                }
+                p.batch_projections_active = false;
+            }
+        }
+
+        auto& final_block = p.batch_blocks[rows - 1];
+        checked(cudaMemcpyAsync(p.state.R, final_block.R, residual_floats * sizeof(float),
+                                cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream)));
+        if (p.head ? (!core::lm_head_mix(p.weights, p.geometry, final_block, stream, err) ||
+                      !p.head->run(final_block.mixed, logits, stream, err))
+                   : !core::lm_head(p.weights, p.geometry, final_block, logits, stream, err)) {
+            p.failed = true;
+            return false;
+        }
+        checked(cudaMemcpyAsync(p.state.block.mixed, final_block.mixed,
+                                size_t(p.geometry.n_embd) * sizeof(float), cudaMemcpyDeviceToDevice,
+                                static_cast<cudaStream_t>(stream)));
+        checked(cudaMemcpyAsync(p.state.block.block_out, final_block.block_out,
+                                size_t(p.geometry.n_embd) * sizeof(float), cudaMemcpyDeviceToDevice,
+                                static_cast<cudaStream_t>(stream)));
+        checked(cudaMemcpyAsync(p.state.block.inject, final_block.inject,
+                                size_t(p.geometry.hc) * sizeof(float), cudaMemcpyDeviceToDevice,
+                                static_cast<cudaStream_t>(stream)));
+        checked(cudaMemcpyAsync(p.state.block.inject2, final_block.inject2,
+                                size_t(p.geometry.hc) * sizeof(float), cudaMemcpyDeviceToDevice,
+                                static_cast<cudaStream_t>(stream)));
+        p.state.ple_token = tokens.back();
+        p.state.ple_prev[0] = tokens.size() > 1 ? tokens[tokens.size() - 2] : p.state.ple_prev[1];
+        p.state.ple_prev[1] = tokens.back();
+        p.next_position += int64_t(rows);
+        p.checkpoint_position_base = base;
+        return true;
+    } catch (const std::exception& e) {
+        p.batch_projections_active = false;
+        p.failed = true;
+        err = std::string("TP exact-native prefill: ") + e.what();
+        return false;
+    }
 }
 
 } // namespace strata::distributed
