@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 
 namespace strata::kernels::tp::cuda {
 
@@ -51,6 +52,19 @@ void gate_up(const MatrixShard& gate, const MatrixShard& up,
 // token; this is a component reference path, not a tensor-core GEMM backend.
 void down(const MatrixShard& weights, const distributed::ActivationContract& contract,
           const GlobalQ81& activation, float* partial, void* stream);
+
+// Exact ordinary native-MMVQ control: store the scale and integer-dot operand
+// for each of at most two calls per warp lane, NOT rounded products/sums (the
+// native loop contracts its product+accumulation to FMA). Local payload layout
+// [rows][nout][call_slot=2][lane=32][scale,integer_dot=2], 128 floats/output.
+// Gather three uniform payloads in rank-major order, then finish once. Only
+// original widths <=1024 with <=64 dot calls and whole weight cuts qualify.
+constexpr int down_lane_payload_width = 128;
+void down_lanes(const MatrixShard&, const distributed::ActivationContract&,
+                const GlobalQ81&, float* operands, void* stream);
+void finish_down_lanes(const float* rank_major_operands, int ggml_type,
+                       int input_width, int output_width, int rows,
+                       std::array<uint64_t, 3> valid_input, float* output, void* stream);
 
 // Gathered wire has [token][rank][wire_slots], h [token][sum(valid_counts)].
 // Padding is discarded before the global quantizer; buffers must not overlap.

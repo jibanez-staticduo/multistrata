@@ -8,6 +8,10 @@
 
 namespace strata::distributed {
 
+enum class ExpertDownPolicy { ExactLaneReference, PartialReduce };
+// ExactLaneReference gathers native FMA operands before the original warp sum;
+// PartialReduce keeps the measured reassociation path for component benchmarks.
+
 // Original GGUF routed experts, each rank owns only its gate/up output rows
 // and down input blocks. The core applies router weights and shared output.
 // Route readback has a monotonic deadline (1..3600000 ms). A transfer error or
@@ -17,7 +21,8 @@ public:
     NativeRoutedExperts(std::string pack_dir, std::string native_gguf,
                         const core::ModelGeometry&, int rank, LayerCollectives&,
                         std::array<uint64_t, 3> valid = {256, 192, 192},
-                        uint32_t readback_timeout_ms = 60000);
+                        uint32_t readback_timeout_ms = 60000,
+                        ExpertDownPolicy down_policy = ExpertDownPolicy::ExactLaneReference);
     ~NativeRoutedExperts();
     NativeRoutedExperts(const NativeRoutedExperts&) = delete;
     NativeRoutedExperts& operator=(const NativeRoutedExperts&) = delete;

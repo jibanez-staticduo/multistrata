@@ -67,7 +67,8 @@ void model_schedule() {
           out[3 * 22].descriptor.valid_counts == std::vector<uint64_t>{2048, 2048, 2048} &&
           out[3 * 22 + 1].route == "qsa_output_rank_zero_reference", "QSA every fourth layer shapes");
     check(out[2].route == "expert_hidden_0" && out[2].descriptor.valid_counts == std::vector<uint64_t>{256, 192, 192} &&
-          out[21].route == "expert_output_9", "all expert route slots in order");
+          out[21].route == "expert_lane_terms_9" &&
+          out[21].descriptor.valid_counts == std::vector<uint64_t>{327680,327680,327680}, "all expert route slots in order");
     command.tokens.push_back(5); command.positions.push_back(1);
     check(!model_forward_schedule(command, g, 1, out) && out.size() == 2 * 48 * 22 &&
           out[48 * 22].descriptor.operation.layer == 0, "multi token prefill restarts all layers without reset sequence");

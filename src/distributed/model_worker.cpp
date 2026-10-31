@@ -80,7 +80,8 @@ Failure model_forward_schedule(const StepCommand& command, const core::ModelGeom
             append(layer, qsa ? "qsa_output_rank_zero_reference" : "mixer", {});
             for (int64_t slot = 0; slot < g.n_expert_used; ++slot) {
                 append(layer, "expert_hidden_" + std::to_string(slot), {256, 192, 192});
-                append(layer, "expert_output_" + std::to_string(slot), {});
+                const uint64_t lanes = uint64_t(g.n_embd) * 128;
+                append(layer, "expert_lane_terms_" + std::to_string(slot), {lanes, lanes, lanes});
             }
         }
     }

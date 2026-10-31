@@ -97,6 +97,8 @@ struct Options {
     bool inspect = false;
     bool roundoff_bound = false;
     bool roundoff_selftest = false;
+    bool exact_lane = false;
+    bool exact_lane_selftest = false;
     double atol = 0, rtol = 0;
     int layer = 0, expert = 0;
     std::vector<std::string> gguf;
@@ -110,6 +112,8 @@ Options options(int argc, char** argv) {
         if (arg == "--inspect-sample") { o.inspect = true; continue; }
         if (arg == "--roundoff-bound") { o.roundoff_bound = true; continue; }
         if (arg == "--roundoff-selftest") { o.roundoff_selftest = true; continue; }
+        if (arg == "--exact-lane-reference") { o.exact_lane = true; continue; }
+        if (arg == "--exact-lane-selftest") { o.exact_lane_selftest = true; continue; }
         require(i + 1 < argc, "missing argument value");
         const std::string v = argv[++i];
         if (arg == "--atol") { o.atol = std::stod(v); atol = true; }
@@ -130,7 +134,8 @@ struct Metrics {
     int failures = 0;
     const Options& o;
     void compare(const char* label, const std::vector<float>& ref, const std::vector<float>& got, bool exact = false,
-                 const std::vector<double>* bounds = nullptr, const std::vector<double>* norm = nullptr) {
+                 const std::vector<double>* bounds = nullptr, const std::vector<double>* norm = nullptr,
+                 bool diagnostic_only = false) {
         require(ref.size() == got.size(), "comparison size mismatch");
         double max_abs = 0, err2 = 0, ref2 = 0;
         std::size_t bad = 0;
@@ -152,13 +157,14 @@ struct Metrics {
         }
         std::printf("%s max_abs=%.9g rms=%.9g relative_l2=%.9g outside_limits=%zu exact=%d\n",
                     label, max_abs, std::sqrt(err2 / ref.size()), std::sqrt(err2 / std::max(ref2, 1e-300)), bad, exact);
+        if (diagnostic_only) std::printf("  diagnostic_only=1 gate=not-selected-arithmetic\n");
         if (bad || bounds) std::printf("  worst_lane=%zu expected=%.9g got=%.9g magnitude=%.9g limit=%.9g error_over_limit=%.9g derived_bound=%d outside_bound=%zu\n",
             worst, double(ref[worst]), double(got[worst]), std::max(std::abs(double(ref[worst])), std::abs(double(got[worst]))),
             bounds ? (*bounds)[worst] : o.atol + o.rtol * std::abs(double(ref[worst])), max_ratio, bounds != nullptr, bound_bad);
         if (norm) std::printf("  worst_lane_sum_abs_terms=%.17g cancellation_condition=%.9g\n", (*norm)[worst],
             (*norm)[worst] / std::max(std::abs(double(ref[worst])), 1e-300));
         const auto rejected = bounds && o.roundoff_bound && !exact ? bound_bad : bad;
-        if (!all_finite || (rejected && (exact || !o.measure))) ++failures;
+        if (!all_finite || (!diagnostic_only && rejected && (exact || !o.measure))) ++failures;
     }
 };
 
@@ -319,6 +325,34 @@ void roundoff_selftest() {
     }
     std::puts("independent-roundoff-host-selftest passed GPU_NOT_RUN");
 }
+void exact_lane_selftest() {
+    // A rounded dot product cannot reproduce the native FMA across ranks.
+    const float x = 1.f + std::ldexp(1.f, -23), y = 1.f - std::ldexp(1.f, -23);
+    const volatile float rounded_product = x * y;
+    require(std::fma(x, y, -1.f) != rounded_product - 1.f, "FMA counterexample disappeared");
+    for (int type : {20, 42}) for (int width : {192, 640, 1024}) {
+        const auto counts = width == 192 ? std::array<int,3>{64,64,64} :
+                            width == 640 ? std::array<int,3>{256,192,192} : std::array<int,3>{384,320,320};
+        const int calls = width / block(type) * 2;
+        require(calls <= 64, "exact lane host geometry exceeds two slots");
+        for (int lane = 0; lane < 32; ++lane) {
+            int previous_rank = -1;
+            for (int call = lane; call < calls; call += 32) {
+                const int input = (call / 2) * block(type);
+                const int owner = input < counts[0] ? 0 : input < counts[0] + counts[1] ? 1 : 2;
+                int matches = 0, begin = 0;
+                for (int rank = 0; rank < 3; ++rank) {
+                    if (input >= begin && input < begin + counts[rank]) ++matches;
+                    begin += counts[rank];
+                }
+                require(matches == 1 && owner >= previous_rank && call / 32 < 2,
+                        "exact lane call ownership/order is ambiguous");
+                previous_rank = owner;
+            }
+        }
+    }
+    std::puts("exact-lane-host-ownership-and-FMA-selftest passed GPU_NOT_RUN");
+}
 Sample sample_real(const Options& o) {
     std::vector<Tensor> all;
     for (const auto& p : o.gguf) { const auto ts = tensors(p); all.insert(all.end(), ts.begin(), ts.end()); }
@@ -436,6 +470,7 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
     Device<float> wire(std::size_t(rows) * 3 * gather.wire_slots), hidden(std::size_t(rows) * ff);
     std::vector<float> poison(wire.size, std::numeric_limits<float>::quiet_NaN()); wire.upload(poison);
     std::array<std::unique_ptr<Device<float>>, 3> partials;
+    Device<float> gathered_lanes(3 * std::size_t(rows) * width * tp::down_lane_payload_width);
     int begin = 0;
     for (int rank = 0; rank < 3; ++rank) {
         const int count = int(gather.valid_counts[rank]), end = begin + count;
@@ -499,6 +534,8 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
             view(sample.down, ff, width, 0, begin, end, compact.p, row_bytes, compact.size);
         tp::down(w,
                  gather, h_image, partials[rank]->p, stream.s);
+        tp::down_lanes(w, gather, h_image,
+            gathered_lanes.p + rank * std::size_t(rows) * width * tp::down_lane_payload_width, stream.s);
         ck(cudaStreamSynchronize(stream.s));
         begin = end;
     }
@@ -509,8 +546,24 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
     std::printf("case gu=%s down=%s width=%d ff=%d rows=%d path=%s\n", codec(sample.gu), codec(sample.down),
                 width, ff, rows, rows == 1 ? "decode" : "prefill-mmvq-reference");
     auto roundoff = down_roundoff(sample, layout, hq.read(), rows);
-    metrics.compare("independent-scalar-original-block-dot", roundoff.scalar, oracle.read(), false, &roundoff.error, &roundoff.norm);
-    metrics.compare("rank-sum-vs-native-expert", oracle.read(), reduced.read(), false, &roundoff.error, &roundoff.norm);
+    metrics.compare("independent-scalar-original-block-dot", roundoff.scalar, oracle.read(), false, &roundoff.error,
+                    &roundoff.norm, metrics.o.exact_lane);
+    metrics.compare("rank-sum-vs-native-expert", oracle.read(), reduced.read(), false, &roundoff.error, &roundoff.norm,
+                    metrics.o.exact_lane);
+    Device<float> exact_output(oracle.size);
+    const std::array<uint64_t, 3> valid{uint64_t(gather.valid_counts[0]), uint64_t(gather.valid_counts[1]),
+                                       uint64_t(gather.valid_counts[2])};
+    tp::finish_down_lanes(gathered_lanes.p, sample.down, ff, width, rows, valid, exact_output.p, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    metrics.compare("exact-lane-vs-native-expert", oracle.read(), exact_output.read(), true);
+    Device<uint8_t> oracle_q(tp::global_q81_bytes(rows, width)), exact_q(oracle_q.size);
+    k::quantize_q8_1_rows(oracle.p, rows, width, oracle_q.p, stream.s);
+    k::quantize_q8_1_rows(exact_output.p, rows, width, exact_q.p, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    require(oracle_q.read() == exact_q.read(), "exact lane output Q8_1 codes mismatch");
+    if (metrics.o.exact_lane) {
+        ck(cudaMemcpyAsync(reduced.p, exact_output.p, oracle.size * sizeof(float), cudaMemcpyDeviceToDevice, stream.s));
+    }
 
     // Ordered top-k10, per-expert scales, a nonzero shared contribution, a zero
     // part and an unselected route (weight zero), independent native combine.
@@ -525,14 +578,15 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
     route.upload(rw); shared.upload(sh); bias.upload(bs); scale.upload({.75f});
     auto projected_ref = oracle.read();
     for (std::size_t i = 0; i < projected_ref.size(); ++i)
-        projected_ref[i] = projected_ref[i] * .75f + bs[i % width];
+        projected_ref[i] = std::fma(projected_ref[i], .75f, bs[i % width]);
     for (std::size_t i = 0; i < roundoff.error.size(); ++i) {
         roundoff.norm[i] = .75 * roundoff.norm[i] + std::abs(double(bs[i % width]));
         roundoff.error[i] = .75 * roundoff.error[i] + 2 * gamma(2) * roundoff.norm[i];
     }
     tp::finish_projection(reduced.p, rows, width, scale.p, bias.p, stream.s);
     ck(cudaStreamSynchronize(stream.s));
-    metrics.compare("expert-scale-bias-after-rank-sum", projected_ref, reduced.read(), false, &roundoff.error, &roundoff.norm);
+    metrics.compare("expert-scale-bias-after-rank-sum", projected_ref, reduced.read(), metrics.o.exact_lane,
+                    metrics.o.exact_lane ? nullptr : &roundoff.error, metrics.o.exact_lane ? nullptr : &roundoff.norm);
     oracle.upload(projected_ref);
     fill_parts<<<unsigned((n + 255) / 256), 256, 0, stream.s>>>(reduced.p, parts.p, n, width);
     fill_parts<<<unsigned((n + 255) / 256), 256, 0, stream.s>>>(oracle.p, reference_parts.p, n, width);
@@ -555,7 +609,8 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
         const double norm = coefficient * roundoff.norm[i] + std::abs(double(sh[i]));
         roundoff.error[i] = coefficient * roundoff.error[i] + 2 * gamma(12) * norm;
     }
-    metrics.compare("moe-topk10-scales-shared-zero-route", ref, combined.read(), false, &roundoff.error);
+    metrics.compare("moe-topk10-scales-shared-zero-route", ref, combined.read(), metrics.o.exact_lane,
+                    metrics.o.exact_lane ? nullptr : &roundoff.error);
 
     // Empty native groups must leave the destination untouched.
     groups.upload({0}); oracle.upload(sh);
@@ -569,6 +624,7 @@ int main(int argc, char** argv) {
     try {
         const Options o = options(argc, argv);
         if (o.roundoff_selftest) { roundoff_selftest(); return 0; }
+        if (o.exact_lane_selftest) { exact_lane_selftest(); return 0; }
         // These environment-only experiments bypass the selected ordinary
         // grouped control before its public setters take effect.
         for (const char* name : {"STRATA_EXPERT_V2", "STRATA_EXPERT_V2K", "STRATA_DOWN_WS"}) {

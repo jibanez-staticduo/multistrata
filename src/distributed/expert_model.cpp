@@ -105,6 +105,8 @@ struct NativeRoutedExperts::Impl {
     uint64_t begin = 0, end = 0, owned = 0;
     std::vector<Layer> layers;
     Buffer input_q, gate, up, local_hidden, wire, hidden, hidden_q, partial;
+    Buffer lane_terms, lane_wire;
+    ExpertDownPolicy down_policy;
     ActivationContract input_contract, hidden_contract;
     RouteReadback readback;
     uint32_t readback_timeout_ms;
@@ -112,11 +114,13 @@ struct NativeRoutedExperts::Impl {
     bool initialized = false;
 
     Impl(std::string pack_dir, std::string gguf, const core::ModelGeometry& g, int r,
-         LayerCollectives& c, std::array<uint64_t, 3> counts, uint32_t timeout_ms)
+         LayerCollectives& c, std::array<uint64_t, 3> counts, uint32_t timeout_ms, ExpertDownPolicy policy)
         : pack(std::move(pack_dir)), native(std::move(gguf)), geometry(g), rank(r), collective(c), valid(counts),
-          readback_timeout_ms(timeout_ms) {
+          down_policy(policy), readback_timeout_ms(timeout_ms) {
         require(timeout_ms > 0 && timeout_ms <= 3600000,
                 "TP expert model: readback timeout must be in [1,3600000] ms");
+        require(policy == ExpertDownPolicy::ExactLaneReference || policy == ExpertDownPolicy::PartialReduce,
+                "TP expert model: unknown down arithmetic policy");
     }
 
     void initialize() {
@@ -149,6 +153,9 @@ struct NativeRoutedExperts::Impl {
         std::vector<uint8_t> compact_down;
         for (int64_t index = 0; index < geometry.n_layers; ++index) {
             const auto& fmt = layout.fmt[std::size_t(index)];
+            if (down_policy == ExpertDownPolicy::ExactLaneReference)
+                require(geometry.n_ff <= 1024 && geometry.n_ff / block(fmt.d_type) * 2 <= 64,
+                        "TP exact lane model requires at most two calls per warp lane");
             require(fmt.n_embd == geometry.n_embd && fmt.n_ff == geometry.n_ff && !fmt.tail_off &&
                     !fmt.had_block && !fmt.had_gu && !fmt.had_d,
                     "TP expert model: scaled/rotated expert is unsupported");
@@ -243,6 +250,10 @@ struct NativeRoutedExperts::Impl {
         local_hidden = Buffer(slots * sizeof(float)); wire = Buffer(3 * slots * sizeof(float));
         hidden = Buffer(geometry.n_ff * sizeof(float)); hidden_q = Buffer(tp::global_q81_bytes(1, int(geometry.n_ff)));
         partial = Buffer(geometry.n_embd * sizeof(float));
+        if (down_policy == ExpertDownPolicy::ExactLaneReference) {
+            lane_terms = Buffer(geometry.n_embd * tp::down_lane_payload_width * sizeof(float));
+            lane_wire = Buffer(3 * lane_terms.bytes);
+        }
         readback.initialize(std::size_t(geometry.n_expert_used));
         input_contract.consumer = "expert_gate_up"; input_contract.gather = "none";
         input_contract.quantizer = "Q8_1"; input_contract.block_size = 32;
@@ -294,10 +305,20 @@ struct NativeRoutedExperts::Impl {
             tp::unpack_gathered(hidden_contract, wire.floats(), 1, hidden.floats(), stream);
             const auto hq = tp::quantize_global(hidden_contract, hidden.floats(), 1, int(geometry.n_ff),
                                                 hidden_q.data, hidden_q.bytes, stream);
-            tp::down(layer.down_view, hidden_contract, hq, partial.floats(), stream);
-            std::snprintf(stage, sizeof(stage), "expert_output_%lld", static_cast<long long>(i));
-            if (!collective.reduce(index, stage, partial.floats(),
-                                   parts + i * geometry.n_embd, std::size_t(geometry.n_embd), stream, err)) return false;
+            if (down_policy == ExpertDownPolicy::ExactLaneReference) {
+                tp::down_lanes(layer.down_view, hidden_contract, hq, lane_terms.floats(), stream);
+                const uint64_t count = uint64_t(geometry.n_embd) * tp::down_lane_payload_width;
+                std::snprintf(stage, sizeof(stage), "expert_lane_terms_%lld", static_cast<long long>(i));
+                if (!collective.gather(index, stage, lane_terms.floats(), lane_wire.floats(),
+                                       {count, count, count}, stream, err)) return false;
+                tp::finish_down_lanes(lane_wire.floats(), layer.layout.d_type, int(geometry.n_ff),
+                                      int(geometry.n_embd), 1, valid, parts + i * geometry.n_embd, stream);
+            } else {
+                tp::down(layer.down_view, hidden_contract, hq, partial.floats(), stream);
+                std::snprintf(stage, sizeof(stage), "expert_output_%lld", static_cast<long long>(i));
+                if (!collective.reduce(index, stage, partial.floats(),
+                                       parts + i * geometry.n_embd, std::size_t(geometry.n_embd), stream, err)) return false;
+            }
         }
         return true;
     }
@@ -305,9 +326,9 @@ struct NativeRoutedExperts::Impl {
 
 NativeRoutedExperts::NativeRoutedExperts(std::string pack, std::string native, const core::ModelGeometry& geometry,
                                        int rank, LayerCollectives& collective, std::array<uint64_t, 3> valid,
-                                       uint32_t readback_timeout_ms)
+                                       uint32_t readback_timeout_ms, ExpertDownPolicy down_policy)
     : impl_(std::make_unique<Impl>(std::move(pack), std::move(native), geometry, rank, collective, valid,
-                                   readback_timeout_ms)) {}
+                                   readback_timeout_ms, down_policy)) {}
 NativeRoutedExperts::~NativeRoutedExperts() = default;
 bool NativeRoutedExperts::initialize(std::string& err) {
     try { impl_->initialize(); return true; } catch (const std::exception& e) { err = e.what(); return false; }
