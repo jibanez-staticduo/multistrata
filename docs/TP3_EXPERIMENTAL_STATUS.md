@@ -172,7 +172,9 @@ correctness run, so their timings do not establish performance.
 A missing-rank injection ends both joining ranks within 10.4 seconds. Killing
 a peer after operation agreement ends the other processes within 14.3 seconds,
 with no passing result. [Fault receipts][rocefaults] cover eager standalone
-failure; graph fault injection and model integration remain unqualified.
+failure; a graph peer-loss injection also ends the surviving ranks within 12.4 seconds
+from process start, without accepting output. This is a standalone graph fault
+check, not a long serving soak.
 The first attempts failed before payload execution because of GID selection,
 an old staged binary, or the follower coordinator address. They are retained.
 NCCL remains the default model transport. The hybrid model path is opt-in and
@@ -180,6 +182,17 @@ keeps reductions on NCCL. Its short full-model comparison now passes: all three
 ranks exit 0, with eight exact logit rows, 2070 state comparisons, 1728 traces
 and 1964 reset comparisons. [The hybrid receipt][hybridmodel] qualifies this
 short case only; long prompts and performance remain pending.
+
+## Service state checks
+
+A normal C1 service request captures 18 consumed input IDs on all three ranks.
+The same IDs replayed through TP1 produce exact final logits and all 171 logical
+state arrays. With MTP4, a separate request captures 22 consumed IDs and passes
+that same full-state check, including the state left after speculative
+rollback/replay. [Normal service][plainstate] and [MTP service][mtpstate]
+receipts use the unchanged zero-error policy. These are short greedy cases;
+they do not establish long MTP correctness or the sampled distribution.
+A client disconnect in the MTP case leaves all three ranks ready when checked.
 
 ## Failed attempts retained
 
@@ -197,7 +210,7 @@ the qualifying outputs. These failed attempts are not counted as passes.
 
 - Full 64K prompt C1 state/logit continuation, long resets and failure recovery.
 - A useful additional capacity case and complete per-rank warmup/prefill/decode accounting.
-- MTP acceptance probabilities, rollback/reset and failure state against TP1; sampled distribution checks.
+- MTP acceptance probabilities, long rollback/reset and failure state against TP1; sampled distribution checks.
 - Full-model CUDA graphs, long replay/reset/timeout behavior and C4/C8 internal state isolation.
 - Matched TP1/TP2/TP3 performance matrix and continuation thresholds; a separate Staticduo21/vLLM comparison when quantization differs.
 
@@ -242,3 +255,6 @@ files with this report when sharing it; the links are not public downloads.
 [rocefaults]: /home/staticduo/tmp/strata-tp3-20261031/roce-qualified/fault-summary.json
 
 [hybridmodel]: /home/staticduo/tmp/strata-tp3-20261031/hybrid-short2/independent-qualification.json
+
+[plainstate]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/plain-check/result/comparison.json
+[mtpstate]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/mtp-check/result/comparison.json
