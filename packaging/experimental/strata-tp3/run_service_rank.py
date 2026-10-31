@@ -30,6 +30,7 @@ _spec.loader.exec_module(_common)
 RunnerError = _common.RunnerError
 digest = _common.digest
 credential = _common.credential
+DISTRIBUTED_MAX_CONTEXT = _common.DISTRIBUTED_MAX_CONTEXT
 MAX_LOG = 32 << 20
 SERVICE_FLAGS = frozenset({"--mtp-path", "--mtp-drafts", "--mtp-hash", "--parallel"})
 
@@ -106,8 +107,8 @@ def validated(supplied):
                       input_file=config.get("source_file"), input_sha256=config.get("source_sha256"),
                       process_timeout_s=600)
     context = options.get("--context", "")
-    if not isinstance(context, str) or not context.isdigit() or not 4 <= int(context) <= 65536:
-        raise RunnerError("service context must be in 4..65536")
+    if not isinstance(context, str) or not context.isdigit() or not 4 <= int(context) <= DISTRIBUTED_MAX_CONTEXT:
+        raise RunnerError(f"service context must be in 4..{DISTRIBUTED_MAX_CONTEXT}")
     normalized["args"] = ["32768" if i and normalized["args"][i - 1] == "--context" and int(context) > 32768 else x
                           for i, x in enumerate(normalized["args"])]
     checked = _common.validated(normalized)

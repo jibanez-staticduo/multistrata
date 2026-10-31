@@ -178,6 +178,14 @@ void large_chunked_prompt() {
           "large prompt crosses bounded 24KiB chunks with declared length and accepts 64K context");
     check(rig.count(StepPhase::prefill) == 1 && rig.count(StepPhase::cancel) == 1,
           "large prompt can cancel between committed tokens without completing full prefill");
+    for (int i = 20000; i < 65536; ++i) ids += ",1";
+    Rig boundary; boundary.input = {generate("boundary", ids, 256), cancel("boundary")};
+    check(!run_autoregressive(0, 100, kDistributedMaxContext, boundary.callbacks()) &&
+          boundary.count(StepPhase::prefill) == 1 && boundary.count(StepPhase::cancel) == 1,
+          "64K prompt plus 256 output admission crosses wire chunks without truncation");
+    Rig invalid;
+    check(bool(run_autoregressive(0, 100, kDistributedMaxContext + 1, invalid.callbacks())) &&
+          invalid.events.empty() && invalid.wire.empty(), "oversized coordinator context fails before readiness");
 }
 
 int32_t target_token(const std::vector<int32_t>& history, uint64_t draw) {

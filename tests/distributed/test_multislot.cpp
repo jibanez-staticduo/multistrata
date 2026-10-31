@@ -89,7 +89,7 @@ struct Rig {
     uint32_t rank;
     std::unique_ptr<MultiSlotScheduler> scheduler;
     Rig(uint32_t slots, uint32_t rank_ = 0, const std::vector<Exchange>* replay = nullptr,
-        uint32_t limit = 4096) : rank(rank_) {
+        uint32_t limit = 4096, uint32_t context = 65536) : rank(rank_) {
         MultiSlotCallbacks cb;
         cb.broadcast = [&, replay](std::string_view label, std::string& bytes) {
             check(bytes.size() <= 24u * 1024u, "broadcast uses bounded chunks");
@@ -145,7 +145,7 @@ struct Rig {
             events.push_back(std::string(type) + ":" + std::string(req));
         };
         cb.abort_all = [&] { ++abort_count; for (auto& s : states) s = FakeSlot{}; };
-        scheduler = std::make_unique<MultiSlotScheduler>(MultiSlotConfig{rank, slots, 100, 65536, limit}, std::move(cb));
+        scheduler = std::make_unique<MultiSlotScheduler>(MultiSlotConfig{rank, slots, 100, context, limit}, std::move(cb));
     }
     void drain() {
         for (int guard = 0; scheduler->active() && guard < 500; ++guard)
@@ -229,6 +229,19 @@ void cancellation_and_reuse() {
 }
 
 void admission_bounds() {
+    for (const uint32_t slots : {1u, 4u, 8u}) {
+        Rig boundary(slots, 0, nullptr, 4096, kDistributedMaxContext);
+        check(boundary.scheduler->submit(generate("overflow", 65536, 257)).outcome == MultiSlotOutcome::rejected &&
+              boundary.calls.empty() && boundary.scheduler->active() == 0,
+              "C1/C4/C8 output overflow rejects before slot state changes");
+        check(boundary.scheduler->submit(generate("boundary", 65536, 256)).outcome == MultiSlotOutcome::accepted &&
+              boundary.scheduler->active() == 1 && boundary.scheduler->request(0) == "boundary",
+              "C1/C4/C8 scheduler admits exact 64K prompt plus 256 outputs without truncation");
+    }
+    bool bad_context = false;
+    try { Rig invalid(1, 0, nullptr, 4096, kDistributedMaxContext + 1); }
+    catch (const std::invalid_argument&) { bad_context = true; }
+    check(bad_context, "scheduler rejects context above bounded capacity");
     Rig rig(1, 0, nullptr, 2);
     check(rig.scheduler->submit("{}").outcome == MultiSlotOutcome::rejected &&
           rig.scheduler->submit(generate("too_long", 65536, 1)).outcome == MultiSlotOutcome::rejected &&

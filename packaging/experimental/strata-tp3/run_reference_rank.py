@@ -27,6 +27,7 @@ _helpers = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_helpers)
 RunnerError = _helpers.RunnerError
 digest = _helpers.digest
+DISTRIBUTED_MAX_CONTEXT = _helpers.DISTRIBUTED_MAX_CONTEXT
 MAX_LOG = 32 << 20
 SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
 FLAGS = frozenset({"--pack", "--native", "--ple", "--context"})
@@ -75,8 +76,8 @@ def validated(supplied):
     if any(not _helpers.absolute(options[key]) for key in FLAGS - {"--context"}):
         raise RunnerError("model paths must be absolute single-line strings")
     context = options["--context"]
-    if not context.isascii() or not context.isdigit() or not 4 <= int(context) <= 65536:
-        raise RunnerError("reference service context must be in 4..65536")
+    if not context.isascii() or not context.isdigit() or not 4 <= int(context) <= DISTRIBUTED_MAX_CONTEXT:
+        raise RunnerError(f"reference service context must be in 4..{DISTRIBUTED_MAX_CONTEXT}")
     config["options"] = options
     for key, default, low, high in (("process_timeout_s", 1800, 1, 86400),
                                    ("terminate_timeout_s", 10, 0.1, 30),

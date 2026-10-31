@@ -1,3 +1,4 @@
+#include "strata/distributed/limits.hpp"
 // Opt-in, uncaptured C1 driver. Teacher forcing keeps the original per-rank input;
 // autoregressive mode lets rank zero coordinate JSONL requests and sampled IDs.
 #include "distributed/nccl_transport.cpp"
@@ -462,7 +463,7 @@ int main(int argc, char** argv) {
             }
         }
         if (rank >= 3 || port < 1024 || port > 65535 || timeout < 100 || timeout > 600000 || context < 4 ||
-            context > 65536u)
+            context > kDistributedMaxContext)
             throw std::runtime_error("invalid rank, port, deadline or context");
         const bool selected_logits = args.contains("logits-positions");
         require(!selected_logits || (args.contains("logits-dir") && !get("logits-dir").empty() &&

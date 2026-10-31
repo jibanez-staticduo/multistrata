@@ -1,5 +1,6 @@
 // CPU state oracle only. No model, drafter, transport or GPU execution.
 #include "strata/distributed/speculative.hpp"
+#include "strata/distributed/limits.hpp"
 
 #include <array>
 #include <cstdio>
@@ -158,6 +159,13 @@ void oracle_cases() {
 
 void invalid_windows() {
     const auto valid = make_window(5, 2, false);
+    for (const uint32_t context : {kDistributedMaxContext, kDistributedMaxContext + 1}) {
+        Fake f; SpeculativeVerifier verifier(0, 97, context); SpeculativeResult out;
+        const auto failure = verifier.verify(valid, f.callbacks(), out);
+        check(context == kDistributedMaxContext ? !failure && !out.tokens.empty() :
+              bool(failure) && out.tokens.empty() && f.calls == 0,
+              "speculative context capacity is bounded before checkpoint and output");
+    }
     std::vector<SpeculativeWindow> bad;
     auto add = [&](auto change) { auto w = valid; change(w); bad.push_back(std::move(w)); };
     add([](auto& w) { w.request_id.clear(); }); add([](auto& w) { w.window_id = 0; });

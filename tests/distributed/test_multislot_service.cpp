@@ -262,6 +262,18 @@ void budgets_chunks_and_validation() {
     Rig invalid_budget;
     check(bool(invalid_budget.run(99)) && invalid_budget.health_calls == 0,
           "operation budgets below minimum reject before health");
+    for (const uint32_t slots : {1u, 4u, 8u}) {
+        Rig boundary;
+        boundary.config.slots = slots;
+        boundary.config.context = kDistributedMaxContext;
+        boundary.input = {generate("boundary", 65536, 256), cancel("boundary")};
+        check(!boundary.run() && boundary.count("cancelled") == 1 && boundary.count("done") == 0,
+              "C1/C4/C8 admit and cancel 64K prompt plus 256 outputs at expanded capacity");
+    }
+    Rig invalid_context;
+    invalid_context.config.context = kDistributedMaxContext + 1;
+    check(bool(invalid_context.run()) && invalid_context.events.empty() && invalid_context.wire.empty(),
+          "context above bounded capacity rejects before service readiness");
     for (uint32_t slots : {1u, 8u}) {
         Rig supported;
         supported.config.slots = slots;

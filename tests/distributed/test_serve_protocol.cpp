@@ -49,9 +49,18 @@ int main() {
     check(parse(" \r\n\t" + generate() + "\n", out), "JSON whitespace accepted");
     check(parse(generate(), out, 5), "context equality accepted");
     check(!parse(generate(), out, 4), "context overflow refused");
-    check(!parse(generate(), out, 65537), "context above hard limit refused");
+    check(!parse(generate(), out, kDistributedMaxContext + 1), "context above hard limit refused");
     check(!parse(generate(), out, 0), "zero context refused");
     check(!parse(generate(), out, 10, 0), "invalid vocabulary refused");
+    std::string prompt_ids = "[1";
+    for (size_t i = 1; i < 65536; ++i) prompt_ids += ",1";
+    prompt_ids += ']';
+    check(parse(generate("{}", prompt_ids, "256"), out, kDistributedMaxContext) &&
+          out.ids.size() == 65536 && out.max_new == 256,
+          "64K prompt plus 256 outputs fits bounded context without truncation");
+    out.request_id = "unchanged";
+    check(!parse(generate("{}", prompt_ids, "257"), out, kDistributedMaxContext) &&
+          out.request_id == "unchanged", "one extra output is rejected without changing request");
 
     for (auto malformed : {"", "{", "[]", "null", "true", "{}", "{\"type\":true}",
         "{\"type\":\"other\"}", "{\"type\":\"shutdown\",}", "{\"type\":\"shutdown\"}{}",
@@ -124,6 +133,9 @@ int main() {
     check(serve_event("ready", {}, -1, 65536) ==
           "{\"type\":\"ready\",\"alive_ranks\":[0,1,2],\"protocol\":\"strata-distributed-v1\",\"mode\":\"autoregressive\",\"world\":3,\"max_context\":65536}",
           "ready JSON matches contract");
+    check(serve_event("ready", {}, -1, kDistributedMaxContext) ==
+          "{\"type\":\"ready\",\"alive_ranks\":[0,1,2],\"protocol\":\"strata-distributed-v1\",\"mode\":\"autoregressive\",\"world\":3,\"max_context\":65792}",
+          "expanded ready capacity preserves protocol and roster");
     check(serve_event("token", "r", 42) ==
           "{\"type\":\"token\",\"alive_ranks\":[0,1,2],\"request_id\":\"r\",\"committed\":true,\"id\":42}",
           "committed token JSON matches contract");
@@ -136,7 +148,7 @@ int main() {
           "{\"type\":\"error\",\"alive_ranks\":[0,1,2],\"state\":\"bad\\u000a\\\"\\\\\"}", "event string safely escaped");
     throws([] { serve_event("unknown"); }, "unknown event refused");
     throws([] { serve_event("ready"); }, "invalid ready context refused");
-    throws([] { serve_event("ready", {}, -1, 65537); }, "oversized ready context refused");
+    throws([] { serve_event("ready", {}, -1, kDistributedMaxContext + 1); }, "oversized ready context refused");
     throws([] { serve_event("token", "r", -1); }, "negative event token refused");
     throws([] { serve_event("token", "bad\n", 1); }, "unsafe event request id refused");
     throws([] { serve_event("health", {}, -1, 0, "failed"); }, "invalid health state refused");

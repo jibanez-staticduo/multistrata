@@ -26,6 +26,8 @@ class RunnerError(ValueError):
     pass
 
 
+DISTRIBUTED_MAX_CONTEXT = 65792
+
 FLAGS = frozenset("rank rank0-address port session-uuid library-path nccl-version library-provenance model-hash config-fingerprint pack native ple context timeout-ms logits-dir".split())
 STATE_FLAGS = frozenset({"state-dir", "state-positions", "state-max-bytes"})
 TRACE_FLAGS = frozenset({"trace-dir"})
@@ -76,7 +78,7 @@ def validated(config):
     n_vocab = config.get("n_vocab", 248320)
     if type(n_vocab) is not int or n_vocab <= 0:
         raise RunnerError("n_vocab must be a positive integer")
-    for key, low, high in (("rank", 0, 2), ("port", 1024, 65535), ("context", 4, 65536), ("timeout-ms", 100, 600000)):
+    for key, low, high in (("rank", 0, 2), ("port", 1024, 65535), ("context", 4, DISTRIBUTED_MAX_CONTEXT), ("timeout-ms", 100, 600000)):
         if not options[key].isdigit() or not low <= int(options[key]) <= high:
             raise RunnerError("invalid rank, port, context or timeout")
     address = ipaddress.IPv4Address(options["rank0-address"])

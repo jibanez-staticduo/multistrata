@@ -99,7 +99,7 @@ def test_invalid_config_refused(config, change):
         runner.validated(dict(config, **change))
 
 
-@pytest.mark.parametrize("context", ["3", "65537", "-1", "1e3", "true", "\u0664"])
+@pytest.mark.parametrize("context", ["3", "65793", "-1", "1e3", "true", "\u0664"])
 def test_context_bounds(config, context):
     args = list(config["args"])
     args[-1] = context
@@ -228,3 +228,10 @@ def test_overflow_terminates_window(config, monkeypatch):
     receipt = runner.run(config, True)
     assert receipt["reason"] == "log size limit exceeded"
     assert (Path(config["evidence_dir"]) / "stdout.log").stat().st_size <= 1024
+
+
+def test_expanded_context_capacity(config):
+    assert runner.DISTRIBUTED_MAX_CONTEXT == runner._helpers.DISTRIBUTED_MAX_CONTEXT == 65792
+    args = list(config["args"])
+    args[-1] = str(runner.DISTRIBUTED_MAX_CONTEXT)
+    assert runner.validated(dict(config, args=args))["options"]["--context"] == "65792"

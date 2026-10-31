@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/distributed/limits.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cstdint>
@@ -22,7 +23,7 @@ struct ServeRequest {
 
 // One JSON value, at most 1 MiB and 16 nested containers. Failure leaves out unchanged.
 // generate requires type, request_id, ids, max_new and sampling; cancel requires
-// type and request_id; shutdown requires only type. The context is limited to 65536.
+// type and request_id; shutdown requires only type. The context is limited to kDistributedMaxContext.
 bool parse_serve_request(std::string_view json, int32_t n_vocab, uint32_t context,
                          ServeRequest& out, std::string& err);
 

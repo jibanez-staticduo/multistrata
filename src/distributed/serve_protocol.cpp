@@ -1,3 +1,4 @@
+#include "strata/distributed/limits.hpp"
 #include "strata/distributed/serve_protocol.hpp"
 
 #include <charconv>
@@ -10,7 +11,6 @@ namespace strata::distributed {
 namespace {
 
 constexpr size_t kMaxLine = 1u << 20;
-constexpr uint32_t kMaxContext = 65536;
 
 struct Value {
     enum class Kind { object, array, string, number, literal } kind = Kind::literal;
@@ -307,7 +307,7 @@ bool parse_serve_request(std::string_view json, int32_t n_vocab, uint32_t contex
         candidate.request_id = id->second.text;
     }
     if (kind == "generate") {
-        if (n_vocab <= 0 || context == 0 || context > kMaxContext) { err = "invalid vocabulary or context capacity"; return false; }
+        if (n_vocab <= 0 || context == 0 || context > kDistributedMaxContext) { err = "invalid vocabulary or context capacity"; return false; }
         const auto ids = root.object.find("ids"), count = root.object.find("max_new"), params = root.object.find("sampling");
         uint64_t max_new = 0;
         if (ids == root.object.end() || ids->second.kind != Value::Kind::array || ids->second.array.empty() ||
@@ -333,7 +333,7 @@ std::string serve_event(std::string_view type, std::string_view request_id, int3
         throw std::invalid_argument("unknown serve event");
     std::string event = "{\"type\":" + quote(type) + ",\"alive_ranks\":[0,1,2]";
     if (type == "ready") {
-        if (!max_context || max_context > kMaxContext) throw std::invalid_argument("invalid event context");
+        if (!max_context || max_context > kDistributedMaxContext) throw std::invalid_argument("invalid event context");
         event += ",\"protocol\":\"strata-distributed-v1\",\"mode\":\"autoregressive\",\"world\":3,\"max_context\":" + std::to_string(max_context);
     } else if (type == "token" || type == "done" || type == "cancelled") {
         if (!safe_id(request_id)) throw std::invalid_argument("invalid event request_id");

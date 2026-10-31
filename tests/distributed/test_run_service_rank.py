@@ -318,3 +318,14 @@ def test_real_wrapper_signal_forwards_and_writes_receipt(config, tmp_path):
     result = json.loads(stdout)
     assert result["reason"] == "wrapper received termination signal"
     assert (Path(config["evidence_dir"]) / "receipt.json").exists()
+
+
+def test_expanded_context_capacity(config):
+    assert runner.DISTRIBUTED_MAX_CONTEXT == runner._common.DISTRIBUTED_MAX_CONTEXT == 65792
+    args = list(config["args"])
+    at = args.index("--context") + 1
+    args[at] = str(runner.DISTRIBUTED_MAX_CONTEXT)
+    assert runner.validated(dict(config, args=args))["options"]["context"] == "65792"
+    args[at] = str(runner.DISTRIBUTED_MAX_CONTEXT + 1)
+    with pytest.raises(runner.RunnerError):
+        runner.validated(dict(config, args=args))

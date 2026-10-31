@@ -64,7 +64,7 @@ remaining acceptance checks open.
 | 4. Native transport | Passed scope | [Window 1 report][transport], mismatch/missing/killed-peer receipts and later `NET/IB` logs; includes unequal padded gathers. |
 | 5. Projection and MoE | Partial | Exact expert gate and short whole-model parity pass after arithmetic fixes; short decode evidence does not qualify GEMM prefill. |
 | 6. GDN, QSA and PLE | Partial | All 48 layers represented in C1 state/trace checks; long continuation and chunk-boundary cases remain open. |
-| 7. Coordinator and C1 | Partial | Windows 4/6/7 exact logits, state, RESET and traces; 8192 is configured capacity, not an 8K-token prompt. 8K and 64K prompt qualification remains open. |
+| 7. Coordinator and C1 | Partial | Windows 4/6/7 exact logits, state, RESET and traces; 8192 is configured capacity, not an 8K-token prompt. The later 8K gate is recorded below; 64K prompt qualification remains open. |
 | 8. Capacity, MTP, graphs, C8 | Partial | Short MTP HTTP and mixed C8 checks, partial graphs and memory snapshots exist; useful extra capacity, full state/failure qualification and full-model graphs remain open. |
 | 9. Server and lifecycle | Partial | OpenAI/Anthropic streaming, tools, cancellation and failure-health artifacts; recorded restoration checks through window 7. No automatic rollout. |
 | 10. Performance decision | Partial | Profiling and resident TP1 control established; matched 4K/16K/64K, 256-output, C1/C4/C8, three paired rounds remain open. |
@@ -103,6 +103,19 @@ CPU records on 31 October: [c8-final-python.log][python] reports **372 passed,
 2 skipped**; [resident-cpu-test.log][ctest] reports **18/18 CTest passed**. These
 are named historical runs, not a claim that all later edits have been retested.
 
+## Later 8K prompt qualification
+
+The frozen zero-error policy was written before the long run. The resident TP1
+reference consumed all 8192 native input IDs and exited 0. TP3 then consumed the
+same 8192 IDs on all three hosts; all three receipts report exit 0. Full-vocabulary
+logits at positions 0 and 8191 and 342 logical state arrays compare with zero
+absolute/relative error. `compare_model.py` reports `qualified: true`,
+`full_model_pass: true` and `state_validation: passed` in
+[the long-run receipt](/home/staticduo/tmp/strata-tp3-20261031/long-context/8192/comparison.json).
+This is an actual 8K prompt check, rather than allocated context alone. It does
+not qualify 64K or the performance matrix. TP3 process wall time was about
+2385 seconds including loading and evidence capture; this is not a decode rate.
+
 ## Failed attempts retained
 
 Early component and whole-model runs failed numerical gates; their original
@@ -117,7 +130,7 @@ the qualifying outputs. These failed attempts are not counted as passes.
 
 ## Not run or not yet qualified
 
-- Full 8K/64K prompt C1 state/logit continuation, long resets and failure recovery.
+- Full 64K prompt C1 state/logit continuation, long resets and failure recovery.
 - A useful additional capacity case and complete per-rank warmup/prefill/decode accounting.
 - MTP acceptance probabilities, rollback/reset and failure state against TP1; sampled distribution checks.
 - Full-model CUDA graphs, long replay/reset/timeout behavior and C4/C8 internal state isolation.

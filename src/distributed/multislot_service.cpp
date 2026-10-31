@@ -1,3 +1,4 @@
+#include "strata/distributed/limits.hpp"
 #include "strata/distributed/multislot_service.hpp"
 
 #include <algorithm>
@@ -32,7 +33,7 @@ Failure message(uint32_t rank, const MultiSlotCallbacks& cb, std::string& bytes)
 Failure run_multislot_service(MultiSlotConfig config, const MultiSlotServiceCallbacks& cb,
                               uint32_t operation_budget_ms) {
     if (config.rank >= kTpWorld || (config.slots != 1 && config.slots != 4 && config.slots != 8) ||
-        config.context < 4 || config.context > 65536 || config.n_vocab <= 0 || operation_budget_ms < 100 ||
+        config.context < 4 || config.context > kDistributedMaxContext || config.n_vocab <= 0 || operation_budget_ms < 100 ||
         !cb.health || !cb.scheduler.broadcast || !cb.scheduler.execute || !cb.scheduler.abort_all ||
         (config.rank == 0 && (!cb.poll || !cb.emit || !cb.scheduler.sample)))
         return Failure::fail(FailureCode::invalid_config, "invalid multislot service configuration");

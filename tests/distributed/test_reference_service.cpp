@@ -1,5 +1,6 @@
 #include "strata/distributed/reference_service.hpp"
 #include "strata/distributed/autoregressive.hpp"
+#include "strata/distributed/limits.hpp"
 
 #include <cstdio>
 #include <deque>
@@ -65,6 +66,21 @@ void state_machine() {
     check(!execute(StepPhase::cancel, "b"), "completed pending row can be safely cancelled");
     check(model.state.empty() && !worker.output_ready(), "cancellation resets actual model and clears output");
     check(bool(execute(StepPhase::prefill, "b", 1)), "cancelled identity cannot be reused");
+}
+void context_capacity() {
+    Model model;
+    ReferenceService supported(16, kDistributedMaxContext, model.hooks());
+    check(!supported.execute(StepPhase::init, {}, -1, 0), "reference accepts expanded context capacity");
+    ReferenceService oversized(16, kDistributedMaxContext + 1, model.hooks());
+    check(bool(oversized.execute(StepPhase::init, {}, -1, 0)) && model.resets == 1,
+          "oversized reference capacity fails before model reset");
+    check(reference_event("ready", {}, -1, kDistributedMaxContext) ==
+          "{\"type\":\"ready\",\"alive_ranks\":[0],\"protocol\":\"strata-reference-v1\",\"mode\":\"autoregressive\",\"world\":1,\"slots\":1,\"max_context\":65792}",
+          "reference publishes expanded capacity with its independent identity");
+    bool threw = false;
+    try { reference_event("ready", {}, -1, kDistributedMaxContext + 1); }
+    catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "oversized reference ready capacity rejected");
 }
 void failed_completion() {
     for (bool deadline : {false, true}) {
@@ -155,7 +171,7 @@ void cancellation() {
 }
 }
 int main() {
-    state_machine(); failed_completion(); coordinator(); cancellation();
+    state_machine(); context_capacity(); failed_completion(); coordinator(); cancellation();
     std::printf("reference_service: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

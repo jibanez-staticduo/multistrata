@@ -1,3 +1,4 @@
+#include "strata/distributed/limits.hpp"
 #include "strata/distributed/speculative.hpp"
 
 #include <algorithm>
@@ -58,7 +59,7 @@ Failure SpeculativeVerifier::verify(const SpeculativeWindow& w, const Speculativ
     // Every error invalidates this coordinator, including malformed decisions and callback exceptions.
     failed_ = true;
     try {
-        if (rank_ >= kTpWorld || n_vocab_ <= 0 || !context_ || context_ > 65536 || !cb.execute ||
+        if (rank_ >= kTpWorld || n_vocab_ <= 0 || !context_ || context_ > kDistributedMaxContext || !cb.execute ||
             !cb.broadcast || (rank_ == 0 && !cb.sample)) return bad("invalid speculative configuration");
         if (w.request_id.empty() || w.request_id.size() > 1024 || !w.window_id || w.window_id <= last_window_ ||
             w.inputs.empty() || w.inputs.size() > 5 || !w.output_budget || w.position >= context_ ||

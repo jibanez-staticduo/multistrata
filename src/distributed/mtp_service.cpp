@@ -1,3 +1,4 @@
+#include "strata/distributed/limits.hpp"
 #include "strata/distributed/mtp_service.hpp"
 
 #include "strata/core/mtp.hpp"
@@ -49,7 +50,7 @@ bool MtpService::initialize(const std::string& runtime, uint32_t drafts, const c
                            const core::NativeHead& head, void* model_stream, std::string& err) {
     auto& p = *impl_;
     if (p.initialized || drafts < 1 || drafts > 4 || !model_stream || state.max_cells < 4 ||
-        state.max_cells > 65536 || geometry.hc_dim() <= 0) { err = "invalid MTP service configuration"; return false; }
+        state.max_cells > kDistributedMaxContext || geometry.hc_dim() <= 0) { err = "invalid MTP service configuration"; return false; }
     p.geometry = &geometry; p.state = &state; p.max_drafts = drafts;
     p.model_stream = static_cast<cudaStream_t>(model_stream);
     p.row_bytes = size_t(geometry.hc_dim()) * sizeof(float);

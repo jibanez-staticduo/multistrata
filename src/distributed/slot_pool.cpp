@@ -1,3 +1,4 @@
+#include "strata/distributed/limits.hpp"
 #include "strata/distributed/slot_pool.hpp"
 
 #include "strata/core/native_head.hpp"
@@ -142,7 +143,7 @@ Failure SlotPool::initialize() {
     auto& p = *impl_;
     if (p.initialized || p.failed) return bad("slot pool cannot initialize twice or after failure");
     const auto& c = p.config;
-    if ((c.slots != 1 && c.slots != 4 && c.slots != 8) || c.context < 4 || c.context > 65536 ||
+    if ((c.slots != 1 && c.slots != 4 && c.slots != 8) || c.context < 4 || c.context > kDistributedMaxContext ||
         c.timeout_ms < 100 || c.timeout_ms > 600000 || c.session_uuid.empty() || c.model_hash.empty() ||
         c.rank >= kTpWorld || !p.resources.stream || !p.resources.head.loaded() ||
         p.resources.collectives.sequence() != 1 || core::qsa_kv_resident() != 0 || core::qsa_kv_elastic() ||

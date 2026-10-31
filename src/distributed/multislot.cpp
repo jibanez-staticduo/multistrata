@@ -1,3 +1,4 @@
+#include "strata/distributed/limits.hpp"
 #include "strata/distributed/multislot.hpp"
 
 #include <algorithm>
@@ -14,7 +15,7 @@ Failure invalid(std::string_view reason) { return Failure::fail(FailureCode::bad
 MultiSlotScheduler::MultiSlotScheduler(MultiSlotConfig config, MultiSlotCallbacks callbacks)
     : config_(config), callbacks_(std::move(callbacks)) {
     if (config.rank > 2 || !config.slots || config.slots > kMultiSlotMaximum ||
-        config.n_vocab <= 0 || !config.context || config.context > 65536 ||
+        config.n_vocab <= 0 || !config.context || config.context > kDistributedMaxContext ||
         !config.request_limit || !callbacks_.broadcast || !callbacks_.execute ||
         !callbacks_.abort_all || (config.rank == 0 && !callbacks_.sample))
         throw std::invalid_argument("invalid multislot configuration or callbacks");

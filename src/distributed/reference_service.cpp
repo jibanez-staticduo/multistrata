@@ -1,3 +1,4 @@
+#include "strata/distributed/limits.hpp"
 #include "strata/distributed/reference_service.hpp"
 
 #include <algorithm>
@@ -26,7 +27,7 @@ Failure ReferenceService::execute(StepPhase phase, std::string_view request, int
         return {};
     };
     if (phase == StepPhase::init) {
-        if (initialized_ || vocabulary_ <= 0 || context_ < 4 || context_ > 65536 ||
+        if (initialized_ || vocabulary_ <= 0 || context_ < 4 || context_ > kDistributedMaxContext ||
             !execution_.reset || !execution_.forward || !request.empty() || token != -1 || position)
             return bad("invalid reference initialization");
         if (auto f = reset()) return f;
@@ -69,7 +70,7 @@ std::string reference_event(std::string_view type, std::string_view request_id, 
         throw std::invalid_argument("unknown reference event");
     std::string out = "{\"type\":\"" + std::string(type) + "\",\"alive_ranks\":[0]";
     if (type == "ready") {
-        if (context < 4 || context > 65536) throw std::invalid_argument("invalid reference context");
+        if (context < 4 || context > kDistributedMaxContext) throw std::invalid_argument("invalid reference context");
         out += ",\"protocol\":\"strata-reference-v1\",\"mode\":\"autoregressive\",\"world\":1,\"slots\":1,\"max_context\":" + std::to_string(context);
     } else if (type == "health") {
         if (state != "ready" && state != "busy") throw std::invalid_argument("invalid reference health state");
@@ -321,7 +322,7 @@ void prepare_reference_service(uint32_t timeout_ms) {
 
 Failure run_reference_service(MonolithicReference& model, int32_t vocabulary, uint32_t context,
                               float* device_logits, void* stream, uint32_t timeout_ms) {
-    if (!output || !stream || !device_logits || vocabulary <= 0 || context < 4 || context > 65536 ||
+    if (!output || !stream || !device_logits || vocabulary <= 0 || context < 4 || context > kDistributedMaxContext ||
         timeout_ms < 100 || timeout_ms > 600000)
         return Failure::fail(FailureCode::invalid_config, "invalid native reference service configuration");
     JsonInput input;

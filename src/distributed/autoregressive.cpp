@@ -1,3 +1,4 @@
+#include "strata/distributed/limits.hpp"
 #include "strata/distributed/autoregressive.hpp"
 
 #include <algorithm>
@@ -34,7 +35,7 @@ Failure message(uint32_t rank, const AutoregressiveCallbacks& cb, std::string& b
 
 Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
                            const AutoregressiveCallbacks& cb, uint32_t operation_budget_ms) {
-    if (rank >= kTpWorld || n_vocab <= 0 || context < 4 || context > 65536 ||
+    if (rank >= kTpWorld || n_vocab <= 0 || context < 4 || context > kDistributedMaxContext ||
         operation_budget_ms < 100 ||
         !cb.broadcast || !cb.health || !cb.execute || (rank == 0 && (!cb.poll || !cb.sample || !cb.emit)))
         return Failure::fail(FailureCode::invalid_config, "invalid autoregressive callbacks or geometry");

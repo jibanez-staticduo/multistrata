@@ -1,3 +1,4 @@
+#include "strata/distributed/limits.hpp"
 // Independent, uncaptured C1 teacher-forcing oracle. No distributed model kernels.
 #include "strata/distributed/reference.hpp"
 #include "strata/distributed/reference_service.hpp"
@@ -141,7 +142,7 @@ int main(int argc, char** argv) {
         if (autoregressive) {
             require(residency == ExpertResidency::AllResident,
                     "autoregressive reference requires --expert-residency all");
-            require(context <= 65536, "autoregressive reference context must not exceed 65536");
+            require(context <= kDistributedMaxContext, "autoregressive reference context must not exceed " + std::to_string(kDistributedMaxContext));
             for (const char* key : {"logits-dir", "logits-positions", "state-dir", "state-positions",
                                     "state-max-bytes", "trace-dir", "timing-file"})
                 require(!args.contains(key), std::string("autoregressive reference does not support --") + key);

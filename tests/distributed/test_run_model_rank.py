@@ -74,7 +74,7 @@ def test_explicit_batched_polling_policy_and_64k_bounds(config):
     args += ["--expert-collectives", "batched", "--poll-interval-ms", "0"]
     options = runner.validated(dict(config, args=args))["options"]
     assert options["context"] == "65536" and options["poll-interval-ms"] == "0"
-    for flag, value in (("--context", "65537"), ("--poll-interval-ms", "1001"),
+    for flag, value in (("--context", "65793"), ("--poll-interval-ms", "1001"),
                         ("--expert-collectives", "unknown")):
         wrong = list(args)
         wrong[wrong.index(flag) + 1] = value
@@ -207,3 +207,12 @@ def test_trace_directory_is_optional_and_must_be_fresh(config, tmp_path, monkeyp
     monkeypatch.setattr(runner.subprocess, "Popen", lambda *_a, **_k: pytest.fail("launched"))
     with pytest.raises(runner.RunnerError, match="trace-dir must be fresh"):
         runner.run(traced, tmp_path / "evidence", True)
+
+
+def test_context_capacity_matches_native_header(config):
+    header = Path(__file__).parents[2] / "include/strata/distributed/limits.hpp"
+    assert f"kDistributedMaxContext = {runner.DISTRIBUTED_MAX_CONTEXT};" in header.read_text()
+    assert runner.DISTRIBUTED_MAX_CONTEXT == 65536 + 256
+    args = list(config["args"])
+    args[args.index("--context") + 1] = str(runner.DISTRIBUTED_MAX_CONTEXT)
+    assert runner.validated(dict(config, args=args))["options"]["context"] == "65792"
