@@ -194,6 +194,13 @@ receipts use the unchanged zero-error policy. These are short greedy cases;
 they do not establish long MTP correctness or the sampled distribution.
 A client disconnect in the MTP case leaves all three ranks ready when checked.
 
+A separately configured C4 pool completes four mixed requests. Replaying their
+canonical consumed IDs through TP1 matches 684 logical state arrays and four
+full-vocabulary final logit rows with zero error. [The C4 state receipt][c4state]
+qualifies this short state-isolation case. A second four-request run cancels one
+client while the other three finish and all workers return ready. It does not
+qualify 64K/C4 or C8.
+
 ## Failed attempts retained
 
 Early component and whole-model runs failed numerical gates; their original
@@ -258,3 +265,5 @@ files with this report when sharing it; the links are not public downloads.
 
 [plainstate]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/plain-check/result/comparison.json
 [mtpstate]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/mtp-check/result/comparison.json
+
+[c4state]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/c4-check/result/comparison.json
