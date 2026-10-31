@@ -47,6 +47,10 @@ Each host needs the existing image, `/experiment/run_transport_smoke.py`, the
 compiled smoke binary selected by its config, and the read-only NCCL library
 mount in `smoke.yaml`. Stage the experiment at the same host path on all nodes.
 The recipe disables model downloads and image distribution.
+The recipe pins `/usr/bin/python3`, confirmed in the experiment image. A dry
+run does not check executables inside that image. If changing the image, check
+the interpreter before launch and override `-o python=/absolute/interpreter`
+when needed. The runtime's fallback for recipes without that setting is `python3`.
 
 Create `smoke-config/rank0.json`, `rank1.json`, and `rank2.json` with matching
 session UUID, model/config/build/library identities, `world: 3`, and rank 0, 1

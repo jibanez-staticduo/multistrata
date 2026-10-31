@@ -12,6 +12,7 @@ defaults:
   data_parallel: 1
   expert_parallel: 1
   mode: smoke
+  python: /usr/bin/python3
   init_port: 30123
   port: 30124
   smoke_runner: /experiment/run_transport_smoke.py

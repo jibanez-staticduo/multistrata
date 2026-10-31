@@ -28,6 +28,13 @@ def recipe():
     return Recipe(yaml.safe_load((PACKAGE / "smoke.yaml").read_text()))
 
 
+def test_recipe_pins_image_python_and_runtime_falls_back_to_python3(recipe):
+    assert recipe.defaults.get("python") == "/usr/bin/python3"
+    minimal = Recipe({"model": "strata-transport-smoke", "defaults": {"tensor_parallel": 3}})
+    command = StrataNativeRuntime().generate_node_command(minimal, {}, "unused", 3, 0)
+    assert shlex.split(command)[0] == "python3"
+
+
 def test_three_rank_commands_and_no_early_probe(recipe):
     runtime = StrataNativeRuntime()
     assert type(runtime).__bases__ == (RuntimePlugin,)
@@ -40,7 +47,7 @@ def test_three_rank_commands_and_no_early_probe(recipe):
     assert runtime.validate_recipe(recipe) == []
     for rank in range(3):
         parts = shlex.split(runtime.generate_node_command(recipe, {}, "10.71.14.15", 3, rank))
-        assert parts == ["python", "/experiment/run_transport_smoke.py", "--config",
+        assert parts == ["/usr/bin/python3", "/experiment/run_transport_smoke.py", "--config",
                          f"/experiment/smoke-config/rank{rank}.json", "--evidence-dir",
                          f"/experiment/smoke-evidence/rank{rank}", "--execute"]
         assert not any("credential" in part or "vllm" in part for part in parts)

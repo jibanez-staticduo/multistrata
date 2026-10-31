@@ -75,7 +75,7 @@ class StrataNativeRuntime(RuntimePlugin):
         if mode == "smoke":
             config_dir = str(config.get("config_dir", "/experiment/smoke-config")).rstrip("/")
             evidence_dir = str(config.get("evidence_dir", "/experiment/smoke-evidence")).rstrip("/")
-            parts = [str(config.get("python", "python")),
+            parts = [str(config.get("python", "python3")),
                      str(config.get("smoke_runner", "/experiment/run_transport_smoke.py")),
                      "--config", f"{config_dir}/rank{node_rank}.json",
                      "--evidence-dir", f"{evidence_dir}/rank{node_rank}", "--execute"]
