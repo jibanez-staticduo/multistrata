@@ -756,6 +756,50 @@ def test_a_plan_locked_to_another_inventory_is_refused(source: Source, tmp_path:
         ptp.prepare_tp_pack(source.write_inventory(), plan, tmp_path / "pack")
 
 
+@pytest.mark.parametrize("lock", [None, {}, {"inventory_hash": ""}])
+def test_missing_inventory_lock_is_refused(source: Source, tmp_path: Path, lock):
+    plan = base_plan(source)
+    plan["source_lock"] = lock
+    with pytest.raises(ptp.SourceError, match="inventory_hash"):
+        ptp.prepare_tp_pack(source.write_inventory(), plan, tmp_path / "pack")
+
+
+
+def test_raw_inventory_fingerprint_is_checked(source: Source, tmp_path: Path):
+    path = source.write_inventory()
+    digest = 0xcbf29ce484222325
+    for byte in path.read_bytes():
+        digest = ((digest ^ byte) * 0x100000001b3) & ((1 << 64) - 1)
+    plan = base_plan(source)
+    plan["source_lock"]["inventory_hash"] = f"fnv1a64-raw:{digest:016x}"
+    ptp.prepare_tp_pack(path, plan, tmp_path / "pack")
+    path.write_bytes(path.read_bytes() + b" ")
+    with pytest.raises(ptp.SourceError):
+        ptp.prepare_tp_pack(path, plan, tmp_path / "mismatch")
+
+
+def test_noncontiguous_head_runs_keep_plan_order_and_original_stride(source: Source, tmp_path: Path):
+    plan = base_plan(source)
+    plan["source_lock"]["inventory_hash"] = ptp.inventory_hash(source.inventory())
+    plan["slices"] = [s for s in plan["slices"] if not (s["tensor"] == GATE_UP and s.get("rank") == 0)]
+    runs = []
+    for start in (0, 16, 32):
+        entry = _slice(GATE_UP, 0, 1, start, start + 6, "gate_up", source, scale_ref=None)
+        entry.update(part="gdn_v", head_range=[start, start + 6], compute_policy="owned_partial")
+        runs.append(entry)
+    plan["slices"].extend(runs)
+    manifest = ptp.prepare_tp_pack(source.write_inventory(), plan, tmp_path / "pack", materialize=True)
+    placed = [s for s in manifest["segments"] if s["tensor"] == GATE_UP and s["rank"] == 0]
+    assert len(placed) == 3
+    stride = source.row_bytes(GATE_UP)
+    blob = (tmp_path / "pack" / "ranks" / "rank0.bin").read_bytes()
+    original = source.files["layer7_gate_up.bin"]
+    for segment, start in zip(placed, (0, 16, 32)):
+        offset = segment["dest_offset"]
+        assert blob[offset:offset + 6 * stride] == original[start * stride:(start + 6) * stride]
+    assert [s["head_range"] for s in manifest["compute_ownership"]
+            if s["tensor"] == GATE_UP and s.get("rank") == 0] == [[0, 6], [16, 22], [32, 38]]
+
 def test_a_plan_locked_with_the_inventory_writer_hash_is_accepted(source: Source, tmp_path: Path):
     """Task 1 hashes an inventory with default separators; that lock must not be a false refusal."""
     plan = base_plan(source)
@@ -897,6 +941,7 @@ def test_verification_of_another_inventory_is_a_mismatch(source: Source, tmp_pat
     other.write_text(json.dumps(moved))
     plan = _plan(source)
     plan["source_lock"]["inventory_hash"] = ptp.inventory_hash(moved)
+    plan["source_lock"]["revision"] = "rev-0002"
     # same bytes on disk, a different pinned revision: the pack must say it is not this source
     ptp.prepare_tp_pack(other, plan, tmp_path / "pack2", materialize=True)
     assert ptp.verify_tp_pack(inventory_path, out).ok

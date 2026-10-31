@@ -144,6 +144,7 @@ ModelInventory fixture() {
         act("expert_down", "Q8_0", 32, "local"),
         act("attn_output", "Q8_K", 256, "local"),
         act("gate_up", "Q8_K", 256, "global"),
+        act("ssm_out", "Q8_K", 256, "global"),
         act("norm", "none", 1, "global"),
         act("embed", "none", 1, "local"),
         act("ple", "none", 1, "local"),
@@ -247,6 +248,19 @@ void test_world3_layout() {
     check_ok(validate_plan(p), "the world 3 plan");
     check_coverage(p, "world 3");
     check_blocks_whole(p, "no world 3 slice splits a weight block");
+    check(p.memory.qualification == "unqualified_lower_bound", "memory estimate does not qualify capacity");
+    // Independent oracle: the monolithic recurrence selects key = global_value % 16.
+    for (int rank = 0; rank < 3; ++rank) {
+        std::vector<int64_t> actual, expected;
+        for (const auto& s : p.slices)
+            if (s.tensor == "blk.0.attn_qkv.weight" && s.part == "gdn_v" && s.rank == rank)
+                for (int64_t h = s.head_start; h < s.head_end; ++h) actual.push_back(h);
+        const int64_t start = rank == 0 ? 0 : rank == 1 ? 6 : 11;
+        const int64_t end = rank == 0 ? 6 : rank == 1 ? 11 : 16;
+        for (int64_t h = 0; h < 48; ++h)
+            if (h % 16 >= start && h % 16 < end) expected.push_back(h);
+        check(actual == expected, "GDN values follow the monolithic modulo-16 key map");
+    }
 
     // The FFN: 640 columns, the largest block along the cut axis is 64, so 256/192/192 at 0/256/448.
     const int64_t ffn_starts[3] = {0, 256, 448};
@@ -277,7 +291,7 @@ void test_world3_layout() {
     // Packed GDN attn_qkv is [q | k | v]: each rank keeps whole key heads and their value heads.
     const int64_t q_starts[3] = {0, 768, 1408}, q_ends[3] = {768, 1408, 2048};
     const int64_t k_starts[3] = {2048, 2816, 3456}, k_ends[3] = {2816, 3456, 4096};
-    const int64_t v_starts[3] = {4096, 6400, 8320}, v_ends[3] = {6400, 8320, 10240};
+    const int64_t v_starts[3] = {4096, 4864, 5504}, v_ends[3] = {4864, 5504, 6144};
     for (int r = 0; r < 3; ++r) {
         const std::string rk = " rank" + std::to_string(r);
         const TensorSlice* q = slice_at(p, "blk.0.attn_qkv.weight", "gdn_q", r);
@@ -289,29 +303,30 @@ void test_world3_layout() {
               "attn_qkv" + rk + " owns the k columns of its key heads");
         check(v && v->range_start == v_starts[r] && v->range_end == v_ends[r],
               "attn_qkv" + rk + " owns the value heads of exactly its own keys");
-        check(q && k && v && (v->head_end - v->head_start) == 3 * (k->head_end - k->head_start),
-              "attn_qkv" + rk + " keeps three values for every key it holds");
+        check(q && k && v && (v->head_end - v->head_start) == (k->head_end - k->head_start),
+              "attn_qkv" + rk + " keeps one value run of exactly its key count");
     }
 
     // The value side: attn_gate is cut on the output axis, so no block is ever touched.
-    const int64_t val_starts[3] = {0, 2304, 4224}, val_ends[3] = {2304, 4224, 6144};
+    const int64_t val_starts[3] = {0, 768, 1408}, val_ends[3] = {768, 1408, 2048};
     for (int r = 0; r < 3; ++r) {
         const TensorSlice* g = slice_at(p, "blk.0.attn_gate.weight", "value_out", r);
         check(g && g->axis == 1 && g->range_start == val_starts[r] && g->range_end == val_ends[r],
               "attn_gate rank" + std::to_string(r) + " owns value heads [" + std::to_string(val_starts[r]) +
                   "," + std::to_string(val_ends[r]) + ") on the output axis");
     }
-    // ssm_out reads its 6144 inputs along the block axis: 4224 splits a 256 block, so every rank reads it
+    // ssm_out reads its 6144 inputs along the block axis: 1408 splits a 256 block, so every rank reads it
     // whole and says so.  That is the reference path, not a requantization.
     auto ssm = slices_of(p, "blk.0.ssm_out.weight");
     check_eq((int64_t)ssm.size(), (int64_t)3, "ssm_out is owned whole by all three ranks");
     bool ssm_whole = true;
     for (const auto* s : ssm)
-        if (!s->replicated || s->range_end != 6144) ssm_whole = false;
+        if (!s->replicated || s->range_end != 6144 || s->compute_policy != "rank0_full_others_zero")
+            ssm_whole = false;
     check(ssm_whole, "ssm_out falls back to whole-rank reads instead of requantizing");
     check_has(p.notes, "blk.0.ssm_out.weight", "ssm_out's fallback is recorded in the plan notes");
     check_has(p.notes, "splits a 256 block", "the note names the block that would be split");
-    check_has(p.notes, "4224", "the note names the offset where it would be split");
+    check_has(p.notes, "1408", "the note names the offset where it would be split");
 
     // QSA attn_q: whole query heads, each keeping its gate half, with the global 24Q/2KV map.
     const int64_t qa_starts[3] = {0, 4096, 8192}, qa_ends[3] = {4096, 8192, 12288};
@@ -368,12 +383,12 @@ void test_world2_control() {
     const TensorSlice* k0 = slice_at(p, "blk.0.attn_qkv.weight", "gdn_k", 0);
     const TensorSlice* v0 = slice_at(p, "blk.0.attn_qkv.weight", "gdn_v", 0);
     check(k0 && k0->head_start == 0 && k0->head_end == 8, "world 2 gives rank 0 eight of sixteen key heads");
-    check(v0 && v0->head_start == 0 && v0->head_end == 24, "and the twenty-four values those keys own");
-    // With two ranks the value cut lands at 3072, which a 256 block divides: ssm_out is not replicated here.
+    check(v0 && v0->head_start == 0 && v0->head_end == 8, "and the first eight-value run those keys own");
+    // With two ranks each value run cuts at 1024, which a 256 block divides.
     const TensorSlice* out0 = slice_at(p, "blk.0.ssm_out.weight", "value_out", 0);
     const TensorSlice* out1 = slice_at(p, "blk.0.ssm_out.weight", "value_out", 1);
-    check(out0 && out0->range_end == 3072 && out1 && out1->range_start == 3072,
-          "world 2 cuts ssm_out at 3072, inside no 256 block, so it is sharded, not replicated");
+    check(out0 && out0->range_end == 1024 && out1 && out1->range_start == 1024,
+          "world 2 cuts the first ssm_out run at 1024, inside no 256 block, so it is sharded, not replicated");
     check(out0 && out0->cut_unit == 128, "ssm_out is still cut at whole value heads");
     const TensorSlice* q0 = slice_at(p, "blk.3.attn_q.weight", "qsa_head", 0);
     const TensorSlice* q1 = slice_at(p, "blk.3.attn_q.weight", "qsa_head", 1);
@@ -410,12 +425,12 @@ void test_ffn_block_reject() {
         if (t.name == "blk.0.ffn_down_exps.weight") t.block_size = 96;
     ShardPlan p = make_tp_plan(inv, 3);
     check_eq(p.world, 0, "the plan is rejected");
-    check_has(p.reject_reasons, "is cut at offset 288", "the reason names the offset that splits a block");
+    check_has(p.reject_reasons, "is cut at offset 640", "the reason names the offset that splits a block");
     check_has(p.reject_reasons, "requantizing to fit is not allowed", "the reason says requantizing is out");
-    check_has(p.reject_reasons, "block size 64", "the reason names the block size being broken");
+    check_has(p.reject_reasons, "block size 96", "the reason names the block size being broken");
     ValidationResult v = validate_plan(p);
     check(!v.ok, "the rejected plan does not validate");
-    check_has(v.errors, "blk.1.ffn_down_exps.weight", "and names the tensor that cannot be cut");
+    check_has(v.errors, "blk.0.ffn_down_exps.weight", "and names the tensor that cannot be cut");
 }
 
 void test_validator_block_gap() {
@@ -544,7 +559,50 @@ void test_key_keeps_its_values() {
     check(!v.ok, "a value group that is not its key's is not valid");
     check_has(v.errors, "values per key", "the message names the values-per-key rule");
     check_has(v.errors, "rank 1", "the message names the rank");
-    check_has(v.errors, "expected [18,33)", "and the range rank 1 should have held");
+    check_has(v.errors, "expected [6,11)", "and the range rank 1 should have held");
+}
+
+void test_gdn_state_and_projection_order() {
+    begin("GDN conv and per-value parameters use the same compact head order");
+    auto inv = fixture();
+    inv.tensors.push_back(mk("blk.0.ssm_conv1d.weight", "F32", {4, 10240}, 1, "", 163840, "gdn_key"));
+    inv.tensors.push_back(mk("blk.0.ssm_alpha.weight", "BF16", {2560, 48}, 1, "", 245760, "gdn_value"));
+    inv.tensors.push_back(mk("blk.0.ssm_dt.bias", "F32", {48}, 1, "", 192, "gdn_value"));
+    auto p = make_tp_plan(inv, 3);
+    check_ok(validate_plan(p), "GDN state-aware fixture");
+    for (int rank = 0; rank < 3; ++rank) {
+        std::vector<int64_t> expected;
+        for (int64_t h = 0; h < 48; ++h)
+            if ((rank == 0 && h % 16 < 6) || (rank == 1 && h % 16 >= 6 && h % 16 < 11) ||
+                (rank == 2 && h % 16 >= 11)) expected.push_back(h);
+        for (const auto& name : {"blk.0.ssm_conv1d.weight", "blk.0.attn_gate.weight",
+                                 "blk.0.ssm_alpha.weight", "blk.0.ssm_dt.bias"}) {
+            std::vector<int64_t> actual;
+            for (const auto& s : p.slices)
+                if (s.tensor == name && s.rank == rank && (s.part == "gdn_v" || s.part == "value_out"))
+                    for (int64_t h = s.head_start; h < s.head_end; ++h) actual.push_back(h);
+            check(actual == expected, std::string(name) + " follows global value modulo key mapping");
+        }
+    }
+    const auto* output = contract_at(p, "ssm_out");
+    check(output && output->gather == "all_gather_padded" &&
+          output->layout == "gdn_value_runs_scatter_global" &&
+          output->valid_counts == std::vector<int64_t>{2304, 1920, 1920},
+          "ssm_out gathers compact runs and scatters them into global input order");
+    p.activation.erase(std::remove_if(p.activation.begin(), p.activation.end(),
+        [](const auto& c) { return c.consumer == "ssm_out"; }), p.activation.end());
+    p.plan_hash = strata::distributed::detail::hex64(strata::distributed::detail::fnv1a64(
+        strata::distributed::plan_canonical_body(p)));
+    check(!validate_plan(p).ok, "a rehashed plan missing ssm_out gather is rejected");
+    p = make_tp_plan(inv, 3);
+    for (auto& c : p.activation) if (c.consumer == "ssm_out") {
+        c.gather = "none";
+        c.layout = "contiguous";
+        c.reference = "local";
+    }
+    p.plan_hash = strata::distributed::detail::hex64(strata::distributed::detail::fnv1a64(
+        strata::distributed::plan_canonical_body(p)));
+    check(!validate_plan(p).ok, "a rehashed ssm_out contract with local input order is rejected");
 }
 
 void test_local_quantizer_that_crosses_is_routed() {
@@ -815,7 +873,7 @@ void test_valid_lanes_are_one_count_per_rank() {
     ShardPlan p = make_tp_plan(inv, 3);
     for (auto& s : p.slices) {
         if (s.tensor != "blk.0.attn_qkv.weight" || s.part != "gdn_v" || s.rank != 0) continue;
-        s.valid_lanes[0] = 2000;                       // not a whole number of 128-item cut units
+        s.valid_lanes[0] = 700;                       // not a whole number of 128-item cut units
     }
     ValidationResult v = validate_plan(p);
     check(!v.ok, "a partial count that is not whole cut units is refused");
@@ -1127,7 +1185,8 @@ int run_inventory(const std::string& path, int world, const std::string& out, in
         std::cout << "rank " << r << " total " << p.memory.per_rank_total[r] << " B ("
                   << gib(p.memory.per_rank_total[r]) << " GiB)\n";
     std::cout << "gate: " << p.memory.gate_limit_bytes << " B (" << gib(p.memory.gate_limit_bytes)
-              << " GiB) -> " << (v.ok ? "PASS" : "FAIL") << "\n";
+              << " GiB) lower-bound check -> " << (v.ok ? "fits estimate" : "FAIL") << "\n";
+    std::cout << "capacity 8K/64K/C8: UNKNOWN (unqualified lower bound)\n";
     int64_t halo_slices = 0, replicated = 0;
     for (const auto& s : p.slices) {
         if (!s.halo.empty()) ++halo_slices;
@@ -1171,6 +1230,7 @@ void run_fixture_suite() {
     test_scale_tensors_are_named_by_their_tensors();
     test_gqa_map_is_global();
     test_key_keeps_its_values();
+    test_gdn_state_and_projection_order();
     test_local_quantizer_that_crosses_is_routed();
     test_halo_bytes_are_the_real_ones();
     test_memory_numbers();

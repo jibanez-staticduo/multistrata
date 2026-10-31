@@ -16,7 +16,7 @@
 // Cuts are derived from the inventory's own geometry, never assumed.  With the Flash-Next numbers they come
 // out as the agreed layout: gate/up output columns 256/192/192 (starts 0/256/448), down input columns the
 // same (block-aligned), packed GDN attn_qkv [q|k|v] split at the head boundaries the geometry gives (key
-// 6/5/5 starts 0/6/11, value 18/15/15 starts 0/18/33 - each key keeps its three values), the GDN z-gate
+// 6/5/5 starts 0/6/11; values are three runs offset by 0/16/32, following value_head % key_heads), the GDN z-gate
 // and ssm_out on the value heads, attn_q in whole query heads (q and its gate stay together), QSA
 // attn_output at the query boundaries, QSA KV and indexer replicated, router/norm/HC/PLE/embedding/head
 // replicated.  A tensor whose block layout forbids the cut is read whole by every rank, with a note: that
@@ -24,7 +24,7 @@
 // Other worlds are rejected, not promised.
 //
 // The per-rank budget names its parts (FFN owned per rank, replicated PLE, vocabulary, state, halos and
-// global buffers) and checks a memory gate: a rank that needs more than the limit fails validation with
+// global buffers) and checks a lower bound: a rank that needs more than the limit fails validation with
 // the concrete numbers, which is the design's cue for PLE/embedding row ownership.
 //
 // CPU-only, header-only, ASCII.  Nothing here touches CUDA or NCCL.
@@ -125,6 +125,7 @@ struct InventoryActivation {
     int64_t block_size = 0;                 // activation block width
     std::string scope = "global";           // "global" | "local"
     std::string notes;
+    std::string backend_policy = "cpu_reference";
 };
 
 struct InventoryVerdict {
@@ -190,6 +191,7 @@ struct TensorSlice {
                                             // activation blocks; empty when none are needed
     std::vector<int64_t> gqa_map;           // "qsa_head": local query head -> GLOBAL kv head (the 24Q/2KV map)
     bool replicated = false;
+    std::string compute_policy = "owned_partial"; // replicated weights alone do not define output ownership
 };
 
 /// Where an activation's norm/transform/quantizer runs and how tensors move to get there.
@@ -202,6 +204,8 @@ struct ActivationContract {
     int64_t block_size = 0;
     bool crosses_rank_boundary = false;     // a quantizer block straddles a rank cut of its vector
     std::string reference;                  // "global_reference" | "local"
+    std::string backend_policy = "cpu_reference";
+    std::string layout = "contiguous";       // GDN compact value runs require scatter back to global order
 };
 
 /// Per-rank memory, unified memory counted once.  `per_rank_total[r]` must equal the shared components
@@ -213,6 +217,7 @@ struct MemoryBudget {
     std::vector<int64_t> per_rank_total;              // owned + shared, per rank
     int64_t halo_and_global_buffers = 0;              // halo + gather buffers + communication workspace
     int64_t gate_limit_bytes = 0;                     // the memory gate the budget must fit
+    std::string qualification = "unqualified_lower_bound"; // no context, concurrency, pools or warmup measurement
 };
 
 /// The nominal usable budget of one 128 GB Spark, the design's memory gate.  Override on the CLI.
@@ -479,6 +484,7 @@ inline bool parse_inventory_json(const std::string& text, ModelInventory& inv, s
     inv.source.kind = str_at(*src, "kind");
     inv.source.repo = str_at(*src, "repo");
     inv.source.revision = str_at(*src, "revision");
+    inv.inventory_hash = "fnv1a64-raw:" + detail::hex64(detail::fnv1a64(text));
 
     const JVal* geom = root.at("geometry");
     if (!geom || geom->k != JVal::K::Obj) return missing("geometry");
@@ -566,6 +572,7 @@ inline bool parse_inventory_json(const std::string& text, ModelInventory& inv, s
             if (bs && bs->k == JVal::K::Num) a.block_size = (int64_t)bs->num;
             a.scope = v.has("scope") ? str_at(v, "scope") : std::string("global");
             a.notes = str_at(v, "notes");
+            if (v.has("backend_policy")) a.backend_policy = str_at(v, "backend_policy");
             inv.activation_contracts.push_back(std::move(a));
         }
     }
@@ -636,7 +643,6 @@ struct CutSection {
 /// ssm_conv_channels on the output side = the packed GDN [q|k|v]; qsa_q = whole query heads.
 inline bool decide_cut(const InventoryTensor& t, const core::ModelGeometry& g, int world,
                        const std::vector<std::pair<int64_t, int64_t>>& key_rng,
-                       const std::vector<std::pair<int64_t, int64_t>>& value_rng,
                        const std::vector<std::pair<int64_t, int64_t>>& qsa_rng,
                        const std::vector<std::pair<int64_t, int64_t>>& ffn_rng,
                        std::vector<CutSection>& secs) {
@@ -670,15 +676,32 @@ inline bool decide_cut(const InventoryTensor& t, const core::ModelGeometry& g, i
         secs.push_back(sec(0, "qsa_out", g.head_dim, 0, qsa_rng));
         return true;
     }
+    // Values repeat the key-head sequence, not each key individually. Concatenating these
+    // runs keeps local_value % local_key_count equal to the original global mapping.
+    auto value_sections = [&](int axis, const std::string& part, int64_t unit, int64_t base) {
+        for (int64_t repeat = 0; repeat < g.ssm_v_heads / g.ssm_k_heads; ++repeat) {
+            auto ranges = key_rng;
+            for (auto& range : ranges) {
+                range.first += repeat * g.ssm_k_heads;
+                range.second += repeat * g.ssm_k_heads;
+            }
+            secs.push_back(sec(axis, part, unit, base, std::move(ranges)));
+        }
+    };
+    // Per-value alpha/beta projections and scalar decay/dt vectors use the same order.
+    if (t.family == TensorFamily::GdnValue && t.shape[last] == g.ssm_v_heads) {
+        value_sections((int)last, "value_out", 1, 0);
+        return true;
+    }
     // GDN ssm_out: reads the value heads sliced; the block rule applies.
     if (t.family == TensorFamily::GdnValue && ndim >= 1 && t.shape[0] == g.ssm_value_dim) {
-        secs.push_back(sec(0, "value_out", g.ssm_state_size, 0, value_rng));
+        value_sections(0, "value_out", g.ssm_state_size, 0);
         return true;
     }
     // GDN value projection (z-gate style): the value heads on the output side, blocks stay intact.
     if (t.family == TensorFamily::GdnValue && ndim >= 2 && t.shape[last] == g.ssm_value_dim &&
         t.shape[0] != g.ssm_value_dim) {
-        secs.push_back(sec((int)last, "value_out", g.ssm_state_size, 0, value_rng));
+        value_sections((int)last, "value_out", g.ssm_state_size, 0);
         return true;
     }
     // Packed GDN in_proj [q | k | v] on the output side: split at the head boundaries the geometry gives.
@@ -686,7 +709,7 @@ inline bool decide_cut(const InventoryTensor& t, const core::ModelGeometry& g, i
         if (g.ssm_conv_channels == 2 * k_total + g.ssm_value_dim) {
             secs.push_back(sec((int)last, "gdn_q", g.ssm_state_size, 0, key_rng));
             secs.push_back(sec((int)last, "gdn_k", g.ssm_state_size, k_total, key_rng));
-            secs.push_back(sec((int)last, "gdn_v", g.ssm_state_size, 2 * k_total, value_rng));
+            value_sections((int)last, "gdn_v", g.ssm_state_size, 2 * k_total);
             return true;
         }
         return false;                       // packed layout not derivable from the geometry: do not guess
@@ -759,10 +782,6 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
                                    : std::vector<std::pair<int64_t, int64_t>>{{0, g.ssm_k_heads}};
     const auto qsa_rng = world > 1 ? head_ranges(g.n_head, world)
                                    : std::vector<std::pair<int64_t, int64_t>>{{0, g.n_head}};
-    const int64_t per_key = g.ssm_k_heads > 0 ? g.ssm_v_heads / g.ssm_k_heads : 1;
-    std::vector<std::pair<int64_t, int64_t>> value_rng((size_t)world);
-    for (int r = 0; r < world; ++r)
-        value_rng[(size_t)r] = {key_rng[(size_t)r].first * per_key, key_rng[(size_t)r].second * per_key};
     const auto ffn_rng = world > 1 ? block_snap_ranges(g.n_ff, world, ffn_block)
                                    : std::vector<std::pair<int64_t, int64_t>>{{0, g.n_ff}};
 
@@ -785,7 +804,7 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
             return plan;
         }
         std::vector<detail::CutSection> secs;
-        bool cut_ok = decide_cut(t, g, world, key_rng, value_rng, qsa_rng, ffn_rng, secs);
+        bool cut_ok = decide_cut(t, g, world, key_rng, qsa_rng, ffn_rng, secs);
         // A cut on the block axis (axis 0) must land on block boundaries for every rank.  The FFN is the
         // agreed contract: a violation rejects the plan.  A violation elsewhere is the design's cue to
         // read the tensor whole on every rank (the reference path) and to say so.
@@ -795,8 +814,9 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
             for (const auto& s : secs) {
                 if (s.axis != 0) continue;
                 for (const auto& [hs, he] : s.hranges) {
-                    (void)he;
-                    const int64_t col = s.base + hs * s.unit;
+                    const int64_t start = s.base + hs * s.unit;
+                    const int64_t end = s.base + he * s.unit;
+                    const int64_t col = start % t.block_size != 0 ? start : end;
                     if (col % t.block_size != 0) {
                         block_violation = true;
                         bad_start = col;
@@ -867,6 +887,8 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
                 s.scale_kind = t.scale_kind;
                 s.scale_ref = scale_ref;
                 s.replicated = true;
+                s.compute_policy = block_violation && t.family == TensorFamily::GdnValue
+                    ? "rank0_full_others_zero" : "replicated_identity";
                 // Whole on every rank, stated as a count per rank rather than left empty.
                 s.valid_lanes.assign((size_t)world, t.shape[0]);
                 plan.slices.push_back(std::move(s));
@@ -929,6 +951,7 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
         c.consumer = a.consumer;
         c.quantizer = a.quantizer;
         c.block_size = a.block_size;
+        c.backend_policy = a.backend_policy;
         std::vector<std::pair<int64_t, int64_t>> cuts;
         if (world > 1 && (a.consumer == "down" || a.consumer == "expert_down")) cuts = ffn_rng;
         else if (world > 1 && a.consumer == "attn_output") {
@@ -939,6 +962,20 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
             c.reference = a.scope == "global" ? "global_reference" : "local";
             c.wire_slots = (a.consumer == "embed" || a.consumer == "ple") ? g.n_vocab : g.n_embd;
             c.valid_counts.assign((size_t)world, c.wire_slots);
+            if (a.consumer == "ssm_out") {
+                c.wire_slots = g.ssm_value_dim;
+                c.valid_counts.assign((size_t)world, g.ssm_value_dim);
+                if (world > 1) {
+                    c.gather = "all_gather_padded";
+                    c.layout = "gdn_value_runs_scatter_global";
+                    c.reference = "global_reference";
+                    c.valid_counts.clear();
+                    for (const auto& [lo, hi] : key_rng)
+                        c.valid_counts.push_back((hi - lo) * (g.ssm_v_heads / g.ssm_k_heads) *
+                                                 g.ssm_state_size);
+                    c.wire_slots = *std::max_element(c.valid_counts.begin(), c.valid_counts.end());
+                }
+            }
             plan.activation.push_back(c);
             continue;
         }
@@ -1010,7 +1047,8 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
     for (const auto& c : plan.activation)
         if (c.gather == "all_gather_padded") gather_bytes += c.wire_slots * 4 * world;
     const int64_t state_bytes =
-        g.n_gdn_layers() * (g.ssm_k_heads * g.ssm_state_size + g.ssm_conv_channels * g.ssm_d_conv) * 4 +
+        g.n_gdn_layers() * (g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size +
+                           g.ssm_conv_channels * g.ssm_d_conv) * 4 +
         g.n_qsa_layers() * (g.n_head_kv * g.head_dim * 2 + g.idx_q_heads * g.idx_key_dim) * 2;
     const int64_t prefill_scratch = g.n_embd * 4 * 64;
     const int64_t comm_workspace = 64LL * 1024 * 1024;
@@ -1040,6 +1078,8 @@ inline ShardPlan make_tp_plan(const ModelInventory& inv, int world,
     }
     plan.memory.halo_and_global_buffers = halo_bytes + gather_bytes + comm_workspace;
     plan.memory.gate_limit_bytes = gate_bytes;
+    plan.notes.push_back("memory qualification UNKNOWN: estimates are lower bounds; no 8K/64K/C8 "
+                         "capacity gate passes without context/cache/pool sizing and measured allocations");
 
     // The numbers the memory gate is judged on, visible in the plan itself.
     {
@@ -1087,18 +1127,19 @@ inline std::string plan_canonical_body(const ShardPlan& p) {
              std::to_string(s.byte_row_stride) + "," + s.codec + "," + std::to_string(s.block_size) + "," +
              s.scale_kind + "," + s.scale_ref + "," + detail::lane_str(s.valid_lanes) + "," +
              detail::lane_str(s.halo) + "," +
-             detail::lane_str(s.gqa_map) + (s.replicated ? ",R" : ",S");
+             detail::lane_str(s.gqa_map) + (s.replicated ? ",R" : ",S") + "," + s.compute_policy;
     }
     for (const auto& c : p.activation) {
         o += "|ac=" + c.consumer + "," + c.gather + "," + std::to_string(c.wire_slots) + "," +
              detail::lane_str(c.valid_counts) + "," + c.quantizer + "," + std::to_string(c.block_size) +
-             (c.crosses_rank_boundary ? ",X" : ",-") + "," + c.reference;
+             (c.crosses_rank_boundary ? ",X" : ",-") + "," + c.reference + "," + c.backend_policy +
+             "," + c.layout;
     }
     for (const auto& m : p.memory.components)
         o += "|mem=" + m.first + "," + std::to_string(m.second);
     o += "|mb=" + std::to_string(p.memory.per_rank_bytes) + "," +
          detail::lane_str(p.memory.per_rank_owned) + "," + detail::lane_str(p.memory.per_rank_total) + "," +
-         std::to_string(p.memory.halo_and_global_buffers);
+         std::to_string(p.memory.halo_and_global_buffers) + "," + p.memory.qualification;
     for (const auto& n : p.notes) o += "|n=" + n;
     return o;
 }
@@ -1116,6 +1157,7 @@ inline ValidationResult validate_plan(const ShardPlan& p) {
     }
     if (p.world < 1 || p.world > 3) v.fail("world " + std::to_string(p.world) + " is outside 1..3");
     if (p.schema_version != 1 || p.plan_version != 1) v.fail("schema/plan version is not 1/1");
+    if (p.inventory_hash.empty()) v.fail("source_lock: inventory_hash must not be empty");
     const std::string want = detail::hex64(detail::fnv1a64(plan_canonical_body(p)));
     if (p.plan_hash != want)
         v.fail("plan hash " + p.plan_hash + " does not match the plan body (" + want +
@@ -1140,6 +1182,10 @@ inline ValidationResult validate_plan(const ShardPlan& p) {
                        " whole-copy slices, world is " + std::to_string(p.world));
             for (const auto* s : grp) {
                 if (!s->replicated) { v.fail("tensor " + name + ": mixed replicated and sharded slices"); continue; }
+                if (p.world > 1 && s->family == TensorFamily::GdnValue &&
+                    !s->global_shape.empty() && s->global_shape[0] == p.geometry.ssm_value_dim &&
+                    s->compute_policy != "rank0_full_others_zero")
+                    v.fail("tensor " + name + ": replicated output weights require rank0_full_others_zero");
                 if (s->range_start != 0 || s->range_end != total)
                     v.fail("tensor " + name + " rank " + std::to_string(s->rank) +
                            ": replicated slice must own the full range");
@@ -1211,29 +1257,35 @@ inline ValidationResult validate_plan(const ShardPlan& p) {
     }
 
     if (p.world > 1) {
-        // Each key's per_key value heads stay together: every rank's value ranges are its key ranges x per_key.
-        const int64_t per_key = p.geometry.ssm_k_heads > 0
-                                    ? p.geometry.ssm_v_heads / p.geometry.ssm_k_heads : 1;
-        for (int rank = 0; rank < p.world; ++rank) {
-            std::vector<std::pair<int64_t, int64_t>> keys, vals;
-            for (const auto& s : p.slices) {
-                if (s.rank != rank) continue;
-                if (s.part == "gdn_q" || s.part == "gdn_k") keys.push_back({s.head_start, s.head_end});
-                if (s.part == "gdn_v" || s.part == "value_out") vals.push_back({s.head_start, s.head_end});
+        bool needs_ssm_gather = false;
+        for (const auto& s : p.slices)
+            if (s.family == TensorFamily::GdnValue && s.replicated &&
+                !s.global_shape.empty() && s.global_shape[0] == p.geometry.ssm_value_dim)
+                needs_ssm_gather = true;
+        if (needs_ssm_gather) {
+            bool has_ssm_gather = false;
+            std::vector<int64_t> expected_counts;
+            for (const auto& [lo, hi] : head_ranges(p.geometry.ssm_k_heads, p.world))
+                expected_counts.push_back((hi - lo) * (p.geometry.ssm_v_heads / p.geometry.ssm_k_heads) *
+                                          p.geometry.ssm_state_size);
+            for (const auto& c : p.activation) if (c.consumer == "ssm_out") {
+                has_ssm_gather = true;
+                if (c.gather != "all_gather_padded" || c.layout != "gdn_value_runs_scatter_global" ||
+                    c.reference != "global_reference" || c.valid_counts != expected_counts)
+                    v.fail("ssm_out: replicated output requires global gather and value-run scatter contract");
             }
-            std::sort(keys.begin(), keys.end());
-            keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-            if (keys.size() != 1) continue;     // no key cut on this rank (or a fallback): nothing to pair
-            for (const auto& val : vals) {
-                const int64_t lo = keys.front().first * per_key, hi = keys.front().second * per_key;
-                if (val.first != lo || val.second != hi) {
-                    v.fail("rank " + std::to_string(rank) + ": value heads [" +
-                           std::to_string(val.first) + "," + std::to_string(val.second) + ") do not keep the "
-                           "key's " + std::to_string(per_key) + " values per key (expected [" +
-                           std::to_string(lo) + "," + std::to_string(hi) + "))");
-                    break;
-                }
-            }
+            if (!has_ssm_gather)
+                v.fail("ssm_out: replicated output requires an explicit global gather and value-run scatter contract");
+        }
+        // Each run must preserve the monolithic value % key mapping.
+        const auto key_ranges = head_ranges(p.geometry.ssm_k_heads, p.world);
+        for (const auto& s : p.slices) {
+            if (s.part != "gdn_v" && s.part != "value_out") continue;
+            const auto [lo, hi] = key_ranges[(size_t)s.rank];
+            const int64_t base = (s.head_start / p.geometry.ssm_k_heads) * p.geometry.ssm_k_heads;
+            if (s.head_start != base + lo || s.head_end != base + hi)
+                v.fail("rank " + std::to_string(s.rank) + ": values per key violate modulo mapping; expected [" +
+                       std::to_string(base + lo) + "," + std::to_string(base + hi) + ")");
         }
         // QSA: the gqa_map is the global 24Q/2KV map, never a local query/kv count.
         const int64_t per_kv = p.geometry.n_head_kv > 0 ? p.geometry.n_head / p.geometry.n_head_kv : 0;
@@ -1263,6 +1315,9 @@ inline ValidationResult validate_plan(const ShardPlan& p) {
     }
 
     for (const auto& c : p.activation) {
+        if (c.backend_policy == "cuda_native_expert_grouped" &&
+            (c.quantizer != "Q8_1" || c.block_size != 32 || c.reference != "global_reference"))
+            v.fail("consumer " + c.consumer + ": CUDA grouped experts require global native Q8_1/block32");
         if ((int)c.valid_counts.size() != p.world)
             v.fail("consumer " + c.consumer + ": valid_counts per rank missing (world " +
                    std::to_string(p.world) + ")");
@@ -1394,7 +1449,7 @@ inline std::string to_tp_plan_json(const ShardPlan& p) {
          ", \"idx_q_heads\": " + std::to_string(p.geometry.idx_q_heads) +
          ", \"n_expert\": " + std::to_string(p.geometry.n_expert) +
          ", \"n_ff\": " + std::to_string(p.geometry.n_ff) + "},\n";
-    o += "  \"memory\": {\"per_rank_bytes\": " + std::to_string(p.memory.per_rank_bytes) +
+    o += "  \"memory\": {\"qualification\": \"unqualified_lower_bound\", \"per_rank_bytes\": " + std::to_string(p.memory.per_rank_bytes) +
          ", \"components\": {";
     for (size_t i = 0; i < p.memory.components.size(); ++i) {
         if (i) o += ", ";
@@ -1429,6 +1484,7 @@ inline std::string to_tp_plan_json(const ShardPlan& p) {
         o += ", \"valid_lanes\": " + detail::lane_str(s.valid_lanes);
         o += ", \"halo\": " + detail::lane_str(s.halo);
         o += std::string(", \"replicated\": ") + (s.replicated ? "true" : "false");
+        o += ", \"compute_policy\": "; json_str(o, s.compute_policy);
         if (!s.gqa_map.empty()) o += ", \"gqa_map\": " + detail::lane_str(s.gqa_map);
         o += "}";
         if (i + 1 < p.slices.size()) o += ",";
@@ -1445,6 +1501,8 @@ inline std::string to_tp_plan_json(const ShardPlan& p) {
         o += ", \"block_size\": " + std::to_string(c.block_size);
         o += std::string(", \"crosses_rank_boundary\": ") + (c.crosses_rank_boundary ? "true" : "false");
         o += ", \"reference\": "; json_str(o, c.reference);
+        o += ", \"backend_policy\": "; json_str(o, c.backend_policy);
+        o += ", \"layout\": "; json_str(o, c.layout);
         o += "}";
         if (i + 1 < p.activation.size()) o += ",";
         o += "\n";

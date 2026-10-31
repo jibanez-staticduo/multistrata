@@ -15,7 +15,9 @@ Weight blocks and activation blocks are recorded apart because TP3 cuts the two 
 travels intact when its output rows are partitioned, while the activation that multiplies it is quantized over
 the whole 2560-wide vector.  The block sizes here come from `tools/gguf_reader.py`; the activation formats from
 the ggml CPU type table (llama.cpp `ggml/src/ggml-cpu/ggml-cpu.c`, `type_traits_cpu[].vec_dot_type`), and the
-trellis types (143-146) from `src/kernels/cpu/native_expert.cpp`, which knows them outside ggml.
+trellis types (143-146) from `src/kernels/cpu/native_expert.cpp`, which knows them outside ggml. This is the
+`cpu_reference` policy. `--backend-policy cuda_native_expert_grouped` records the separate native CUDA Q8_1
+contract for routed experts; other consumers keep their explicitly named CPU reference policy.
 
     python tools/distributed/model_inventory.py hf:ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF --variant IQ3_S \
            --revision ed59f92... --evidence /home/staticduo/tmp/strata-tp3-20261030/evidence/task1
@@ -678,7 +680,7 @@ FAMILY_CONSUMER = {
 }
 
 
-def activation_contracts(rows: list[dict], geometry: dict) -> list[dict]:
+def activation_contracts(rows: list[dict], geometry: dict, *, backend_policy: str = "cpu_reference") -> list[dict]:
     """Per consumer: the activation format and block its weights ask for, and whether TP3 may quantize that
     activation per rank.  Copying weight bytes is not enough when the scale of a block two ranks share would
     change: a block that does not fit inside one rank's slice keeps the original global quantizer.
@@ -687,6 +689,8 @@ def activation_contracts(rows: list[dict], geometry: dict) -> list[dict]:
     block that fits one rank, and QSA query heads 8/8/8, which cuts an attention output projection by its input
     columns at 8 * head_dim and 16 * head_dim.
     """
+    if backend_policy not in ("cpu_reference", "cuda_native_expert_grouped"):
+        raise ValueError(f"unknown backend_policy {backend_policy!r}")
     n_head = int(geometry.get("n_head", COMPILED_GEOMETRY["n_head"]))
     head_dim = int(geometry.get("head_dim", COMPILED_GEOMETRY["head_dim"]))
     n_embd = int(geometry.get("n_embd", COMPILED_GEOMETRY["n_embd"]))
@@ -700,8 +704,20 @@ def activation_contracts(rows: list[dict], geometry: dict) -> list[dict]:
         if re.search(ATTN_OUT_RE, name):
             consumer, width_key, kind = "attn_output", "attn_out", "sliced"
             cuts = tuple(h * head_dim for h in QSA_QUERY_HEAD_CUTS)
+        elif "ssm_out" in name:
+            consumer, width_key, kind = "ssm_out", "ssm_value_dim", "full"
         elif kind == "ffn":
             kind, cuts = "sliced", FFN_CUTS
+
+        if backend_policy == "cuda_native_expert_grouped" and family in ("expert_gate_up", "expert_down"):
+            supported = ({"IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ3_S", "IQ2_S", "IQ4_XS"}
+                         if family == "expert_gate_up" else {"IQ4_NL", "Q2_0"})
+            quantizer = "Q8_1" if row["dtype"] in supported else f"unsupported ({row['dtype']})"
+            _contract(out, consumer, quantizer, 32 if row["dtype"] in supported else 0, "global",
+                      "CUDA native expert activation uses original-order global Q8_1 blocks of 32 with FP16 "
+                      "scale and sum, quantized once before selecting owned contributions; CPU Q8_K/Q8_0 "
+                      "contracts do not describe this backend", weight_type=row["dtype"])
+            continue
 
         if kind == "gather":
             _contract(out, consumer, "none", 1, "local",
@@ -721,7 +737,9 @@ def activation_contracts(rows: list[dict], geometry: dict) -> list[dict]:
                       "run on the global reference path until one is")
             continue
         block = BLOCK_GEOMETRY[act][0] if act in BLOCK_GEOMETRY else 1
-        width = n_head * head_dim if width_key == "attn_out" else (n_ff if width_key == "n_ff" else n_embd)
+        width = (n_head * head_dim if width_key == "attn_out" else
+                 geometry["ssm_value_dim"] if width_key == "ssm_value_dim" else
+                 n_ff if width_key == "n_ff" else n_embd)
         where = f"{width}-wide" + (" FFN" if width_key == "n_ff" else
                                   " attention output" if width_key == "attn_out" else " residual")
         if block == 1:
@@ -747,6 +765,9 @@ def activation_contracts(rows: list[dict], geometry: dict) -> list[dict]:
                      + ("" if width % block == 0 else f", and {width} is not a multiple of {block}")
                      + ": every rank needs the same quantizer, so it is all-gathered, never re-quantized per rank")
         _contract(out, consumer, act, block, scope, notes, weight_type=row["dtype"])
+    for entry in out.values():
+        entry["backend_policy"] = (backend_policy if entry["consumer"] in ("expert_gate_up", "expert_down")
+                                   else "cpu_reference")
     return sorted(out.values(), key=lambda c: (c["consumer"], c["quantizer"], c["block_size"]))
 
 
@@ -861,7 +882,8 @@ def _sum_by(rows: list[dict], key: str) -> dict:
 
 
 def inspect_model(source: str, *, variant: str | None = None, revision: str | None = None,
-                  max_header_bytes: int = DEFAULT_MAX_HEADER_BYTES, timeout: int = 60) -> ModelInventory:
+                  max_header_bytes: int = DEFAULT_MAX_HEADER_BYTES, timeout: int = 60,
+                  backend_policy: str = "cpu_reference") -> ModelInventory:
     """Read a pack's headers and return the contract's inventory.  No tensor is ever materialized."""
     block, files, extra = resolve_source(source, variant, revision, timeout)
     if timeout:
@@ -898,6 +920,9 @@ def inspect_model(source: str, *, variant: str | None = None, revision: str | No
             reasons.append(f"{h['file']}: GGUF v{h['version']}, strata's reader handles v3 "
                            "(include/strata/artifact/gguf_reader.hpp)")
     reasons += _role_problems(geometry, rows)
+    contracts = activation_contracts(rows, geometry, backend_policy=backend_policy)
+    reasons += [f"{entry['consumer']}: {entry['quantizer']} under {backend_policy}"
+                for entry in contracts if entry["quantizer"].startswith("unsupported")]
 
     by_family: dict[str, int] = {}
     for row in rows:
@@ -906,8 +931,9 @@ def inspect_model(source: str, *, variant: str | None = None, revision: str | No
         "tensor order is (file, byte offset); byte_offset and byte_length are absolute in the named file",
         "blk.N.attn_qkv and blk.N.ssm_conv1d are packed GDN tensors: their key and value head rows share one "
         "name, so Task 2 splits them at the head boundaries the geometry gives",
-        f"activation formats are ggml's vec_dot_type table plus the trellis types from "
-        f"src/kernels/cpu/native_expert.cpp; TP3 FFN cuts are {FFN_CUTS[0]} and {FFN_CUTS[1]}",
+        f"activation backend policy is {backend_policy}; cpu_reference uses ggml vec_dot_type plus "
+        f"src/kernels/cpu/native_expert.cpp, CUDA routed experts use native Q8_1; "
+        f"TP3 FFN cuts are {FFN_CUTS[0]} and {FFN_CUTS[1]}",
         "what a checked tensor means: its byte range lies inside a file of the declared size, and its length "
         "equals what its type's block geometry says.  No tensor payload was read: bounded header reads only, "
         "so no weight file was downloaded",
@@ -924,7 +950,7 @@ def inspect_model(source: str, *, variant: str | None = None, revision: str | No
         source={**block, "files": [{"path": f.name, "size": f.size, "sha256": sha.get(f.name)} for f in files]},
         geometry=geometry,
         tensors=inventory_rows,
-        activation_contracts=activation_contracts(rows, geometry),
+        activation_contracts=contracts,
         assets=assets_from(meta, rows, files, geometry),
         bytes={"total": sum(r["byte_length"] for r in rows), "by_family": dict(sorted(by_family.items()))},
         verdict={"loadable_by_strata": not reasons, "reasons": reasons, "checked_tensors": checked},
@@ -940,6 +966,8 @@ def main(argv: list[str] | None = None) -> int:
                                    "a .gguf file or a folder of shards")
     ap.add_argument("--variant", help="a variant name or glob (e.g. IQ3_S, UD-Q4_K_XL)")
     ap.add_argument("--revision", help="pin the hub revision (commit sha) instead of the one the hub reports")
+    ap.add_argument("--backend-policy", choices=("cpu_reference", "cuda_native_expert_grouped"),
+                    default="cpu_reference", help="activation contract; CUDA policy applies to routed experts")
     ap.add_argument("--out", metavar="FILE", help="write the inventory JSON here")
     ap.add_argument("--evidence", metavar="DIR",
                     help="write inventory.json, source-lock.json and disk-estimate.json here")
@@ -949,7 +977,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     inv = inspect_model(a.source, variant=a.variant, revision=a.revision,
-                        max_header_bytes=a.max_header_bytes, timeout=a.timeout)
+                        max_header_bytes=a.max_header_bytes, timeout=a.timeout, backend_policy=a.backend_policy)
     d = inv.to_dict()
     if a.out:
         Path(a.out).write_text(json.dumps(d, indent=1) + "\n", encoding="utf-8")

@@ -88,7 +88,7 @@ Validate every dimension against the selected file; these values come from
 | --- | --- | --- |
 | Layers | 48 | All 48 on every rank; never consecutive thirds |
 | GDN key heads | 16 | 6 / 5 / 5, starts 0 / 6 / 11 |
-| GDN value heads | 48 | 18 / 15 / 15, starts 0 / 18 / 33 |
+| GDN value heads | 48 | 18 / 15 / 15; key ranges repeated at offsets 0 / 16 / 32 |
 | QSA query heads | 24 | 8 / 8 / 8, starts 0 / 8 / 16 |
 | QSA KV heads | 2 | Replicate both on each rank initially |
 | QSA indexer heads | 4 | Replicate initially; preserve global selection |
@@ -97,7 +97,7 @@ Validate every dimension against the selected file; these values come from
 | Router, norms, HC | Original | Replicate, same route and expert weights |
 | PLE, embedding, output head | Original | Replicate first if budget fits; see memory gate |
 
-Keep each GDN key head with its three value heads, including convolution,
+Keep each GDN key head k with value heads k, k+16 and k+32, in that order, including convolution,
 recurrent state and rollback. In QSA, an eight-query range can intersect a
 global GQA group boundary; use original global head mapping into the replicated
 KV heads, not a local `query_count / kv_count` formula.

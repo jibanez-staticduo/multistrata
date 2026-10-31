@@ -198,6 +198,26 @@ def test_activation_contracts_per_consumer_from_the_actual_types(tmp_path):
     assert c["expert_down"]["scope"] == "local"             # 32 divides the FFN cuts 256 and 448
 
 
+def test_cuda_expert_contract_is_explicit_and_keeps_native_q8_1(tmp_path):
+    p = tmp_path / "cuda.gguf"
+    rows = [("blk.0.ffn_gate_exps.weight", [2560, 640], "IQ3_S", 0),
+            ("blk.0.ffn_down_exps.weight", [640, 2560], "IQ4_NL", block_bytes("IQ3_S", 2560 * 640))]
+    write_gguf(p, meta(), rows)
+    inv = mi.inspect_model(str(p), backend_policy="cuda_native_expert_grouped").to_dict()
+    contracts = {a["consumer"]: a for a in inv["activation_contracts"]}
+    for name in ("expert_gate_up", "expert_down"):
+        assert contracts[name]["quantizer"] == "Q8_1"
+        assert contracts[name]["block_size"] == 32
+        assert contracts[name]["scope"] == "global"
+        assert contracts[name]["backend_policy"] == "cuda_native_expert_grouped"
+        assert "FP16" in contracts[name]["notes"]
+
+
+def test_unknown_backend_policy_is_rejected():
+    with pytest.raises(ValueError, match="backend_policy"):
+        mi.activation_contracts([], mi.COMPILED_GEOMETRY, backend_policy="guess")
+
+
 def test_activation_contract_is_global_when_its_block_crosses_a_rank_cut(tmp_path):
     """A 256-value activation block cannot sit inside the 192-wide FFN slices: the quantizer must stay global."""
     p = tmp_path / "cross-00001-of-00001.gguf"

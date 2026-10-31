@@ -704,16 +704,27 @@ def _check_vocabulary(plan_geometry: dict, slices: Sequence[dict], tensors: dict
             "note": modes or ["no vocabulary-row tensor in the plan, so there is nothing to trim"]}
 
 
-def _check_source_lock(inventory: dict, plan: dict) -> None:
+def _check_source_lock(inventory: dict, plan: dict, *, raw_inventory: bytes | None = None) -> None:
     lock = plan.get("source_lock") or {}
     recorded = lock.get("inventory_hash")
+    _require(isinstance(recorded, str) and bool(recorded),
+             "the plan source_lock requires a nonempty inventory_hash", SourceError)
+    variants = inventory_hash_variants(inventory)
+    if raw_inventory is not None:
+        digest = 0xcbf29ce484222325
+        for byte in raw_inventory:
+            digest = ((digest ^ byte) * 0x100000001b3) & ((1 << 64) - 1)
+        variants.add(f"fnv1a64-raw:{digest:016x}")
     if recorded:
-        _require(recorded in inventory_hash_variants(inventory),
+        _require(recorded in variants,
                  f"the plan is locked to inventory {recorded} but the inventory reads "
                  f"{inventory_hash(inventory)}", SourceError)
     lock_repo, inv_repo = lock.get("repo"), (inventory.get("source") or {}).get("repo")
     _require(not (lock_repo and inv_repo and lock_repo != inv_repo),
              f"the plan is locked to {lock_repo} but the inventory describes {inv_repo}", SourceError)
+    lock_revision, inv_revision = lock.get("revision"), (inventory.get("source") or {}).get("revision")
+    _require(not (lock_revision and inv_revision and lock_revision != inv_revision),
+             "the plan source revision differs from the inventory", SourceError)
 
 
 def build_segments(source, plan, *, source_root: Path | None = None
@@ -729,7 +740,13 @@ def build_segments(source, plan, *, source_root: Path | None = None
     world = int(plan_doc.get("world", 0))
     _require(world >= 1, f"plan world {plan_doc.get('world')!r} is not a rank count")
 
-    _check_source_lock(inventory, plan_doc)
+    raw_inventory = None
+    if not isinstance(source, dict):
+        source_path = Path(source)
+        if source_path.is_dir():
+            source_path /= "inventory.json"
+        raw_inventory = source_path.read_bytes()
+    _check_source_lock(inventory, plan_doc, raw_inventory=raw_inventory)
     sizes = _file_sizes(inventory, inv_root, source_root)
     tensors = _tensor_map(inventory)
 
@@ -770,6 +787,7 @@ def build_segments(source, plan, *, source_root: Path | None = None
                          for entry in inventory["source"].get("files", [])],
         "memory": plan_doc.get("memory"),
         "activation": plan_doc.get("activation"),
+        "compute_ownership": slices,
         "segments": [segment.as_dict() for segment in placed],
         "segment_count": len(placed),
         "run_count": runs,
