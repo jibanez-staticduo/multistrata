@@ -2771,9 +2771,17 @@ endif()
 # through src/distributed/nccl_api.hpp, whose device implementation is still to come.
 option(STRATA_BUILD_DISTRIBUTED "EXPERIMENTAL: build the TP3 CUDA/NCCL device backend (docs/superpowers/)" OFF)
 option(STRATA_BUILD_DISTRIBUTED_TESTS "Build the TP3 transport CPU contract tests (no CUDA, no NCCL)" OFF)
+option(STRATA_BUILD_ROCE_EXPERIMENTAL "EXPERIMENTAL: build the private TP3 RoCEnante smoke (direct RoCE; requires STRATA_BUILD_DISTRIBUTED and CUDA)" OFF)
 
 if(STRATA_BUILD_DISTRIBUTED AND NOT STRATA_ENABLE_CUDA)
   message(FATAL_ERROR "STRATA_BUILD_DISTRIBUTED needs STRATA_ENABLE_CUDA=ON")
+endif()
+
+if(STRATA_BUILD_ROCE_EXPERIMENTAL AND NOT STRATA_ENABLE_CUDA)
+  message(FATAL_ERROR "STRATA_BUILD_ROCE_EXPERIMENTAL needs STRATA_ENABLE_CUDA=ON")
+endif()
+if(STRATA_BUILD_ROCE_EXPERIMENTAL AND NOT STRATA_BUILD_DISTRIBUTED)
+  message(FATAL_ERROR "STRATA_BUILD_ROCE_EXPERIMENTAL needs STRATA_BUILD_DISTRIBUTED=ON")
 endif()
 
 if(STRATA_BUILD_DISTRIBUTED)
@@ -2806,6 +2814,42 @@ if(STRATA_BUILD_DISTRIBUTED)
                             ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   find_package(Threads REQUIRED)
   target_link_libraries(strata-tp3-transport-smoke PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+
+  if(STRATA_BUILD_ROCE_EXPERIMENTAL)
+    enable_language(C)
+    find_path(STRATA_IBVERBS_INCLUDE_DIR infiniband/verbs.h REQUIRED)
+    find_library(STRATA_IBVERBS_LIBRARY ibverbs REQUIRED)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rocenante/proxy.c")
+    file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rocenante/proxy.c" STRATA_ROCE_PROXY_SHA256)
+
+    add_executable(strata-tp3-roce-transport-smoke
+                   tests/distributed/roce_transport_smoke.cu
+                   src/distributed/roce_backend.cpp
+                   src/kernels/cuda/tp/roce_collective.cu
+                   src/distributed/session.cpp
+                   src/distributed/control_tcp.cpp
+                   third_party/rocenante/proxy.c)
+    target_compile_definitions(strata-tp3-roce-transport-smoke PRIVATE STRATA_DISTRIBUTED_CUDA
+                               STRATA_ROCE_PROXY_SHA256="${STRATA_ROCE_PROXY_SHA256}")
+    target_include_directories(strata-tp3-roce-transport-smoke PRIVATE include src
+                               ${STRATA_IBVERBS_INCLUDE_DIR} ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(strata-tp3-roce-transport-smoke PRIVATE CUDA::cudart
+                          ${STRATA_IBVERBS_LIBRARY} Threads::Threads)
+    set_target_properties(strata-tp3-roce-transport-smoke PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+    add_executable(test_roce_backend_state
+                   tests/distributed/test_roce_backend_state.cpp
+                   src/distributed/roce_backend.cpp)
+    target_compile_definitions(test_roce_backend_state PRIVATE STRATA_DISTRIBUTED_CUDA
+                               STRATA_ROCE_TEST_SYSFS_ROOT_ENV
+                               STRATA_ROCE_PROXY_SHA256="test-proxy-hash")
+    target_include_directories(test_roce_backend_state PRIVATE include src
+                               ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(test_roce_backend_state PRIVATE Threads::Threads)
+    add_test(NAME test_roce_backend_state COMMAND test_roce_backend_state)
+    set_tests_properties(test_roce_backend_state PROPERTIES LABELS "distributed;cuda;contract")
+  endif()
 
   # Preserve the original native CUDA arithmetic; these files do not inherit fast-math source flags.
   add_library(strata_tp_cuda STATIC src/kernels/cuda/tp/linear.cu src/kernels/cuda/tp/moe.cu
