@@ -89,7 +89,16 @@ does not meet the proposed 10% C1 improvement threshold. Median request wall
 time is 322.261 seconds for TP1 and 939.525 seconds for TP3. Correct state
 reconstruction does not imply a performance gain.
 
-The configured C4/C8 cases and the 16K/64K rounds remain in progress. TP2 and
+The first TP3 C4 4096-token round also passes: four requests each produce 256
+output tokens. The concurrent round takes 4030.110 seconds and returns an
+aggregate 0.2541 output tokens/s. Per-request first-content TTFT is
+3771.771-3780.399 seconds. Native per-request prefill is 873.922-876.716 seconds
+and decode is 56.201-58.845 seconds. These native active times exclude waiting
+between serialized slots; client wall time includes it. The small reported
+admission queue time is not total scheduler waiting. One C4 round does not
+establish its variability or a capacity advantage.
+
+The remaining C4/C8 cases and the 16K/64K rounds are in progress. TP2 and
 TP1 C4/C8 are unsupported by this candidate and are explicitly not run. No
 aggregate C8 gain against TP1 can be claimed without that control. Raw partial
 records and the analysis are in
