@@ -174,6 +174,19 @@ prefill/decode timings. Its same-ID full-state comparison also passes: 24 consum
 state arrays and the final full-vocabulary logits agree exactly with TP1.
 [The service chunk receipt][servicebatch8] qualifies this short request only.
 
+## Routed prefill rows
+
+The separate `--prefill-expert-batch 1` option groups selected expert work across
+prompt rows, preserving each row's router weights and the exact compact down
+operands. It requires native multi-token prefill, batched expert collectives and
+compact operands. Extra provider and model buffers are budgeted before allocation;
+this option remains off by default.
+
+Its first size-eight test processes the same variable chunks and RESET replay
+as the native prefill control. All three ranks exit 0. [The expert-row receipt][expertrows]
+reports nine exact full-vocabulary boundary rows and 3915 state comparisons with
+zero differing bits. This short gate does not establish a performance improvement.
+
 ## Native RoCEnante transport checks
 
 The separate opt-in native CUDA/C proxy transport passes a three-host smoke:
@@ -301,3 +314,5 @@ files with this report when sharing it; the links are not public downloads.
 [prefill8]: /home/staticduo/tmp/strata-tp3-20261031/prefill-batch8/independent-qualification.json
 
 [servicebatch8]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/batch8-check/result/comparison.json
+
+[expertrows]: /home/staticduo/tmp/strata-tp3-20261031/expert-prefill8/independent-qualification.json
