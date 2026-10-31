@@ -7133,6 +7133,13 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
+                group_health = svc.engine.health() if getattr(svc.engine, "distributed_health", False) else None
+                if group_health is not None:
+                    self._json(200 if group_health["ready"] else 503,
+                               {"max_context": svc.reported_ctx(), "model": svc.model, "images": False,
+                                "api_key": bool(svc.api_key), "image_generation": False,
+                                "loaded": group_health["ready"], "service": "strata", **group_health})
+                    return
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
@@ -8715,7 +8722,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             event_sink = None
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
+    ap.add_argument("--engine", choices=["mock", "strata", "distributed"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
@@ -8899,7 +8906,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     tok = ByteTokenizer()
     tcfg = {}
     tpath = Path(a.tokenizer)
-    if a.engine == "strata" and not (tpath / "vocab.json").exists():
+    if a.engine in ("strata", "distributed") and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
@@ -8913,6 +8920,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
+        if a.engine == "distributed" and arch_from_tokenizer(None, tcfg.get("pre")) == "deepseek41":
+            ap.error("distributed engine currently supports Qwen model families only")
         tok = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
     if a.engine == "strata" and not cfg.get("arch") and arch_from_tokenizer(None, tcfg.get("pre")):
         cfg["arch"] = arch_from_tokenizer(None, tcfg.get("pre"))
@@ -8932,7 +8941,21 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
     lazy = False
-    if a.engine == "strata":
+    if a.engine == "distributed":
+        from serve.distributed_backend import DistributedEngine
+        if not a.config:
+            ap.error("--engine distributed needs --config")
+        if a.lazy or a.idle_unload or a.before_load or a.slot_save_path or a.batch_groups:
+            ap.error("distributed engine does not support lazy loading, unload hooks, session files or batching")
+        if a.offline:
+            ap.error("distributed engine cannot attest that remote ranks are offline")
+        sampling_defaults = sampling_defaults_from_config(cfg)
+        try:
+            engine = DistributedEngine(cfg, engine_error=EngineDied)
+        except (ValueError, EngineDied) as e:
+            ap.error(str(e))
+        effort_end, vision = None, None
+    elif a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
         cfg = with_component_engine(cfg)
@@ -9205,7 +9228,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc.terminal_topology_mode = ("replicas (configured)" if a.engine == "strata" and groups
                                   else "split serve (configured)" if a.engine == "strata" and split
                                   else "layer split (configured)" if a.engine == "strata" and layer_split_of(cfg)
-                                  else "single GPU or CPU" if a.engine == "strata" else "mock")
+                                  else "single GPU or CPU" if a.engine == "strata"
+                                  else "distributed TP3" if a.engine == "distributed" else "mock")
     svc.terminal_configured_split = (layer_split_value(cfg) if a.engine == "strata" and layer_split_of(cfg)
                                      else None)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)

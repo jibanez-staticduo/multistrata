@@ -267,6 +267,10 @@ std::string control_payload(uint64_t sequence, std::string_view label, std::stri
     return out;
 }
 
+std::string broadcast_payload(uint64_t sequence, std::string_view label, std::string_view payload) {
+    return std::string("BRC1", 4) + control_payload(sequence, label, payload);
+}
+
 void queue_coordinator_ready(Harness& h) {
     const auto ranks = good_roster();
     h.channel.recv_frames.push_back(from(1, FrameKind::join, join_payload(good_join(1))));
@@ -394,6 +398,117 @@ void control_payload_agreement() {
         for (uint32_t rank : {1u, 2u}) h.channel.recv_frames.push_back(from(rank, FrameKind::operation, operation_payload(d)));
         check(!session.agree_operation(d, {h.clock.now() + std::chrono::seconds(1)}) &&
                   !session.complete_operation(d.operation), "control agreements do not consume collective sequence numbers");
+    }
+}
+
+void control_payload_broadcast() {
+    const std::string label("action\0step", 11), bytes("private\0payload\xff", 16);
+    const auto request = broadcast_payload(1, label, {});
+    const auto envelope = broadcast_payload(1, label, bytes);
+    {
+        Harness h;
+        Session session = h.session(0, good_join(0), good_config(0));
+        std::string output = bytes;
+        check(session.broadcast_control_payload(label, output, {}).code == FailureCode::not_ready &&
+                  output == bytes && h.channel.sent.empty(), "broadcast requires READY and preserves caller bytes on failure");
+    }
+    // The follower never publishes staged bytes on a malformed proposal, missing/mismatching commit,
+    // a failure from the channel, or a deadline reached while reading the final commit.
+    for (int mode = 0; mode < 15; ++mode) {
+        Harness h;
+        const auto ranks = good_roster();
+        h.channel.recv_frames.push_back(from(0, FrameKind::roster, roster_payload(ranks, PhaseBudgets{})));
+        h.channel.recv_frames.push_back(from(0, FrameKind::ready, make_ack(kUuid, 0, roster_digest(ranks))));
+        Session session = h.session(1, good_join(1), good_config(1));
+        check(!session.start(), "follower is ready for binary broadcast");
+        std::string proposed = envelope, commit = envelope, output;
+        if (mode == 1) proposed = broadcast_payload(1, "other-label", bytes);
+        if (mode == 2) proposed = broadcast_payload(0, label, bytes);
+        if (mode == 3) proposed[8] ^= 1;  // another session UUID
+        if (mode == 4) proposed.pop_back();
+        if (mode == 5) proposed += 'x';
+        if (mode == 6) proposed.assign(kControlMaxPayload + 1, 'x');
+        if (mode == 7) proposed.assign(3, 'x');
+        if (mode == 8) commit.back() ^= 1;
+        if (mode == 11) output = "follower-input";
+        if (mode == 12) proposed = control_payload(1, label, bytes);  // mixed APIs
+        if (mode == 13) {
+            const size_t offset = request.size() - 4;
+            proposed.replace(offset, 4, 4, static_cast<char>(0xff));
+        }
+        h.channel.recv_frames.push_back(from(mode == 10 ? 2 : 0, FrameKind::control, proposed));
+        if (mode != 9) h.channel.recv_frames.push_back(from(0, FrameKind::control_ack, commit));
+        const auto before = output;
+        const auto at = Deadline{h.clock.now() + std::chrono::milliseconds(mode == 14 ? 2 : 1000)};
+        const auto f = session.broadcast_control_payload(label, output, at);
+        FailureCode expected = FailureCode::bad_operation;
+        if (mode == 0) expected = FailureCode::none;
+        if (mode == 4 || mode == 7) expected = FailureCode::truncated_frame;
+        if (mode == 5) expected = FailureCode::bad_frame;
+        if (mode == 6 || mode == 13) expected = FailureCode::oversized_frame;
+        if (mode == 9 || mode == 14) expected = FailureCode::deadline_expired;
+        check(f.code == expected && (mode == 0 ? session.ready() && output == bytes :
+                  !session.ready() && output == before), "broadcast follower publishes exact binary bytes only after a valid final commit");
+        if (mode != 0) check(session.broadcast_control_payload(label, output, {}).code == FailureCode::not_ready,
+                             "failed broadcast is terminal");
+        for (const auto& line : h.lines) {
+            check(line.find("private") == std::string::npos && line.find("action") == std::string::npos,
+                  "broadcast logs contain no caller label or payload bytes");
+        }
+    }
+    for (int mode = 0; mode < 10; ++mode) {
+        Harness h;
+        queue_coordinator_ready(h);
+        Session session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "coordinator is ready for broadcast validation");
+        std::string peer_request = request, ack = envelope, output = bytes;
+        if (mode == 1) peer_request = broadcast_payload(1, label, "unexpected-input");
+        if (mode == 2) peer_request = broadcast_payload(0, label, {});
+        if (mode == 3) ack.back() ^= 1;
+        if (mode == 5) output.assign(kControlMaxPayload, 'x');
+        if (mode == 9) h.channel.send_failure = Failure::fail(FailureCode::peer_closed, "send failed");
+        h.channel.recv_frames.push_back(from(1, FrameKind::control, peer_request));
+        h.channel.recv_frames.push_back(from(mode == 4 ? 1 : 2, FrameKind::control, request));
+        if (mode != 6) {
+            h.channel.recv_frames.push_back(from(1, FrameKind::control_ack, envelope));
+            h.channel.recv_frames.push_back(from(mode == 7 ? 1 : 2, FrameKind::control_ack, ack));
+        }
+        Deadline at{h.clock.now() + std::chrono::seconds(1)};
+        if (mode == 8) {
+            CollectiveDescriptor d{{1, 2, 3}, CollectiveKind::all_reduce_sum, ScalarType::fp32, 1, {}};
+            h.channel.recv_frames.clear();
+            for (uint32_t rank : {1u, 2u}) h.channel.recv_frames.push_back(from(rank, FrameKind::operation, operation_payload(d)));
+            check(!session.agree_operation(d, at), "broadcast test holds a collective in flight");
+        }
+        const auto before = output;
+        const auto f = session.broadcast_control_payload(label, output, at);
+        const auto expected = mode == 0 ? FailureCode::none : mode == 5 ? FailureCode::oversized_frame :
+            mode == 6 ? FailureCode::deadline_expired : mode == 8 ? FailureCode::in_flight :
+            mode == 9 ? FailureCode::peer_closed : FailureCode::bad_operation;
+        check(f.code == expected && output == before && session.ready() == (mode == 0),
+              "coordinator broadcast requires distinct empty requests and exact acknowledgments before commit");
+        if (mode != 0) check(h.channel.sends_of(FrameKind::control_ack) == 0,
+                             "failed coordinator broadcast sends no commit");
+    }
+    {
+        Harness h;
+        queue_coordinator_ready(h);
+        Session session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "coordinator is ready for mixed control sequence");
+        bool exact = true;
+        for (uint64_t sequence = 1; sequence <= 4; ++sequence) {
+            const bool broadcast = sequence % 2 == 0;
+            const auto value = sequence == 4 ? std::string{} : bytes;
+            const auto message = broadcast ? broadcast_payload(sequence, label, value) : control_payload(sequence, label, value);
+            const auto initial = broadcast ? broadcast_payload(sequence, label, {}) : message;
+            for (uint32_t rank : {1u, 2u}) h.channel.recv_frames.push_back(from(rank, FrameKind::control, initial));
+            for (uint32_t rank : {1u, 2u}) h.channel.recv_frames.push_back(from(rank, FrameKind::control_ack, message));
+            std::string output = value;
+            const auto at = Deadline{h.clock.now() + std::chrono::seconds(1)};
+            exact &= !(broadcast ? session.broadcast_control_payload(label, output, at) : session.agree_control_payload(label, value, at));
+            exact &= output == value;
+        }
+        check(exact, "agreement and broadcast share a sequence, including an empty root broadcast");
     }
 }
 
@@ -1338,6 +1453,86 @@ void control_payload_agreement_over_tcp() {
     }
 }
 
+void control_payload_broadcast_over_tcp() {
+    for (int failure = -1; failure < 3; ++failure) {
+        const uint16_t port = pick_free_port();
+        check(port != 0, "a TCP port for rank-zero control broadcast");
+        if (!port) return;
+        std::atomic<int> finished{0};
+        FailureCode results[kTpWorld]{};
+        std::string details[kTpWorld];
+        uint32_t committed[kTpWorld]{};
+        bool exact[kTpWorld]{true, true, true};
+        std::vector<std::thread> threads;
+        for (uint32_t rank = 0; rank < kTpWorld; ++rank) {
+            threads.emplace_back([&, rank] {
+                SystemClock clock;
+                TcpChannelConfig wire;
+                wire.rank = rank;
+                wire.self = wire.rank0 = TcpEndpoint{"127.0.0.1", port};
+                wire.credential = kCredential;
+                std::string err;
+                auto channel = make_tcp_control_channel(wire, clock, err);
+                auto config = good_config(rank);
+                config.budgets = PhaseBudgets{3000, 3000, 3000, 3000};
+                Session session(config, good_join(rank), *channel, clock, [](std::string_view) {});
+                Failure f = session.start();
+                for (uint64_t sequence = 1; !f && sequence <= 6; ++sequence) {
+                    std::string label("action\0step", 11);
+                    const size_t overhead = 4 + 4 + std::strlen(kUuid) + 8 + 4 + label.size() + 4;
+                    std::string expected(kControlMaxPayload - overhead, '\0');
+                    expected.front() = static_cast<char>(sequence);
+                    expected.back() = static_cast<char>(0xff);
+                    if (sequence == 4) expected.clear();
+                    std::string output = rank == 0 ? expected : std::string{};
+                    if (sequence == 2 && rank == 2) {
+                        if (failure == 0) label[1] ^= 1;
+                        if (failure == 1) output = "forbidden-follower-input";
+                        if (failure == 2) {
+                            session.close();
+                            f = Failure::fail(FailureCode::peer_closed, "deliberate test disconnect");
+                            break;
+                        }
+                    }
+                    if (sequence % 2 == 0) {
+                        const auto before = output;
+                        f = session.broadcast_control_payload(label, output,
+                                                              {clock.now() + std::chrono::seconds(3)});
+                        exact[rank] &= output == (f ? before : expected);
+                    } else {
+                        f = session.agree_control_payload(label, expected,
+                                                          {clock.now() + std::chrono::seconds(3)});
+                    }
+                    if (!f) ++committed[rank];
+                    if (!f) {
+                        CollectiveDescriptor d{{sequence, 2, 3}, CollectiveKind::all_reduce_sum,
+                                                ScalarType::fp32, 1, {}};
+                        f = session.agree_operation(d, {clock.now() + std::chrono::seconds(3)});
+                        if (!f) f = session.complete_operation(d.operation);
+                    }
+                }
+                results[rank] = f.code;
+                details[rank] = f.detail;
+                ++finished;
+                const auto end = clock.now() + std::chrono::seconds(3);
+                while (finished != 3 && clock.now() < end) std::this_thread::yield();
+                session.close();
+            });
+        }
+        for (auto& thread : threads) thread.join();
+        for (uint32_t rank = 0; rank < kTpWorld; ++rank) {
+            const auto expected = failure < 0 ? FailureCode::none :
+                failure == 2 ? FailureCode::peer_closed : FailureCode::bad_operation;
+            check(results[rank] == expected && exact[rank] && committed[rank] == (failure < 0 ? 6u : 1u),
+                  failure < 0 ? "three TCP ranks mix agreement and max-size/empty binary broadcasts before collectives" :
+                                "TCP broadcast disagreement or disconnect fails all ranks without publishing output");
+            if (results[rank] != expected)
+                std::printf("    failure %d rank %u: %s: %s\n", failure, rank,
+                            failure_code_name(results[rank]), details[rank].c_str());
+        }
+    }
+}
+
 void queued_abort_survives_tcp_reset() {
     const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in address{};
@@ -1632,6 +1827,7 @@ int main() {
     coordinator_reaches_ready();
     collective_agreement();
     control_payload_agreement();
+    control_payload_broadcast();
     follower_reaches_ready();
     follower_adopts_the_smaller_budget();
     coordinator_refuses_a_group_that_does_not_agree();
@@ -1647,6 +1843,7 @@ int main() {
     three_ranks_over_real_tcp();
     collective_agreement_over_tcp();
     control_payload_agreement_over_tcp();
+    control_payload_broadcast_over_tcp();
     queued_abort_survives_tcp_reset();
     a_follower_starts_before_its_coordinator();
     raw_peers_over_real_tcp();

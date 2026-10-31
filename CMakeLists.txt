@@ -2836,7 +2836,9 @@ if(STRATA_BUILD_DISTRIBUTED)
                  src/distributed/expert_model.cpp src/distributed/qsa_model.cpp
                  src/distributed/model_worker.cpp src/distributed/worker.cpp
                  src/distributed/session.cpp src/distributed/control_tcp.cpp
-                 src/distributed/state_evidence.cpp src/distributed/parity_trace_writer.cpp)
+                 src/distributed/state_evidence.cpp src/distributed/parity_trace_writer.cpp
+                 src/distributed/serve_protocol.cpp src/distributed/autoregressive.cpp
+                 src/distributed/model_checkpoint.cpp)
   target_compile_definitions(strata-distributed PRIVATE STRATA_BUILD_DISTRIBUTED
                              STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE)
   target_include_directories(strata-distributed PRIVATE include src ${STRATA_NCCL_INCLUDE_DIR}
@@ -2895,6 +2897,23 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_include_directories(test_worker_protocol PRIVATE include)
   target_link_libraries(test_worker_protocol PRIVATE strata_warnings)
   add_test(NAME test_worker_protocol COMMAND test_worker_protocol)
+
+  add_executable(test_serve_protocol tests/distributed/test_serve_protocol.cpp src/distributed/serve_protocol.cpp)
+  target_include_directories(test_serve_protocol PRIVATE include)
+  target_link_libraries(test_serve_protocol PRIVATE strata_warnings)
+  add_test(NAME test_serve_protocol COMMAND test_serve_protocol)
+
+  add_executable(test_autoregressive tests/distributed/test_autoregressive.cpp
+                 src/distributed/autoregressive.cpp src/distributed/serve_protocol.cpp src/distributed/worker.cpp)
+  target_include_directories(test_autoregressive PRIVATE include)
+  target_link_libraries(test_autoregressive PRIVATE strata_warnings)
+  add_test(NAME test_autoregressive COMMAND test_autoregressive)
+
+  add_executable(test_model_checkpoint tests/distributed/test_model_checkpoint.cpp
+                 src/distributed/model_checkpoint.cpp src/distributed/state_evidence.cpp)
+  target_include_directories(test_model_checkpoint PRIVATE include)
+  target_link_libraries(test_model_checkpoint PRIVATE strata_warnings)
+  add_test(NAME test_model_checkpoint COMMAND test_model_checkpoint)
 
   add_executable(test_model_worker_command tests/distributed/test_model_worker_command.cpp
                                           src/distributed/model_worker.cpp)

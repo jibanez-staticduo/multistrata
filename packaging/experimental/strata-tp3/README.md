@@ -2,8 +2,9 @@
 
 This package uses the public SparkRun 0.4.1 plugin API. It launches three
 Strata ranks through SparkRun's native container lifecycle. The pinned image
-provides CUDA and Python; no vLLM process is launched. This is a transport
-correctness smoke, not a model server or a performance result.
+provides CUDA and Python; no vLLM process is launched. The transport smoke,
+teacher-forced model and autoregressive service have separate validation gates.
+No performance improvement has been established.
 
 ## Isolated setup on DG1
 
@@ -103,7 +104,36 @@ The tests use real plugin discovery and check all rank argv, quoting, topology,
 the absence of the bootstrap probe, and delegation to native start/stop.
 No GPU or Docker execution is needed.
 
-`mode: distributed` is reserved for a future separately built engine. It
+`mode: distributed` launches a separately built experimental engine. It
 requires an explicit absolute `distributed_executable` and a
 `distributed_args` argv list. Only `{rank}` and `{world_size}` placeholders are
-supported. This package does not ship or claim an existing distributed server.
+supported.
+
+## Experimental C1 service
+
+`service.yaml` runs `run_service_rank.py` on each host. Rank zero starts the
+existing Python API with `--engine distributed`; ranks one and two run the
+native `strata-distributed --mode autoregressive` worker. The endpoint binds
+to `127.0.0.1:18080`. The normal launch path is unchanged.
+
+Each rank needs a JSON config with binary, driver source, NCCL and tokenizer
+hashes, the staged Python source manifest and a fresh evidence directory.
+The wrapper reads its credential from a user-owned mode-0600 file, validates
+the artifacts and starts only with `--execute`. It bounds process lifetime and
+log size and stops the complete child process group on exit. See its module
+docstring for the config fields. The image must provide `regex` and `jinja2`.
+
+The native coordinator owns sampling and sends only tokens whose source
+logits have committed on all three ranks. Cancellation finishes the current
+step and resets the group before accepting another request. Periodic health
+requires a round trip through every worker. A worker failure ends the group.
+
+CPU protocol and API tests use simulated model execution. The short hardware
+trial on 2026-10-31 compared four teacher-forced tokens, repeated after RESET,
+against an independent TP1 implementation: logits and captured logical state
+were bit-identical on DG1/DG2/DG3 with the ISTA IQ3_S pack. That trial does not
+qualify autoregressive HTTP serving, long prompts, 64K, MTP, graphs or C8.
+
+`tools/distributed/benchmark_tp.py` prepares a matched TP1/TP2/TP3 matrix.
+It defaults to a dry run and records unsupported cases as `NOT_RUN`.
+The TP1 numerical oracle stages experts and is not a matched speed baseline.

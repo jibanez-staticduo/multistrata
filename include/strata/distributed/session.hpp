@@ -301,6 +301,11 @@ class Session {
     // All ranks acknowledge the same metadata before this returns. Any disagreement ends the session.
     Failure agree_control_payload(std::string_view label, std::string_view payload, Deadline at);
 
+    // Rank 0 supplies the bytes; followers supply an empty string and receive them only after every rank
+    // acknowledges the same bounded binary envelope and rank 0 commits it. Shares the control agreement
+    // sequence, requires READY and no collective in flight. Any failure ends the session; output is unchanged.
+    Failure broadcast_control_payload(std::string_view label, std::string& payload, Deadline at);
+
     // End the session and try to tell the others.  Idempotent; the first reason wins.
     void abort(std::string_view reason);
 

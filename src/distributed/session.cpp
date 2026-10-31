@@ -1053,6 +1053,120 @@ Failure Session::agree_control_payload(std::string_view label, std::string_view 
     return ok_failure();
 }
 
+Failure Session::broadcast_control_payload(std::string_view label, std::string& output, Deadline at) {
+    if (state_ != SessionState::ready) {
+        return Failure::fail(FailureCode::not_ready, "no control broadcast before READY");
+    }
+    if (operation_in_flight_) {
+        return fail(Failure::fail(FailureCode::in_flight, "a collective is already in flight"), true);
+    }
+    if (config_.rank != 0 && !output.empty()) {
+        return fail(Failure::fail(FailureCode::bad_operation, "a control broadcast follower supplied input"), true);
+    }
+    constexpr size_t cap = kControlMaxPayload;
+    const size_t overhead = 4 + 4 + config_.session_uuid.size() + 8 + 4 + 4;
+    if (overhead > cap || label.size() > cap - overhead ||
+        output.size() > cap - overhead - label.size()) {
+        return fail(Failure::fail(FailureCode::oversized_frame, "control broadcast exceeds the payload cap"), true);
+    }
+    if (next_control_sequence_ == UINT64_MAX) {
+        return fail(Failure::fail(FailureCode::overflow, "control broadcast sequence is exhausted"), true);
+    }
+    auto check_deadline = [&]() -> Failure {
+        return deadline_passed(clock_, at)
+            ? Failure::fail(FailureCode::deadline_expired, "control broadcast deadline passed")
+            : ok_failure();
+    };
+    if (auto f = check_deadline()) return fail(f, true);
+
+    // A marker impossible at the start of a valid agreement envelope (its UUID length is 36) keeps mixed
+    // agreement/broadcast calls from matching, including when the root broadcasts an empty payload.
+    std::string prefix;
+    put_u32(prefix, 0x42524331u);  // BRC1
+    if (auto f = put_field(prefix, "session_uuid", config_.session_uuid)) return fail(f, true);
+    put_u32(prefix, static_cast<uint32_t>(next_control_sequence_ >> 32));
+    put_u32(prefix, static_cast<uint32_t>(next_control_sequence_));
+    put_u32(prefix, static_cast<uint32_t>(label.size()));
+    prefix.append(label);
+    std::string payload = prefix;
+    put_u32(payload, static_cast<uint32_t>(output.size()));
+    payload.append(output);
+    const std::string request = prefix + std::string(4, '\0');
+    std::string staged;
+
+    auto send = [&](uint32_t rank, FrameKind kind, std::string_view bytes) -> Failure {
+        if (auto f = check_deadline()) return f;
+        return channel_.send(rank, kind, bytes, at);
+    };
+    auto receive = [&](FrameKind kind, std::vector<bool>& seen, std::string_view expected,
+                       bool accept_root_payload = false) -> Failure {
+        if (auto f = check_deadline()) return f;
+        ReceivedFrame got;
+        if (auto f = channel_.recv(got, at)) return f;
+        if (got.frame.kind == FrameKind::abort) return peer_abort(got);
+        if (got.frame.kind != kind || got.from_rank >= config_.world || seen[got.from_rank]) {
+            return Failure::fail(FailureCode::bad_operation, "unexpected or duplicate control broadcast frame");
+        }
+        const auto& bytes = got.frame.payload;
+        if (bytes.size() > cap) {
+            return Failure::fail(FailureCode::oversized_frame, "control broadcast exceeds the payload cap");
+        }
+        if (accept_root_payload) {
+            if (bytes.size() < prefix.size() + 4) {
+                return Failure::fail(FailureCode::truncated_frame, "control broadcast envelope is incomplete");
+            }
+            if (bytes.compare(0, prefix.size(), prefix) != 0) {
+                return Failure::fail(FailureCode::bad_operation, "ranks disagree on control broadcast sequence or label");
+            }
+            const size_t length = get_u32(bytes.data() + prefix.size());
+            const size_t remaining = bytes.size() - prefix.size() - 4;
+            if (length > cap - prefix.size() - 4) {
+                return Failure::fail(FailureCode::oversized_frame, "control broadcast claims more bytes than the cap allows");
+            }
+            if (length != remaining) {
+                return Failure::fail(length > remaining ? FailureCode::truncated_frame : FailureCode::bad_frame,
+                                     "control broadcast payload length disagrees with the envelope");
+            }
+            staged.assign(bytes.data() + prefix.size() + 4, length);
+            payload = bytes;
+        } else if (bytes != expected) {
+            return Failure::fail(FailureCode::bad_operation, "ranks disagree on control broadcast metadata or payload");
+        }
+        seen[got.from_rank] = true;
+        return ok_failure();
+    };
+    if (config_.rank == 0) {
+        std::vector<bool> seen(config_.world, false);
+        seen[0] = true;
+        for (uint32_t i = 1; i < config_.world; ++i) {
+            if (auto f = receive(FrameKind::control, seen, request)) return fail(f, true);
+        }
+        for (uint32_t i = 1; i < config_.world; ++i) {
+            if (auto f = send(i, FrameKind::control, payload)) return fail(f, true);
+        }
+        seen.assign(config_.world, false);
+        seen[0] = true;
+        for (uint32_t i = 1; i < config_.world; ++i) {
+            if (auto f = receive(FrameKind::control_ack, seen, payload)) return fail(f, true);
+        }
+        for (uint32_t i = 1; i < config_.world; ++i) {
+            if (auto f = send(i, FrameKind::control_ack, payload)) return fail(f, true);
+        }
+    } else {
+        if (auto f = send(0, FrameKind::control, request)) return fail(f, true);
+        std::vector<bool> seen(config_.world, true);
+        seen[0] = false;
+        if (auto f = receive(FrameKind::control, seen, {}, true)) return fail(f, true);
+        if (auto f = send(0, FrameKind::control_ack, payload)) return fail(f, true);
+        seen[0] = false;
+        if (auto f = receive(FrameKind::control_ack, seen, payload)) return fail(f, true);
+    }
+    if (auto f = check_deadline()) return fail(f, true);
+    ++next_control_sequence_;
+    if (config_.rank != 0) output.swap(staged);
+    return ok_failure();
+}
+
 void Session::abort(std::string_view reason) {
     if (state_ == SessionState::closed) return;
     if (state_ != SessionState::failed) {

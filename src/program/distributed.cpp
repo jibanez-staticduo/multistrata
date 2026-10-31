@@ -1,10 +1,11 @@
-// Opt-in, uncaptured C1 teacher-forcing driver. Every rank reads identical
-// token IDs; the control protocol agrees them before any model operation.
+// Opt-in, uncaptured C1 driver. Teacher forcing keeps the original per-rank input;
+// autoregressive mode lets rank zero coordinate JSONL requests and sampled IDs.
 #include "distributed/nccl_transport.cpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/distributed/expert_model.hpp"
 #include "strata/distributed/model_worker.hpp"
+#include "strata/distributed/autoregressive.hpp"
 #include "strata/distributed/parity_trace_writer.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_gdn.hpp"
@@ -24,6 +25,14 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <cerrno>
+#include <csignal>
+#include <cstring>
+#include <fcntl.h>
+#include <poll.h>
+#include <random>
+#include <thread>
+#include <unistd.h>
 
 namespace {
 using namespace strata;
@@ -44,6 +53,185 @@ struct Stream {
 struct SessionLifetime {
     core::SessionState& state;
     ~SessionLifetime() { core::session_release(state); }
+};
+
+struct PinnedAllocation {
+    void* pointer = nullptr;
+    ~PinnedAllocation() { if (pointer) cudaFreeHost(pointer); }
+    void allocate(size_t bytes) { cuda_check(cudaMallocHost(&pointer, bytes)); }
+};
+struct Event {
+    cudaEvent_t value = nullptr;
+    Event() { cuda_check(cudaEventCreateWithFlags(&value, cudaEventDisableTiming)); }
+    ~Event() { if (value) cudaEventDestroy(value); }
+};
+
+class JsonInput {
+ public:
+    JsonInput() {
+        previous_ = ::fcntl(STDIN_FILENO, F_GETFL);
+        require(previous_ >= 0 && ::fcntl(STDIN_FILENO, F_SETFL, previous_ | O_NONBLOCK) == 0,
+                "cannot set nonblocking serve input");
+    }
+    ~JsonInput() { if (previous_ >= 0) ::fcntl(STDIN_FILENO, F_SETFL, previous_); }
+    Failure poll(uint32_t wait_ms, std::string& line, bool& eof) {
+        line.clear(); eof = false;
+        auto extract = [&]() {
+            const auto end = pending_.find('\n');
+            if (end == std::string::npos) return false;
+            line = pending_.substr(0, end); pending_.erase(0, end + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) throw std::runtime_error("empty serve input line");
+            return true;
+        };
+        if (extract()) return {};
+        if (eof_) { eof = true; return {}; }
+        pollfd fd{STDIN_FILENO, POLLIN, 0};
+        const int ready = ::poll(&fd, 1, int(wait_ms));
+        if (ready < 0) {
+            if (errno == EINTR) return {};
+            return Failure::fail(FailureCode::comm_failed, "serve stdin poll failed");
+        }
+        if (!ready) return {};
+        char buffer[4096];
+        // One bounded read per turn also keeps an endlessly writing pipe from delaying group health.
+        const auto n = ::read(STDIN_FILENO, buffer, sizeof buffer);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return {};
+            return Failure::fail(FailureCode::comm_failed, "serve stdin read failed");
+        }
+        if (!n) {
+            eof_ = true;
+            if (!pending_.empty()) return Failure::fail(FailureCode::truncated_frame, "serve input ended before newline");
+            eof = true; return {};
+        }
+        pending_.append(buffer, size_t(n));
+        const auto first = pending_.find('\n');
+        if ((first == std::string::npos ? pending_.size() : first) > kAutoregressiveMaxLine)
+            return Failure::fail(FailureCode::oversized_frame, "serve input exceeds one MiB");
+        extract(); return {};
+    }
+ private:
+    int previous_ = -1;
+    bool eof_ = false;
+    std::string pending_;
+};
+
+class JsonOutput {
+ public:
+    JsonOutput(bool coordinator, uint32_t timeout) : timeout_(timeout) {
+        if (coordinator) {
+            fd_ = ::dup(STDOUT_FILENO);
+            require(fd_ >= 0, "cannot preserve JSON output channel");
+            const int flags = ::fcntl(fd_, F_GETFL);
+            require(flags >= 0 && ::fcntl(fd_, F_SETFL, flags | O_NONBLOCK) == 0, "cannot bound JSON output");
+        }
+        // Core and library diagnostics (including C stdio) go to stderr in this opt-in mode.
+        require(::dup2(STDERR_FILENO, STDOUT_FILENO) >= 0, "cannot route service diagnostics to stderr");
+    }
+    ~JsonOutput() { if (fd_ >= 0) ::close(fd_); }
+    void emit(std::string_view json) {
+        const std::string line = std::string(json) + '\n';
+        size_t offset = 0;
+        const auto at = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_);
+        while (offset < line.size()) {
+            const auto n = ::write(fd_, line.data() + offset, line.size() - offset);
+            if (n > 0) { offset += size_t(n); continue; }
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                throw std::runtime_error("JSON output channel failed");
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(at - std::chrono::steady_clock::now()).count();
+            require(left > 0, "JSON output deadline expired");
+            pollfd fd{fd_, POLLOUT, 0};
+            const int result = ::poll(&fd, 1, int(std::min<int64_t>(left, 100)));
+            require(result >= 0 || errno == EINTR, "JSON output poll failed");
+        }
+    }
+ private:
+    int fd_ = -1;
+    uint32_t timeout_;
+};
+
+// CUDA sampler buffers are fixed before READY. Host staging is pinned, and completion uses the same
+// bounded event/health polling as ModelWorker; no stream/device synchronize enters the service loop.
+class ServiceSampler {
+ public:
+    ServiceSampler(size_t vocabulary, size_t context, cudaStream_t stream, Session& session,
+                   GuardedTransport& transport, ModelWorkerBackend& execution)
+        : vocabulary_(vocabulary), context_(context), stream_(stream), session_(session), transport_(transport), execution_(execution) {
+        logits_.allocate(vocabulary * sizeof(float)); bias_.allocate(vocabulary * sizeof(float));
+        history_.allocate(context * sizeof(int32_t)); token_.allocate(sizeof(int32_t));
+        host_logits_.allocate(vocabulary * sizeof(float)); host_bias_.allocate(vocabulary * sizeof(float));
+        host_history_.allocate(context * sizeof(int32_t)); host_token_.allocate(sizeof(int32_t));
+        // sample_tokens caches split top-k scratch per stream on its first sampled call. Populate it before
+        // READY so no request needs to allocate it; these dummy logits never enter model/request state.
+        cuda_check(cudaMemsetAsync(logits_.pointer, 0, vocabulary * sizeof(float), stream_));
+        kernels::SamplerParams warm;
+        warm.top_k = 64; warm.top_p = 1.0f; warm.seed = 1;
+        kernels::sample_tokens(static_cast<const float*>(logits_.pointer), 1, int(vocabulary), nullptr, 0,
+                               warm, static_cast<int*>(token_.pointer), stream_);
+        cuda_check(cudaGetLastError());
+        require(wait());
+    }
+    Failure sample(const ServeRequest& request, const std::vector<int32_t>& history, uint64_t draw, int32_t& out) {
+        const auto* logits = execution_.committed_logits();
+        if (!logits || execution_.logits_size() != vocabulary_)
+            return Failure::fail(FailureCode::bad_operation, "sampler requires committed rank-zero logits");
+        if (history.empty() || history.size() > context_)
+            return Failure::fail(FailureCode::bad_operation, "sampler history exceeds fixed context capacity");
+        if (draw == 0) {
+            params_ = request.sampling;
+            params_.penalty_last_n = std::min(params_.penalty_last_n, int(context_));
+            if (!params_.seed) {
+                std::random_device entropy;
+                params_.seed = (uint64_t(entropy()) << 32) ^ uint64_t(entropy());
+                if (!params_.seed) params_.seed = 1;
+            }
+            auto* bias = static_cast<float*>(host_bias_.pointer);
+            std::fill(bias, bias + vocabulary_, 0.0f);
+            for (const auto& [id, value] : request.logit_bias) bias[id] = value;
+            cuda_check(cudaMemcpyAsync(bias_.pointer, bias, vocabulary_ * sizeof(float), cudaMemcpyHostToDevice, stream_));
+            params_.logit_bias = request.logit_bias.empty() ? nullptr : static_cast<const float*>(bias_.pointer);
+        }
+        params_.counter = request.sampling.counter + draw;
+        std::memcpy(host_logits_.pointer, logits, vocabulary_ * sizeof(float));
+        std::memcpy(host_history_.pointer, history.data(), history.size() * sizeof(int32_t));
+        cuda_check(cudaMemcpyAsync(logits_.pointer, host_logits_.pointer, vocabulary_ * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        cuda_check(cudaMemcpyAsync(history_.pointer, host_history_.pointer, history.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream_));
+        kernels::sample_tokens(static_cast<const float*>(logits_.pointer), 1, int(vocabulary_),
+                               static_cast<const int*>(history_.pointer), int(history.size()), params_,
+                               static_cast<int*>(token_.pointer), stream_);
+        cuda_check(cudaGetLastError());
+        cuda_check(cudaMemcpyAsync(host_token_.pointer, token_.pointer, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
+        if (auto f = wait()) return f;
+        out = *static_cast<const int32_t*>(host_token_.pointer);
+        return {};
+    }
+ private:
+    Failure wait() {
+        cuda_check(cudaEventRecord(event_.value, stream_));
+        Deadline deadline;
+        if (auto f = session_.operation_deadline(deadline)) return f;
+        for (;;) {
+            const auto status = cudaEventQuery(event_.value);
+            if (status == cudaSuccess) break;
+            if (status != cudaErrorNotReady) return Failure::fail(FailureCode::comm_failed, cudaGetErrorString(status));
+            if (auto f = transport_.check_health()) return f;
+            if (std::chrono::steady_clock::now() >= deadline.end)
+                return Failure::fail(FailureCode::deadline_expired, "sampler completion deadline expired");
+            std::this_thread::yield();
+        }
+        return transport_.check_health();
+    }
+    size_t vocabulary_;
+    size_t context_;
+    cudaStream_t stream_;
+    Session& session_;
+    GuardedTransport& transport_;
+    ModelWorkerBackend& execution_;
+    Allocation logits_, bias_, history_, token_;
+    PinnedAllocation host_logits_, host_bias_, host_history_, host_token_;
+    Event event_;
+    kernels::SamplerParams params_;
 };
 
 void wire_ple(const core::WeightTable& weights, core::SessionState& state,
@@ -95,7 +283,7 @@ int main(int argc, char** argv) {
         const std::set<std::string> allowed = {"rank", "rank0-address", "port", "session-uuid",
             "library-path", "nccl-version", "library-provenance", "model-hash", "config-fingerprint",
             "pack", "native", "ple", "context", "logits-dir", "timeout-ms",
-            "state-dir", "state-positions", "state-max-bytes", "trace-dir"};
+            "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) || args.contains(key.substr(2)))
@@ -128,8 +316,19 @@ int main(int argc, char** argv) {
                        "state options require state-dir");
         const uint64_t rank = number("rank", 3), port = number("port", 0);
         const auto timeout = number("timeout-ms", 60000), context = number("context", 256);
-        if (rank >= 3 || port < 1024 || port > 65535 || timeout < 100 || timeout > 600000 || context < 4 || context > 32768)
+        const auto mode = args.contains("mode") ? args.at("mode") : "teacher-forced";
+        require(mode == "teacher-forced" || mode == "autoregressive", "invalid distributed mode");
+        const bool autoregressive = mode == "autoregressive";
+        if (rank >= 3 || port < 1024 || port > 65535 || timeout < 100 || timeout > 600000 || context < 4 ||
+            context > (autoregressive ? 65536u : 32768u))
             throw std::runtime_error("invalid rank, port, deadline or context");
+        std::unique_ptr<JsonOutput> json;
+        if (autoregressive) {
+            require(!args.contains("trace-dir") && !args.contains("state-dir") && !args.contains("logits-dir"),
+                    "autoregressive mode does not accept teacher-forced evidence options");
+            json = std::make_unique<JsonOutput>(rank == 0, uint32_t(timeout));
+            std::signal(SIGPIPE, SIG_IGN);
+        }
         const auto pack = get("pack"), native = get("native"), ple = get("ple");
         const auto shards = gguf_split_paths(native);
         const GgufFile metadata(shards.front());
@@ -143,6 +342,7 @@ int main(int argc, char** argv) {
         kernels::gr_set_fp32_activations(true); kernels::gr_set_native_mmvf(true);
         core::layer_set_native_bf16(true); core::layer_set_fused_gr(false);
         core::layer_set_fused_gdn(false); core::layer_set_fast_attn(false);
+        core::layer_set_fast_select(true);
         core::layer_set_native_flash_attn_short(false); core::layer_set_shared_early(true);
         kernels::native_grouped_set_v1(true); kernels::iq_set_old_kernels(true);
         kernels::native_expert_set_mode(0, 0); kernels::native_expert_set_expdec(0);
@@ -252,6 +452,44 @@ int main(int argc, char** argv) {
                 return result;
             };
             execute(StepPhase::init);
+            if (autoregressive) {
+                std::unique_ptr<JsonInput> input;
+                std::unique_ptr<ServiceSampler> sampler;
+                if (rank == 0) {
+                    input = std::make_unique<JsonInput>();
+                    sampler = std::make_unique<ServiceSampler>(size_t(geometry.n_vocab), size_t(context),
+                                                               stream.value, session, transport, execution);
+                }
+                AutoregressiveCallbacks callbacks;
+                callbacks.poll = [&](uint32_t wait, std::string& line, bool& eof) {
+                    return input->poll(wait, line, eof);
+                };
+                callbacks.broadcast = [&](std::string_view label, std::string& bytes) {
+                    Deadline at;
+                    if (auto f = session.operation_deadline(at)) return f;
+                    return session.broadcast_control_payload(label, bytes, at);
+                };
+                callbacks.health = [&] { return transport.check_health(); };
+                callbacks.execute = [&](StepPhase phase, std::string_view request, int32_t token, uint64_t position) {
+                    StepCommand command{join.session_uuid, std::string(request), 0, step++, phase,
+                                        {}, {}, join.model_hash, {}};
+                    if (phase == StepPhase::prefill || phase == StepPhase::decode) {
+                        command.tokens = {token}; command.positions = {position};
+                    }
+                    if (auto f = execution.plan(command, command.expected_collective_schedule)) return f;
+                    const auto result = worker.execute(command);
+                    if (result.status != StepStatus::completed && result.status != StepStatus::cancelled)
+                        return result.failure ? result.failure : Failure::fail(FailureCode::bad_operation, "worker did not complete serve step");
+                    return Failure{};
+                };
+                callbacks.sample = [&](const ServeRequest& request, const std::vector<int32_t>& history,
+                                       uint64_t draw, int32_t& token) { return sampler->sample(request, history, draw, token); };
+                callbacks.emit = [&](std::string_view type, std::string_view request, int32_t token, std::string_view status) {
+                    json->emit(serve_event(type, request, token, uint32_t(context), status));
+                };
+                require(run_autoregressive(uint32_t(rank), int32_t(geometry.n_vocab), uint32_t(context), callbacks,
+                                          std::min(config.budgets.operation_ms, session.roster().budgets.operation_ms)));
+            } else {
             std::set<uint64_t> dumped_positions;
             auto dump_state = [&](bool reset) {
                 if (!args.contains("state-dir")) return;
@@ -319,6 +557,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 require(any && input.eof(), "GEN needs valid integer token IDs");
+            }
             }
             transport.abort("driver finished");
             require(session.close());
