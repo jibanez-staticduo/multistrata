@@ -93,7 +93,8 @@ int main(int argc, char** argv) {
         std::map<std::string, std::string> args;
         const std::set<std::string> allowed = {"rank", "rank0-address", "port", "session-uuid",
             "library-path", "nccl-version", "library-provenance", "model-hash", "config-fingerprint",
-            "pack", "native", "ple", "context", "logits-dir", "timeout-ms"};
+            "pack", "native", "ple", "context", "logits-dir", "timeout-ms",
+            "state-dir", "state-positions", "state-max-bytes"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) || args.contains(key.substr(2)))
@@ -110,6 +111,20 @@ int main(int argc, char** argv) {
             if (used != args.at(key).size()) throw std::runtime_error("invalid numeric argument");
             return uint64_t(n);
         };
+        std::set<uint64_t> state_positions;
+        bool state_last = false;
+        if (args.contains("state-dir")) {
+            std::istringstream values(args.contains("state-positions") ? args.at("state-positions") : "0,3,last");
+            std::string value;
+            while (std::getline(values, value, ',')) {
+                if (value == "last") { state_last = true; continue; }
+                size_t used = 0;
+                const auto position = std::stoull(value, &used);
+                require(used == value.size() && state_positions.insert(position).second,
+                        "invalid or duplicate state position");
+            }
+        } else require(!args.contains("state-positions") && !args.contains("state-max-bytes"),
+                       "state options require state-dir");
         const uint64_t rank = number("rank", 3), port = number("port", 0);
         const auto timeout = number("timeout-ms", 60000), context = number("context", 256);
         if (rank >= 3 || port < 1024 || port > 65535 || timeout < 100 || timeout > 600000 || context < 4 || context > 32768)
@@ -221,15 +236,41 @@ int main(int argc, char** argv) {
                 return result;
             };
             execute(StepPhase::init);
+            std::set<uint64_t> dumped_positions;
+            auto dump_state = [&](bool reset) {
+                if (!args.contains("state-dir")) return;
+                const auto count = uint64_t(model.next_position());
+                if (!reset && (!count || !dumped_positions.insert(count - 1).second)) return;
+                std::vector<StateEvidenceArray> arrays;
+                const StateReadback readback = [](void* dst, const void* src, size_t n, std::string& error) {
+                    const auto status = cudaMemcpy(dst, src, n, cudaMemcpyDeviceToHost);
+                    if (status != cudaSuccess) { error = cudaGetErrorString(status); return false; }
+                    return true;
+                };
+                require(describe_session_state(state, geometry, count, readback, model.state_sources(), arrays, err), err);
+                StateEvidenceRequest request;
+                request.request_id = "request-" + std::to_string(request_sequence);
+                request.position = count ? count - 1 : 0;
+                request.token_count = count;
+                request.max_bytes = number("state-max-bytes", uint64_t(4) << 30);
+                request.reset = reset;
+                request.required = state_evidence_inventory(arrays);
+                const auto path = std::filesystem::path(args.at("state-dir")) / request.request_id /
+                                  (reset ? "reset" : "position-" + std::to_string(count - 1));
+                require(write_state_evidence(path.string(), request, arrays, err), err);
+            };
+            dump_state(true);
             std::cout << "READY rank=" << rank << " tp=3 pp=1 layers=48 c=1"
                       << " policy=native-original-v1-gather-reference"
                       << " grouped_v1=1 old_iq=1 expert_mode=0 expert_expdec=0"
                       << " fused_gr=0 fused_gdn=0 fast_attn=0 flash_short=0 shared_early=1\n";
             std::string line;
             while (std::getline(std::cin, line)) {
-                if (line == "QUIT") break;
+                if (line == "QUIT") { if (state_last) dump_state(false); break; }
                 if (line == "RESET") {
+                    if (state_last) dump_state(false);
                     execute(StepPhase::reset); ++request_sequence;
+                    dumped_positions.clear(); dump_state(true);
                     std::cout << "RESET_OK\n"; continue;
                 }
                 std::istringstream input(line);
@@ -243,12 +284,16 @@ int main(int argc, char** argv) {
                     const auto pos = model.next_position();
                     execute(StepPhase::prefill, {int32_t(id)}, {uint64_t(pos)});
                     const auto result = execute(StepPhase::commit);
+                    if (state_positions.contains(uint64_t(pos))) dump_state(false);
                     if (rank == 0 && result.output_ready) {
                         const auto* logits = execution.committed_logits();
                         require(logits != nullptr, "commit did not publish logits");
                         const auto top = std::max_element(logits, logits + geometry.n_vocab) - logits;
                         if (args.contains("logits-dir")) {
-                            const auto path = std::filesystem::path(args.at("logits-dir")) / ("logits-" + std::to_string(pos) + ".f32");
+                            const auto directory = std::filesystem::path(args.at("logits-dir")) /
+                                                   ("request-" + std::to_string(request_sequence));
+                            std::filesystem::create_directories(directory);
+                            const auto path = directory / ("logits-" + std::to_string(pos) + ".f32");
                             std::ofstream file(path, std::ios::binary);
                             file.write(reinterpret_cast<const char*>(logits), geometry.n_vocab * sizeof(float));
                             require(bool(file), "cannot write logits artifact");

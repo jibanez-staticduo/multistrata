@@ -4,6 +4,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/distributed/session.hpp"
 #include "strata/distributed/worker.hpp"
+#include "strata/distributed/state_evidence.hpp"
 
 #include <array>
 #include <memory>
@@ -75,6 +76,7 @@ public:
                float* logits, void* stream, std::string& err);
     const core::ModelGeometry& geometry() const;
     int64_t next_position() const;
+    std::vector<GdnStateSource> state_sources() const;
     void invalidate() noexcept;
 private:
     bool mixer(int64_t, int64_t, int32_t, const float*, float*, void*, std::string&) override;

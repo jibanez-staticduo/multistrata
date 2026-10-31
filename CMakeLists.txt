@@ -2808,7 +2808,8 @@ if(STRATA_BUILD_DISTRIBUTED)
   target_link_libraries(strata-tp3-transport-smoke PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
 
   # Preserve the original native CUDA arithmetic; these files do not inherit fast-math source flags.
-  add_library(strata_tp_cuda STATIC src/kernels/cuda/tp/linear.cu src/kernels/cuda/tp/moe.cu)
+  add_library(strata_tp_cuda STATIC src/kernels/cuda/tp/linear.cu src/kernels/cuda/tp/moe.cu
+                                  src/kernels/cuda/tp/gdn.cu src/kernels/cuda/tp/qsa.cu)
   target_include_directories(strata_tp_cuda PUBLIC include PRIVATE third_party/ggml)
   target_link_libraries(strata_tp_cuda PUBLIC strata_kernels CUDA::cudart)
   add_executable(tp_expert_parity tests/distributed/tp_expert_parity.cu)
@@ -2816,6 +2817,39 @@ if(STRATA_BUILD_DISTRIBUTED)
   target_link_libraries(tp_expert_parity PRIVATE strata_tp_cuda)
   add_test(NAME distributed_tp_expert_parity COMMAND tp_expert_parity --measure-only)
   set_tests_properties(distributed_tp_expert_parity PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
+
+  add_executable(tp_gdn_parity tests/distributed/tp_gdn_parity.cu)
+  target_include_directories(tp_gdn_parity PRIVATE include)
+  target_link_libraries(tp_gdn_parity PRIVATE strata_tp_cuda)
+  add_test(NAME distributed_tp_gdn_parity COMMAND tp_gdn_parity --selftest)
+  set_tests_properties(distributed_tp_gdn_parity PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
+
+  add_executable(tp_qsa_parity tests/distributed/tp_qsa_parity.cu)
+  target_include_directories(tp_qsa_parity PRIVATE include)
+  target_link_libraries(tp_qsa_parity PRIVATE strata_tp_cuda)
+  add_test(NAME distributed_tp_qsa_parity COMMAND tp_qsa_parity --measure-only)
+  set_tests_properties(distributed_tp_qsa_parity PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
+
+  # The opt-in core seam must have the same declaration in the engine and its consumers.
+  target_compile_definitions(strata_engine PUBLIC STRATA_BUILD_DISTRIBUTED STRATA_DISTRIBUTED_CUDA)
+  add_executable(strata-distributed src/program/distributed.cpp src/distributed/model.cpp
+                 src/distributed/expert_model.cpp src/distributed/qsa_model.cpp
+                 src/distributed/model_worker.cpp src/distributed/worker.cpp
+                 src/distributed/session.cpp src/distributed/control_tcp.cpp
+                 src/distributed/state_evidence.cpp)
+  target_compile_definitions(strata-distributed PRIVATE STRATA_BUILD_DISTRIBUTED
+                             STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE)
+  target_include_directories(strata-distributed PRIVATE include src ${STRATA_NCCL_INCLUDE_DIR}
+                            ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(strata-distributed PRIVATE strata_engine strata_tp_cuda strata_kernels_cpu
+                        ${CMAKE_DL_LIBS} Threads::Threads)
+  add_executable(strata-tp-reference src/program/distributed_reference.cpp src/distributed/reference.cpp
+                                   src/distributed/state_evidence.cpp)
+  target_compile_definitions(strata-tp-reference PRIVATE STRATA_BUILD_DISTRIBUTED
+                             STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE)
+  target_include_directories(strata-tp-reference PRIVATE include src
+                            ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(strata-tp-reference PRIVATE strata_engine strata_kernels_cpu Threads::Threads)
 endif()
 
 if(STRATA_BUILD_DISTRIBUTED_TESTS)
@@ -2850,4 +2884,20 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_include_directories(tp_projection_test PRIVATE include)
   target_link_libraries(tp_projection_test PRIVATE strata_warnings)
   add_test(NAME tp_projection_test COMMAND tp_projection_test)
+
+  add_executable(test_worker_protocol tests/distributed/test_worker_protocol.cpp src/distributed/worker.cpp)
+  target_include_directories(test_worker_protocol PRIVATE include)
+  target_link_libraries(test_worker_protocol PRIVATE strata_warnings)
+  add_test(NAME test_worker_protocol COMMAND test_worker_protocol)
+
+  add_executable(test_model_worker_command tests/distributed/test_model_worker_command.cpp
+                                          src/distributed/model_worker.cpp)
+  target_include_directories(test_model_worker_command PRIVATE include)
+  target_link_libraries(test_model_worker_command PRIVATE strata_warnings)
+  add_test(NAME test_model_worker_command COMMAND test_model_worker_command)
+
+  add_executable(test_state_evidence tests/distributed/test_state_evidence.cpp src/distributed/state_evidence.cpp)
+  target_include_directories(test_state_evidence PRIVATE include)
+  target_link_libraries(test_state_evidence PRIVATE strata_warnings)
+  add_test(NAME test_state_evidence COMMAND test_state_evidence)
 endif()

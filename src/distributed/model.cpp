@@ -213,6 +213,31 @@ ModelForward::ModelForward(const core::WeightTable& w, const core::ModelGeometry
 ModelForward::~ModelForward() = default;
 const core::ModelGeometry& ModelForward::geometry() const { return impl_->geometry; }
 int64_t ModelForward::next_position() const { return impl_->next_position; }
+std::vector<GdnStateSource> ModelForward::state_sources() const {
+    const auto& p = *impl_;
+    if (!p.ready || p.failed) throw std::runtime_error("GDN evidence requires a live initialized model");
+    const auto& map = p.maps[p.rank];
+    const auto stride = map.state_elements() + map.history_elements();
+    std::vector<uint64_t> heads, channels;
+    for (int run = 0; run < 3; ++run)
+        for (int key = map.key_begin; key < map.key_end; ++key)
+            heads.push_back(uint64_t(run * map.global_key_heads + key));
+    for (int run = 0; run < 2; ++run)
+        for (int key = map.key_begin; key < map.key_end; ++key)
+            for (int lane = 0; lane < map.state_size; ++lane)
+                channels.push_back(uint64_t((run * map.global_key_heads + key) * map.state_size + lane));
+    for (const auto head : heads)
+        for (int lane = 0; lane < map.state_size; ++lane)
+            channels.push_back(uint64_t(2 * map.global_key_heads * map.state_size) + head * map.state_size + lane);
+    std::vector<GdnStateSource> result;
+    size_t ordinal = 0;
+    for (int64_t layer = 0; layer < p.geometry.n_layers; ++layer) {
+        if (core::is_qsa_layer(p.geometry, layer)) continue;
+        auto* recurrent = p.states + ordinal++ * stride;
+        result.push_back({layer, recurrent, recurrent + map.state_elements(), heads, channels});
+    }
+    return result;
+}
 void ModelForward::invalidate() noexcept { impl_->failed = true; }
 void ModelForward::native_head(const core::NativeHead* head) { impl_->head = head; }
 
@@ -259,6 +284,17 @@ bool ModelForward::reset(void* stream, std::string& err) {
         checked(cudaMemsetAsync(p.embedding, 0, size_t(p.geometry.n_embd) * sizeof(float),
                                 static_cast<cudaStream_t>(stream)));
         core::session_zero(p.state, p.geometry, p.embedding, stream);
+        for (int64_t i = 0; i < p.state.qsa_alloc; ++i) {
+            auto& q = p.state.qsa_states[p.state.qsa_ord0 + i];
+            checked(cudaMemsetAsync(q.step, 0, kernels::qsa_step_bytes(), static_cast<cudaStream_t>(stream)));
+            checked(cudaMemsetAsync(q.pos_dev, 0, size_t(p.geometry.n_head) * sizeof(int32_t),
+                                    static_cast<cudaStream_t>(stream)));
+            checked(cudaMemsetAsync(q.idx_block_pos, 0, sizeof(int32_t), static_cast<cudaStream_t>(stream)));
+            if (q.attention_status)
+                checked(cudaMemsetAsync(q.attention_status, 0, sizeof(int32_t), static_cast<cudaStream_t>(stream)));
+            std::fill_n(q.host_step, kernels::kStepCount + 1, int32_t(0));
+            std::fill_n(q.host_pos, p.geometry.n_head, int32_t(0));
+        }
         p.next_position = 0;
         return true;
     } catch (const std::exception& e) { p.failed = true; err = e.what(); return false; }
