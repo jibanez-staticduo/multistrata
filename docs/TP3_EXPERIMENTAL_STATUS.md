@@ -1,9 +1,9 @@
 # Native TP3 experimental acceptance record
 
-**Recorded 31 October 2026, through window 8. This is a partial acceptance record.**
+**Recorded 31 October 2026, including the later 8K gate. This is a partial acceptance record.**
 Native Strata runs all 48 layers of the original Qwen pack across DG1, DG2 and
 DG3. Short C1 checks match the independent TP1 reference bit for bit. The full
-plan is still open: long prompts, useful extra capacity, full MTP state checks
+plan is still open: 64K prompts, useful extra capacity, full MTP state checks
 and matched performance rounds remain unqualified. There is no speed claim
 against TP1 or vLLM, and no production recommendation.
 
@@ -116,6 +116,34 @@ This is an actual 8K prompt check, rather than allocated context alone. It does
 not qualify 64K or the performance matrix. TP3 process wall time was about
 2385 seconds including loading and evidence capture; this is not a decode rate.
 
+## Later component and reference service checks
+
+The optional `--expert-operands compact` path keeps the original FMA operands
+and their order, while omitting unowned zero operands from the wire buffers.
+For FF640 its per-output payload is 32 floats for IQ4_NL and 16 for Q2_0,
+compared with 128 in the default `full` path. These are logical buffer sizes,
+not measured link bandwidth. On DG3, 75 component cases include 375 compact
+comparisons with zero differing bits, including ten-expert batches and a real
+GGUF expert. [The component receipt][compact] records the original scalar
+tolerance and the first stricter scalar attempt separately. Whole-model
+compact qualification is still pending.
+
+Both codecs and both representations pass 100 partial finish-graph replays
+each on DG3, including reset, terminal checks and compact-versus-full bit
+comparisons. [The final graph log][compactgraphs] does not qualify a graph of
+the full model or collective transport.
+
+The all-resident world-one reference service runs through SparkRun on DG2.
+Health reports `loaded: true`, `world: 1`, `alive_ranks: [0]` and capacity 65792.
+A plain request returns `OK`; a streamed request reports 18 prompt and 14
+completion tokens, with first actual content at 1.210 seconds. These are
+[functional checks][referencehttp], not matched performance measurements.
+The first launch stalled inside the head's pageable `cudaMemcpy`; a distributed
+build now uses bounded pinned staging. An isolated copy of the same tensor
+succeeds with both methods, so the driver's underlying cause remains unknown.
+The successful launch also advises away clean verified model file-cache pages
+after hashing; CUDA's resident-expert budget check remains enforced.
+
 ## Failed attempts retained
 
 Early component and whole-model runs failed numerical gates; their original
@@ -165,4 +193,7 @@ files with this report when sharing it; the links are not public downloads.
 [profile]: /home/staticduo/tmp/strata-tp3-20261031/operations/window8/profile/rank0.csv
 [python]: /home/staticduo/tmp/strata-tp3-20261031/c8-final-python.log
 [ctest]: /home/staticduo/tmp/strata-tp3-20261031/resident-cpu-test.log
+[compact]: /home/staticduo/tmp/strata-tp3-20261031/compact-component-summary.json
+[compactgraphs]: /home/staticduo/tmp/strata-tp3-20261031/compact-graphs-gpu-final.log
+[referencehttp]: /home/staticduo/tmp/strata-tp3-20261031/head-upload-probes/reference-http-qualification.json
 [failure]: /home/staticduo/tmp/strata-tp3-20261031/operations/window2/NUMERICAL-FAILURE.md

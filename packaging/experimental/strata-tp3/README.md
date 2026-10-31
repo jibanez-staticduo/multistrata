@@ -136,4 +136,22 @@ qualify autoregressive HTTP serving, long prompts, 64K, MTP, graphs or C8.
 
 `tools/distributed/benchmark_tp.py` prepares a matched TP1/TP2/TP3 matrix.
 It defaults to a dry run and records unsupported cases as `NOT_RUN`.
-The TP1 numerical oracle stages experts and is not a matched speed baseline.
+The TP1 numerical oracle's default stages experts and is not a matched speed
+baseline. `reference-service.yaml` instead uses the separate `strata-reference`
+runtime and `run_reference_rank.py`, with all experts resident, world one and
+one active request on `127.0.0.1:18081`. Its config pins every model file as
+well as the native binary, server sources and tokenizer. The optional boolean
+`release_verified_cache` advises away clean model file-cache pages after those
+hash checks. It defaults to false; dry runs never change cache residency.
+This helps the Spark's CUDA memory budget reflect available unified memory
+after hashing. It does not bypass the budget or change model bytes.
+
+The model and service runners accept explicit `--expert-operands full|compact`
+and `--collective-agreement per-op|step`; defaults remain `full` and `per-op`.
+`--profile-dir` requires an absolute path separate from trace evidence.
+Only the service runner accepts `--service-state-dir`: an absolute, fresh
+directory separate from logs and profiles. The driver creates that directory
+when it saves canonical consumed IDs and internal state before reset/cancel.
+Capturing these files is diagnostic work, not a performance benchmark.
+See [the current acceptance record](../../../docs/TP3_EXPERIMENTAL_STATUS.md)
+for the exact hardware scope qualified so far.
