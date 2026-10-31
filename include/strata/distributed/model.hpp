@@ -54,6 +54,7 @@ public:
     void reset_observations() { observed_.clear(); }
     const std::vector<ScheduledCollective>& observed() const { return observed_; }
     void expect_schedule(const std::vector<ScheduledCollective>& expected) { expected_ = expected; }
+    void preagreed(bool enabled) { preagreed_ = enabled; }
     // Opt-in diagnostics. Disabled by default; toggling does not clear accumulated counters.
     void profile(bool enabled) { profiling_ = enabled; }
     const std::array<LayerCollectiveProfile, 48>& profile() const { return profile_; }
@@ -73,6 +74,7 @@ private:
     std::vector<ScheduledCollective> observed_;
     std::vector<ScheduledCollective> expected_;
     bool profiling_ = false;
+    bool preagreed_ = false;
     std::array<LayerCollectiveProfile, 48> profile_{};
 };
 

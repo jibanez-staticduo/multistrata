@@ -65,6 +65,8 @@ void canonical_fields() {
           "configured final slot identity participates in complete command agreement");
 }
 void model_schedule() {
+    ModelWorkerConfig default_config;
+    check(!default_config.preagreed_collectives, "step agreement is opt-in with unchanged default");
     StepCommand command{"session", "request", 0, 3, StepPhase::prefill, {4}, {0}, "manifest", {}};
     std::vector<ScheduledCollective> out;
     const strata::core::ModelGeometry g;

@@ -819,6 +819,9 @@ Failure Session::start_follower() {
 }
 
 Failure Session::fail(Failure f, bool notify) {
+    schedule_active_ = false;
+    schedule_signatures_.clear();
+    schedule_cursor_ = 0;
     failure_ = f;
     state_ = SessionState::failed;
     log(std::string("session failed: ") + failure_code_name(f.code) + ": " + f.detail);
@@ -874,6 +877,7 @@ Failure Session::expect_operation(const Operation& operation) {
     if (state_ != SessionState::ready) {
         return Failure::fail(FailureCode::not_ready, "no collective order before READY");
     }
+    if (schedule_active_) return fail(Failure::fail(FailureCode::bad_operation, "legacy operation inside agreed schedule"), true);
     if (operation.sequence != next_sequence_) {
         return Failure::fail(FailureCode::bad_operation,
                             "the step issued collective " + std::to_string(operation.sequence) +
@@ -911,6 +915,7 @@ Failure canonical_collective(const CollectiveDescriptor& d, std::string& out) {
 
 Failure Session::agree_operation(const CollectiveDescriptor& descriptor, Deadline at) {
     if (state_ != SessionState::ready) return Failure::fail(FailureCode::not_ready, "no collective agreement before READY");
+    if (schedule_active_) return fail(Failure::fail(FailureCode::bad_operation, "per-operation agreement inside agreed schedule"), true);
     if (operation_in_flight_) return fail(Failure::fail(FailureCode::in_flight, "a collective is already in flight"), true);
     if (descriptor.operation.sequence != next_sequence_) {
         return fail(Failure::fail(FailureCode::bad_operation, "collective sequence differs from the session"), true);
@@ -959,6 +964,81 @@ Failure Session::agree_operation(const CollectiveDescriptor& descriptor, Deadlin
     return ok_failure();
 }
 
+Failure Session::agree_operation_schedule(std::span<const CollectiveScheduleEntry> entries,
+                                          std::string_view label, Deadline at) {
+    if (state_ != SessionState::ready) return Failure::fail(FailureCode::not_ready, "no schedule agreement before READY");
+    if (operation_in_flight_ || schedule_active_)
+        return fail(Failure::fail(FailureCode::in_flight, "cannot replace an active collective or schedule"), true);
+    if (entries.empty() || entries.size() > 16384 || label.empty() || label.size() > kControlMaxField ||
+        schedule_generation_ == UINT64_MAX || entries.size() > UINT64_MAX - next_sequence_)
+        return fail(Failure::fail(FailureCode::bad_operation, "invalid collective schedule bounds or generation"), true);
+    constexpr size_t cap = 1024u * 1024u, part_bytes = 24u * 1024u;
+    std::string payload;
+    if (auto f = put_field(payload, "schedule_label", label)) return fail(f, true);
+    const auto generation = schedule_generation_ + 1;
+    put_u32(payload, uint32_t(generation >> 32)); put_u32(payload, uint32_t(generation));
+    put_u32(payload, uint32_t(entries.size()));
+    std::vector<std::string> signatures;
+    signatures.reserve(entries.size());
+    uint64_t sequence = next_sequence_;
+    for (const auto& entry : entries) {
+        if (deadline_passed(clock_, at))
+            return fail(Failure::fail(FailureCode::deadline_expired, "collective schedule deadline passed"), true);
+        if (entry.descriptor.operation.sequence != sequence++ || entry.stage.empty())
+            return fail(Failure::fail(FailureCode::bad_operation, "collective schedule sequence or stage is invalid"), true);
+        std::string signature, encoded;
+        if (auto f = canonical_collective(entry.descriptor, signature)) return fail(f, true);
+        if (auto f = put_field(encoded, "signature", signature)) return fail(f, true);
+        if (auto f = put_field(encoded, "stage", entry.stage)) return fail(f, true);
+        if (encoded.size() > cap - payload.size())
+            return fail(Failure::fail(FailureCode::oversized_frame, "collective schedule exceeds one MiB"), true);
+        payload += encoded;
+        signatures.push_back(std::move(encoded));
+    }
+    const auto parts = (payload.size() + part_bytes - 1) / part_bytes;
+    for (size_t part = 0; part < parts; ++part) {
+        const std::string tag = "collective-schedule-v1:bytes=" + std::to_string(payload.size()) +
+                                ":part=" + std::to_string(part) + "/" + std::to_string(parts);
+        if (auto f = agree_control_payload(tag, std::string_view(payload).substr(part * part_bytes, part_bytes), at)) return f;
+    }
+    schedule_signatures_ = std::move(signatures);
+    schedule_cursor_ = 0;
+    schedule_generation_ = generation;
+    schedule_active_ = true;
+    return ok_failure();
+}
+
+Failure Session::agree_preagreed_operation(const CollectiveDescriptor& descriptor, std::string_view stage,
+                                          Deadline at) {
+    if (state_ != SessionState::ready) return Failure::fail(FailureCode::not_ready, "no collective admission before READY");
+    if (operation_in_flight_)
+        return fail(Failure::fail(FailureCode::in_flight, "a collective is already in flight"), true);
+    if (!schedule_active_ || schedule_cursor_ >= schedule_signatures_.size() ||
+        descriptor.operation.sequence != next_sequence_)
+        return fail(Failure::fail(FailureCode::bad_operation, "collective has no matching agreed schedule entry"), true);
+    if (deadline_passed(clock_, at))
+        return fail(Failure::fail(FailureCode::deadline_expired, "preagreed collective deadline passed"), true);
+    std::string signature, encoded;
+    if (auto f = canonical_collective(descriptor, signature)) return fail(f, true);
+    if (auto f = put_field(encoded, "signature", signature)) return fail(f, true);
+    if (auto f = put_field(encoded, "stage", stage)) return fail(f, true);
+    if (encoded != schedule_signatures_[schedule_cursor_])
+        return fail(Failure::fail(FailureCode::bad_operation, "actual collective or stage differs from agreed schedule"), true);
+    operation_in_flight_ = true;
+    last_operation_ = descriptor.operation;
+    return ok_failure();
+}
+
+Failure Session::finish_operation_schedule() {
+    if (state_ != SessionState::ready) return Failure::fail(FailureCode::not_ready, "no schedule completion before READY");
+    if (!schedule_active_ || operation_in_flight_ || schedule_cursor_ != schedule_signatures_.size())
+        return fail(Failure::fail(FailureCode::bad_operation, "collective schedule did not fully complete"), true);
+    schedule_active_ = false;
+    schedule_cursor_ = 0;
+    schedule_signatures_.clear();
+    return ok_failure();
+}
+
 Failure Session::complete_operation(const Operation& operation) {
     if (state_ != SessionState::ready) return Failure::fail(FailureCode::not_ready, "the session is not ready");
     if (!operation_in_flight_ || operation.sequence != last_operation_.sequence ||
@@ -967,6 +1047,7 @@ Failure Session::complete_operation(const Operation& operation) {
     }
     operation_in_flight_ = false;
     ++next_sequence_;
+    if (schedule_active_) ++schedule_cursor_;
     return ok_failure();
 }
 
@@ -1168,6 +1249,9 @@ Failure Session::broadcast_control_payload(std::string_view label, std::string& 
 }
 
 void Session::abort(std::string_view reason) {
+    schedule_active_ = false;
+    schedule_signatures_.clear();
+    schedule_cursor_ = 0;
     if (state_ == SessionState::closed) return;
     if (state_ != SessionState::failed) {
         Failure f = Failure::fail(FailureCode::aborted,
@@ -1182,6 +1266,9 @@ void Session::abort(std::string_view reason) {
 }
 
 Failure Session::close() {
+    schedule_active_ = false;
+    schedule_signatures_.clear();
+    schedule_cursor_ = 0;
     channel_.close();
     if (state_ != SessionState::failed) state_ = SessionState::closed;
     return ok_failure();

@@ -265,6 +265,11 @@ Failure canonical_collective(const CollectiveDescriptor& descriptor, std::string
 // A line the session wants recorded.  Every string reaching this already went through `Session::redact()`.
 using LogFn = std::function<void(std::string_view)>;
 
+struct CollectiveScheduleEntry {
+    CollectiveDescriptor descriptor;
+    std::string stage;
+};
+
 // The rank coordinator.  Single-threaded: one rank, one thread, one conversation at a time.
 class Session {
  public:
@@ -295,6 +300,13 @@ class Session {
     // All ranks agree the entire wire shape before enqueue. Complete only after transport.wait succeeds.
     Failure agree_operation(const CollectiveDescriptor& descriptor, Deadline at);
     Failure complete_operation(const Operation& operation);
+    // Opt-in: agree exact descriptors AND stage labels once, before the command's compute.
+    // Bounded to 16384 entries/one MiB; chunked agreements share one deadline. Only one
+    // schedule may be active. Local admission still checks every field and sequence before enqueue.
+    Failure agree_operation_schedule(std::span<const CollectiveScheduleEntry>, std::string_view label, Deadline at);
+    Failure agree_preagreed_operation(const CollectiveDescriptor&, std::string_view stage, Deadline at);
+    // Retire only after every entry completed. Does not rewind the collective sequence.
+    Failure finish_operation_schedule();
 
     // Agree exact label and payload bytes (including embedded NULs) before compute or commit. The complete
     // envelope must fit kControlMaxPayload. Independent of collective sequence; no collective may be in flight.
@@ -355,6 +367,10 @@ class Session {
     uint64_t next_control_sequence_ = 1;
     Operation last_operation_{};
     bool operation_in_flight_ = false;
+    bool schedule_active_ = false;
+    uint64_t schedule_generation_ = 0;
+    size_t schedule_cursor_ = 0;
+    std::vector<std::string> schedule_signatures_;
     bool notified_ = false;
 };
 

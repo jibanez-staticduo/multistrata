@@ -1325,6 +1325,143 @@ void three_ranks_over_real_tcp() {
     }
 }
 
+std::vector<CollectiveScheduleEntry> schedule_entries(uint64_t first, size_t count) {
+    std::vector<CollectiveScheduleEntry> entries;
+    for (size_t i = 0; i < count; ++i)
+        entries.push_back({{{first + i, uint64_t(i % 48), 71}, CollectiveKind::all_gather_padded,
+                            ScalarType::fp32, 256, {256, 192, 192}}, "expert-stage-" + std::to_string(i)});
+    return entries;
+}
+
+void preagreed_schedule_over_tcp() {
+    // A full old 1056-op step crosses the chunk boundary; no per-op TCP is needed after install.
+    for (int mismatch = -1; mismatch < 4; ++mismatch) {
+        const auto port = pick_free_port();
+        check(port != 0, "a TCP port for whole-step collective schedule");
+        if (!port) return;
+        std::atomic<int> finished{0};
+        FailureCode results[3]{};
+        std::vector<std::thread> threads;
+        for (uint32_t rank = 0; rank < 3; ++rank) threads.emplace_back([&, rank] {
+            SystemClock clock;
+            TcpChannelConfig wire; wire.rank = rank;
+            wire.self = wire.rank0 = {"127.0.0.1", port}; wire.credential = kCredential;
+            std::string err;
+            auto channel = make_tcp_control_channel(wire, clock, err);
+            auto config = good_config(rank); config.budgets = {5000,5000,5000,5000};
+            Session session(config, good_join(rank), *channel, clock, [](std::string_view) {});
+            auto f = session.start();
+            auto entries = schedule_entries(1, mismatch < 0 ? 1056 : 3);
+            if (rank == 2) {
+                if (mismatch == 0) entries.back().stage += "different";
+                if (mismatch == 1) entries.pop_back();
+                if (mismatch == 2) --entries.back().descriptor.valid_counts[2];
+                if (mismatch == 3) entries.front().descriptor.operation.sequence = 2;
+            }
+            if (!f) f = session.agree_operation_schedule(entries, "whole-step", {clock.now() + std::chrono::seconds(5)});
+            if (!f && mismatch < 0) {
+                for (const auto& entry : entries) {
+                    f = session.agree_preagreed_operation(entry.descriptor, entry.stage, {clock.now() + std::chrono::seconds(5)});
+                    if (!f) f = session.complete_operation(entry.descriptor.operation);
+                    if (f) break;
+                }
+                if (!f) f = session.finish_operation_schedule();
+                // Route/control agreement remains available inside and after a plan; fresh plan starts at
+                // the advanced sequence rather than allowing old entries to be reused.
+                auto next = schedule_entries(1057, 1);
+                if (!f) f = session.agree_operation_schedule(next, "next-step", {clock.now() + std::chrono::seconds(5)});
+                if (!f) f = session.agree_control_payload("routes-still-required", "10,9,8", {clock.now() + std::chrono::seconds(5)});
+                if (!f) f = session.agree_preagreed_operation(next[0].descriptor, next[0].stage, {clock.now() + std::chrono::seconds(5)});
+                if (!f) f = session.complete_operation(next[0].descriptor.operation);
+                if (!f) f = session.finish_operation_schedule();
+            }
+            results[rank] = f.code;
+            ++finished;
+            while (finished != 3) std::this_thread::yield();
+            session.close();
+        });
+        for (auto& thread : threads) thread.join();
+        for (auto code : results)
+            check(mismatch < 0 ? code == FailureCode::none : code == FailureCode::bad_operation,
+                  mismatch < 0 ? "three ranks install, consume and retire chunked exact step schedules" :
+                                 "stage/count/layout/start-sequence disagreement aborts every schedule install");
+    }
+}
+
+void preagreed_local_gates() {
+    auto payload = [](const std::vector<CollectiveScheduleEntry>& entries) {
+        std::string out;
+        auto u32 = [&](uint32_t n) { for (int shift : {24,16,8,0}) out.push_back(char((n >> shift) & 255)); };
+        auto field = [&](const std::string& text) { u32(uint32_t(text.size())); out += text; };
+        field("local-test"); u32(0); u32(1); u32(uint32_t(entries.size()));
+        for (const auto& entry : entries) {
+            std::string signature; canonical_collective(entry.descriptor, signature);
+            field(signature); field(entry.stage);
+        }
+        return out;
+    };
+    for (int error = 0; error < 18; ++error) {
+        Harness h; queue_coordinator_ready(h);
+        auto session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "local preagreed fixture READY");
+        auto entries = schedule_entries(1, 2);
+        const auto bytes = payload(entries);
+        const auto tag = "collective-schedule-v1:bytes=" + std::to_string(bytes.size()) + ":part=0/1";
+        for (auto kind : {FrameKind::control, FrameKind::control_ack})
+            for (uint32_t rank : {1u,2u})
+                h.channel.recv_frames.push_back(from(rank, kind, control_payload(1, tag, bytes)));
+        check(!session.agree_operation_schedule(entries, "local-test", {h.clock.now() + std::chrono::seconds(1)}),
+              "exact all-rank plan installs before local admission");
+        const auto sent = h.channel.sent.size();
+        auto actual = entries[0];
+        Failure f;
+        const Deadline future{h.clock.now() + std::chrono::seconds(1)};
+        if (error == 0) ++actual.descriptor.operation.sequence;
+        if (error == 1) ++actual.descriptor.operation.layer;
+        if (error == 2) ++actual.descriptor.operation.step;
+        if (error == 3) actual.descriptor.type = ScalarType::bf16;
+        if (error == 4) --actual.descriptor.valid_counts[2];
+        if (error == 5) actual.stage += "wrong";
+        if (error <= 5) f = session.agree_preagreed_operation(actual.descriptor, actual.stage, future);
+        if (error == 6) f = session.finish_operation_schedule();
+        if (error == 7) f = session.agree_operation(actual.descriptor, future);
+        if (error == 8) f = session.expect_operation(actual.descriptor.operation);
+        if (error == 9) f = session.agree_operation_schedule(entries, "replacement", future);
+        if (error == 10) f = session.agree_preagreed_operation(actual.descriptor, actual.stage, {h.clock.now()});
+        if (error >= 11) {
+            f = session.agree_preagreed_operation(actual.descriptor, actual.stage, future);
+            check(!f && h.channel.sent.size() == sent, "local schedule admission sends no TCP metadata");
+            if (error == 11) f = session.agree_preagreed_operation(actual.descriptor, actual.stage, future);
+            if (error == 12) f = session.finish_operation_schedule();
+            if (error == 13) { auto wrong = actual.descriptor.operation; ++wrong.layer; f = session.complete_operation(wrong); }
+            if (error == 14) { session.abort("injected transport failure"); f = session.complete_operation(actual.descriptor.operation); }
+            if (error >= 15) {
+                f = session.complete_operation(actual.descriptor.operation);
+                if (!f && error == 15) f = session.agree_preagreed_operation(actual.descriptor, actual.stage, future);
+                if (!f && error >= 16) f = session.agree_preagreed_operation(entries[1].descriptor, entries[1].stage, future);
+                if (!f && error >= 16) f = session.complete_operation(entries[1].descriptor.operation);
+                if (!f && error == 16) f = session.agree_preagreed_operation(entries[1].descriptor, entries[1].stage, future);
+                if (!f && error == 17) f = session.finish_operation_schedule();
+                if (!f && error == 17) f = session.agree_preagreed_operation(entries[0].descriptor, entries[0].stage, future);
+            }
+        }
+        check(bool(f) && !session.ready(), "invalid actual/mixed/unfinished/deadline/duplicate/failure is terminal");
+        check(bool(session.agree_preagreed_operation(entries[0].descriptor, entries[0].stage, future)),
+              "failed schedule cannot be reused");
+    }
+    for (int invalid = 0; invalid < 4; ++invalid) {
+        Harness h; queue_coordinator_ready(h);
+        auto session = h.session(0, good_join(0), good_config(0)); check(!session.start(), "schedule limits READY");
+        auto entries = schedule_entries(1, invalid == 0 ? 0 : invalid == 1 ? 16385 : invalid == 2 ? 300 : 1);
+        if (invalid == 2) for (auto& entry : entries) entry.stage.assign(4096, 'x');
+        if (invalid == 3) entries[0].stage.assign(4097, 'x');
+        const auto before = h.channel.sent.size();
+        check(bool(session.agree_operation_schedule(entries, "limits", {h.clock.now() + std::chrono::seconds(1)})) &&
+              !session.ready(), "empty/excess-entry/one-MiB/excess-stage plans fail terminally before install");
+        check(h.channel.sent.size() <= before + 2, "invalid plan sends only terminal aborts, no schedule prefix");
+    }
+}
+
 void collective_agreement_over_tcp() {
     for (int mismatch = -1; mismatch < 3; ++mismatch) {
         const uint16_t port = pick_free_port();
@@ -1842,6 +1979,8 @@ int main() {
     tcp_factory_rules();
     three_ranks_over_real_tcp();
     collective_agreement_over_tcp();
+    preagreed_schedule_over_tcp();
+    preagreed_local_gates();
     control_payload_agreement_over_tcp();
     control_payload_broadcast_over_tcp();
     queued_abort_survives_tcp_reset();

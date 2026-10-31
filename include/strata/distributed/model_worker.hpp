@@ -25,6 +25,7 @@ struct ModelWorkerConfig {
     // Checkpoints allocate only on the explicit phase. Zero byte cap disables capture.
     uint64_t checkpoint_max_bytes = uint64_t(1) << 30;
     uint64_t checkpoint_max_context = 0;
+    bool preagreed_collectives = false;
 };
 
 // CUDA single-slot uncaptured bridge. Every slot owns a model; serialized slots may share collectives.

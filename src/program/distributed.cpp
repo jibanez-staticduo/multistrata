@@ -332,7 +332,8 @@ int main(int argc, char** argv) {
             "library-path", "nccl-version", "library-provenance", "model-hash", "config-fingerprint",
             "pack", "native", "ple", "context", "logits-dir", "logits-positions", "timeout-ms",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
-            "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel", "profile-dir"};
+            "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel", "profile-dir",
+            "collective-agreement"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) || args.contains(key.substr(2)))
@@ -370,6 +371,9 @@ int main(int argc, char** argv) {
         const auto expert_collectives = args.contains("expert-collectives") ? args.at("expert-collectives") : "sequential";
         require(expert_collectives == "sequential" || expert_collectives == "batched", "invalid expert collective policy");
         const bool batched_experts = expert_collectives == "batched";
+        const auto agreement = args.contains("collective-agreement") ? args.at("collective-agreement") : "per-op";
+        require(agreement == "per-op" || agreement == "step", "invalid collective agreement policy");
+        const bool preagreed_collectives = agreement == "step";
         const auto graph_finish_value = number("graph-finish", 0);
         require(graph_finish_value <= 1 && (!graph_finish_value || batched_experts),
                 "--graph-finish must be 0 or 1 and requires batched expert collectives");
@@ -494,6 +498,7 @@ int main(int argc, char** argv) {
         JoinInfo join;
         join.session_uuid = get("session-uuid"); join.rank = rank; join.world = 3;
         join.model_hash = get("model-hash"); join.config_fingerprint = get("config-fingerprint");
+        if (preagreed_collectives) join.config_fingerprint += ":collective-agreement=step-v1";
         if (batched_experts || graph_finish || poll_interval != 1)
             join.config_fingerprint += ":tp-policy-v1:expert=" + expert_collectives +
                                        ":poll=" + std::to_string(poll_interval) +
@@ -544,7 +549,8 @@ int main(int argc, char** argv) {
             std::cerr << "LOAD rank=" << rank << " stage=expert-shards-complete bytes=" << experts.owned_weight_bytes() << std::endl;
             if (multislot) {
                 SlotPoolConfig pool_config{uint32_t(parallel), uint32_t(context), uint32_t(timeout),
-                                            join.session_uuid, join.model_hash, uint32_t(rank), batched_experts, 0};
+                                            join.session_uuid, join.model_hash, uint32_t(rank), batched_experts, 0,
+                                            preagreed_collectives};
                 SlotPool pool(pool_config, {weights, geometry, head, table, collectives, experts, session, transport,
                                             stream.value, [&] { return experts.requires_process_exit(); }});
                 PendingDmaExitGuard pool_lifetime(pool);
@@ -609,6 +615,7 @@ int main(int argc, char** argv) {
             WorkerConfig worker_config{join.session_uuid, join.model_hash, uint32_t(rank)};
             ModelWorkerConfig model_worker_config{worker_config, stream.value, 0, batched_experts};
             model_worker_config.checkpoint_max_context = uint64_t(state.max_cells);
+            model_worker_config.preagreed_collectives = preagreed_collectives;
             ModelWorkerBackend execution(model_worker_config, model, collectives, session, transport);
             Worker worker(worker_config, execution);
             PendingDmaExitGuard checkpoint_lifetime(model);

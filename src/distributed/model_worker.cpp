@@ -243,6 +243,17 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
     p.collectives.step(command.step);
     p.collectives.reset_observations();
     p.collectives.expect_schedule(command.expected_collective_schedule);
+    p.collectives.preagreed(p.config.preagreed_collectives);
+    if (p.config.preagreed_collectives &&
+        (command.phase == StepPhase::prefill || command.phase == StepPhase::decode)) {
+        std::vector<CollectiveScheduleEntry> schedule;
+        schedule.reserve(command.expected_collective_schedule.size());
+        for (const auto& entry : command.expected_collective_schedule)
+            schedule.push_back({entry.descriptor, entry.route});
+        Deadline deadline;
+        if (auto f = p.session.operation_deadline(deadline)) return f;
+        if (auto f = p.session.agree_operation_schedule(schedule, "model-worker-compute-v1", deadline)) return f;
+    }
     std::string err;
     if (command.phase == StepPhase::init) {
         if (p.initialized) return bad("model worker already initialized");
@@ -310,6 +321,10 @@ Failure ModelWorkerBackend::finish(const StepCommand& command, BackendCompletion
         !std::equal(observed.begin(), observed.end(), command.expected_collective_schedule.begin(), identical))
         return bad("actual model execution did not complete the declared schedule");
     if (auto f = p.wait()) return f;
+    if (p.config.preagreed_collectives &&
+        (command.phase == StepPhase::prefill || command.phase == StepPhase::decode)) {
+        if (auto f = p.session.finish_operation_schedule()) return f;
+    }
     // Receipt confirms completed command and logical position. It does not claim to checksum model
     // KV/GDN/QSA/PLE bytes; numerical state parity still requires the GPU qualification harness.
     const std::string receipt = "noncrypto-execution-receipt-v1:position=" +

@@ -132,7 +132,7 @@ bool SessionCollectives::execute(CollectiveDescriptor d, const char* stage, cons
         stats->output_bytes += d.elements * sizeof(float) *
                                (d.kind == CollectiveKind::all_gather_padded ? 3 : 1);
     }
-    {
+    if (!preagreed_) {
         ProfileSpan timing(stats ? &stats->stage_metadata_ns : nullptr);
         const std::string stage_payload = actual + ":" + std::to_string(std::char_traits<char>::length(stage)) + ":" + stage;
         if (const auto f = session_.agree_control_payload("model-stage-v1", stage_payload, deadline)) {
@@ -141,7 +141,9 @@ bool SessionCollectives::execute(CollectiveDescriptor d, const char* stage, cons
     }
     {
         ProfileSpan timing(stats ? &stats->operation_agreement_ns : nullptr);
-        if (const auto f = session_.agree_operation(d, deadline)) { err = f.detail; return false; }
+        const auto f = preagreed_ ? session_.agree_preagreed_operation(d, stage, deadline) :
+                                   session_.agree_operation(d, deadline);
+        if (f) { err = f.detail; return false; }
     }
     Failure f;
     {
