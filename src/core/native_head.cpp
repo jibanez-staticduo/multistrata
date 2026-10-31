@@ -3,6 +3,9 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/platform/memory.hpp"
+#if defined(STRATA_BUILD_DISTRIBUTED)
+#include "strata/core/native_upload.hpp"
+#endif
 
 #include <cuda_runtime.h>
 #include <climits>
@@ -12,6 +15,20 @@
 #include <exception>
 
 namespace strata::core {
+
+#if defined(STRATA_BUILD_DISTRIBUTED)
+namespace {
+struct PinnedHeadUpload {
+    using Error = cudaError_t;
+    static constexpr Error success = cudaSuccess;
+    Error allocate(void** p, size_t bytes) { return cudaMallocHost(p, bytes); }
+    void release(void* p) { (void) cudaFreeHost(p); }
+    Error copy(void* dst, const void* src, size_t bytes) {
+        return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    }
+};
+}
+#endif
 
 NativeHead::~NativeHead() {
     unload();
@@ -58,8 +75,17 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         if (status == cudaSuccess)
             status = cudaMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
         strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
+#if defined(STRATA_BUILD_DISTRIBUTED)
+        if (status == cudaSuccess) {
+            // Avoid passing file-backed pageable ranges directly to the Spark driver.
+            PinnedHeadUpload backend;
+            NativeUpload<PinnedHeadUpload> upload(backend);
+            status = upload.copy(weights, gguf.tensor_data(*tensor), bytes);
+        }
+#else
         if (status == cudaSuccess)
             status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
+#endif
         if (status != cudaSuccess) {
             if (scratch) cudaFree(scratch);
             if (weights) cudaFree(weights);
