@@ -89,6 +89,26 @@ struct Planes {    const uint8_t* codes = nullptr;    const float* scales = null
 ///< null when the form has none
 };
 bool plane_ptrs(const WeightRef& r, const std::string& name, Planes& out, std::string& err) {
+#ifdef STRATA_BUILD_DISTRIBUTED
+    // A standalone native pack records shape-only quantized rows. These
+    // projections consume original GGUF blocks and never canonical planes.
+    if (r.native_data && r.native_q8_1 && r.quantized() &&
+        strata::kernels::native_mmvq_supported(r.native_type)) {
+        if (r.ne0 <= 0 || r.ne0 > std::numeric_limits<int>::max() ||
+            r.ne1 <= 0 || r.ne1 > std::numeric_limits<int>::max()) {
+            err = name + ": native matrix has invalid dimensions";
+            return false;
+        }
+        try {
+            (void) strata::kernels::native_mmvq_weight_bytes(r.native_type, (int) r.ne0, (int) r.ne1);
+        } catch (const std::exception& error) {
+            err = name + ": " + error.what();
+            return false;
+        }
+        out = {};
+        return true;
+    }
+#endif
 // S2, S4 AND S8 ALL SPLIT THE SAME WAY.  The plane LOCATION does not depend on the code width - the three
 // sizes come from the index and are checked against the tensor below - so the guard is here to catch a
 // tensor that is not quantized at all, not to pick a decoder.  WHICH KERNEL reads the planes is the
@@ -1127,7 +1147,22 @@ void stage_timing_report(int64_t n_layers) {
 // needs nothing from the layer it is called for beyond its index.
 static void dump_slot(float* dump, const ModelGeometry& g, int64_t layer, const float* src, uint64_t off,
                       uint64_t n, void* stream);
-bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace strata::kernels;    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    const int64_t n_kv = pos + 1;    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
+#ifdef STRATA_BUILD_DISTRIBUTED
+static bool qsa_layer_impl(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump, QsaTpStages* tp)
+#else
+bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base, const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream, std::string& err, float* dump)
+#endif
+{    using namespace strata::kernels;    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    const int64_t n_kv = pos + 1;    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
+#ifdef STRATA_BUILD_DISTRIBUTED
+const int64_t query_heads = tp ? tp->local_heads() : g.n_head;
+if (query_heads <= 0 || query_heads > g.n_head || (tp && dump)) { err = "qsa_layer: invalid TP heads or dump requested"; return false; }
+QsaShapes query_shapes = s; query_shapes.n_head = query_heads;
+#define STRATA_QSA_QUERY_HEADS query_heads
+#define STRATA_QSA_QUERY_SHAPES query_shapes
+#else
+#define STRATA_QSA_QUERY_HEADS g.n_head
+#define STRATA_QSA_QUERY_SHAPES s
+#endif
 const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, int cols) {
     try {
         if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, RMS_EPS, stream);
@@ -1237,11 +1272,16 @@ if (st.kv_q4) {
 // four, and this line used to call `s2_gemv_q8` unconditionally - so TEN of the twelve layers decoded an
 // S4 code plane with a Q8_0 activation.  Both are "a quantized activation", both produce a plausible
 // vector, and the difference is 0.6-1.4%.
+#ifdef STRATA_BUILD_DISTRIBUTED
+if (tp) {
+    if (!tp->query(*w_attnq, x, b.q_full, stream, err)) return false;
+} else
+#endif
 if (!gemv_quantized(*w_attnq, p_q, f_q, b.x_q8_0, b.x_q8k, b.q_full, g.n_embd, g.n_head * 2 * g.head_dim,                        v.name("attn_q.weight"), stream, err, x, w_attnv->native_data && w_attnq->native_data)) return false;
 // `per_head[:, :head_dim]` - the FIRST half of each head's 2*head_dim block, copied out contiguously so
 // the norm and the rotation see whole rows.  A 2-D copy is a memcpy node, which captures (`pinned_capture`
 // case A) and needs no kernel.
-if (cudaMemcpy2DAsync(b.qcur, (size_t) g.head_dim * 4, b.q_full, (size_t) g.head_dim * 2 * 4,                          (size_t) g.head_dim * 4, (size_t) g.n_head, cudaMemcpyDeviceToDevice,                          (cudaStream_t) stream) != cudaSuccess) {        err = "qsa_layer: the q/gate split failed";        return false;    }    if (!normalize_rotate(b.qcur, w_qn, (int) g.n_head, (int) g.head_dim)) return false;
+if (cudaMemcpy2DAsync(b.qcur, (size_t) g.head_dim * 4, b.q_full, (size_t) g.head_dim * 2 * 4,                          (size_t) g.head_dim * 4, (size_t) STRATA_QSA_QUERY_HEADS, cudaMemcpyDeviceToDevice,                          (cudaStream_t) stream) != cudaSuccess) {        err = "qsa_layer: the q/gate split failed";        return false;    }    if (!normalize_rotate(b.qcur, w_qn, (int) STRATA_QSA_QUERY_HEADS, (int) g.head_dim)) return false;
 // ---- 7. the indexer's query: with the V100 switch it was projected at step 3 (paired with the raw key);
 // the trunk projects it here.  Either way, norm and rotate it now.
 if (!idx_pair) project_bf16(x, b.x_bf16, (const uint16_t*) w_idxq->data, b.q_idx, g.n_embd, g.idx_q_heads * g.idx_key_dim,
@@ -1260,7 +1300,12 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     }
     // KV streaming: every block the selection names is made resident before anything reads it
     qsa_kv_resolve(st, g, b.ids, st.step, 1, cap, stream);
-    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(b.qcur, g.n_head, stream);   // <Hq, Hk> = <q, k>
+    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(b.qcur, STRATA_QSA_QUERY_HEADS, stream);   // <Hq, Hk> = <q, k>
+#ifdef STRATA_BUILD_DISTRIBUTED
+    if (tp) {
+        if (!tp->attend(st, b, cap, stream, err)) return false;
+    } else
+#endif
     if (g_fast_attn && !native_flash_attn_short && dump == nullptr) {
         const strata::kernels::QsaAttnPools pools = qsa_attn_pools(st);
         strata::kernels::qsa_decode_attn_step(b.qcur, pools, b.ids, st.step, cap, s, b.attn_scratch, b.attn, stream);
@@ -1289,15 +1334,18 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
     }
 } else qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
     }
-    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
+    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(b.attn, STRATA_QSA_QUERY_HEADS, stream);   // the output back: H is self-inverse
     dump_slot(dump, g, layer, b.attn, (uint64_t) 2 * g.n_embd + 2 * g.hc,                            (uint64_t) g.n_head * g.head_dim, stream);    {        const uint64_t vs = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim +                            (uint64_t) 2 * g.n_head_kv * g.head_dim;        dump_slot(dump, g, layer, (const float*) b.v_scratch, vs,                            (uint64_t) g.n_head_kv * g.head_dim / 2, stream);        dump_slot(dump, g, layer, (const float*) b.ids, vs + (uint64_t) g.n_head_kv * g.head_dim / 2, 4, stream);        dump_slot(dump, g, layer, (const float*) st.step,                            vs + (uint64_t) g.n_head_kv * g.head_dim / 2 + 4, 4, stream);    }
 // ---- 9. Gate the attention output before its projection. Native CUDA keeps F32
 // sigmoid/multiply arithmetic and uses Q8_1 for the native quantized projection.
 // The canonical fallback retains its prior FP64 gate and Q8_K projection.
 try {
-    if (native_qsa_enabled()) native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) g.n_head, (int) g.head_dim, stream);
-    else qsa_gate_apply_f32(b.attn, b.q_full, s, b.attn32, stream);
+    if (native_qsa_enabled()) native_qsa_gate_apply(b.attn, b.q_full, b.attn32, (int) STRATA_QSA_QUERY_HEADS, (int) g.head_dim, stream);
+    else qsa_gate_apply_f32(b.attn, b.q_full, STRATA_QSA_QUERY_SHAPES, b.attn32, stream);
 } catch (const std::exception& error) { err = v.name("qsa_gate") + ": " + error.what(); return false; }
+#ifdef STRATA_BUILD_DISTRIBUTED
+    if (tp) return tp->output(*w_attno, b.attn32, out, stream, err);
+#endif
     if (!w_attno->native_data) quantize_q8_K(b.attn32, b.attn_q8k, g.n_head * g.head_dim, stream);
     if (w_attno->native_data) {
     if (!gemv_quantized(*w_attno, p_o, f_o, nullptr, b.attn_q8k, out,
@@ -1306,6 +1354,24 @@ try {
     s_gemv_q8k_split(b.attn_q8k, p_o.codes, p_o.scales, p_o.offset, out,
                     g.n_head * g.head_dim, g.n_embd, f_o, stream);
 }    return true;}
+#undef STRATA_QSA_QUERY_HEADS
+#undef STRATA_QSA_QUERY_SHAPES
+#ifdef STRATA_BUILD_DISTRIBUTED
+bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
+               int64_t pos, int32_t pos_base, const QsaState& st, const QsaBuffers& b,
+               const float* x, float* out, void* stream, std::string& err, float* dump) {
+    return qsa_layer_impl(tables, g, layer, pos, pos_base, st, b, x, out, stream, err, dump, nullptr);
+}
+bool qsa_layer_staged(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
+                       int64_t pos, int32_t pos_base, const QsaState& st, const QsaBuffers& b,
+                       const float* x, float* out, QsaTpStages& stages, void* stream, std::string& err) {
+    if (!native_bf16_projections || (st.max_cells > strata::kernels::kTopkMaxCells && !g_fast_select)) {
+        err = "qsa_layer_staged: native BF16 projections and capacity-compatible fast selection are required";
+        return false;
+    }
+    return qsa_layer_impl(tables, g, layer, pos, pos_base, st, b, x, out, stream, err, nullptr, &stages);
+}
+#endif
 // ================================ THE DOORBELL ================================
 namespace {}
 // namespace
@@ -1456,7 +1522,11 @@ static void dump_half(const BlockBuffers& bb, const ModelGeometry& g, int64_t la
                       uint64_t off, uint64_t n, void* stream) {
     dump_slot(bb.dump, g, layer, src, off, n, stream);
 }
-bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos,                     int32_t pos_base, const GdnBuffers& gb, const QsaState& qst, const QsaBuffers& qb,                     const MoEBuffers& mb, int64_t k, const BlockBuffers& bb, void* stream, std::string& err,                     const Doorbell* db, const PleRun* ple, int half, int stage_prefix) {
+bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos,                     int32_t pos_base, const GdnBuffers& gb, const QsaState& qst, const QsaBuffers& qb,                     const MoEBuffers& mb, int64_t k, const BlockBuffers& bb, void* stream, std::string& err,                     const Doorbell* db, const PleRun* ple, int half, int stage_prefix
+#ifdef STRATA_BUILD_DISTRIBUTED
+                     , DistributedLayerHooks* distributed
+#endif
+                     ) {
     // ================================ THE PLE, AT LAYER 1 ONLY ================================
     //
     // **THIS IS THE CALL WHOSE ABSENCE FAILED GATE C1.**  Layer 1 carries the six `blk.1.ple_*` tensors and no
@@ -1474,7 +1544,11 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
     //
     // So the driver calls `ple_stage_token` once per token, BEFORE the graphs, and what is captured here is only
     // the device half: `ple_block` reading `emb_dev`, and the history shift.
-    const bool fused = g_fused_gr && stage_prefix == 0 && half == 0 &&
+    const bool fused =
+#ifdef STRATA_BUILD_DISTRIBUTED
+                       distributed == nullptr &&
+#endif
+                       g_fused_gr && stage_prefix == 0 && half == 0 &&
                        strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr);
     // layer-1's FFN write has not been applied to R yet - unless a control vector follows it, which needs R
     bool pending_ffn = fused && layer > 0 && !strata::kernels::cvec().covers(layer - 1);
@@ -1545,7 +1619,13 @@ st_begin(layer, 0, stream);
     }
     st_end(layer, 0, stream);    dump_half(bb, g, layer, bb.inject, 2 * g.n_embd, g.hc, stream);        }
     if (run1) {
-    st_begin(layer, 1, stream);    if (qsa) {        if (!qsa_layer(tables, g, layer, pos, pos_base, qst, qb, bb.mixed, bb.block_out, stream, err,                            bb.dump))            return false;    } else {        if (!gdn_layer(tables, g, layer, gb, bb.mixed, bb.block_out, stream, err)) return false;    }    st_end(layer, 1, stream);    dump_half(bb, g, layer, bb.block_out, 0, g.n_embd, stream);        }
+    st_begin(layer, 1, stream);
+#ifdef STRATA_BUILD_DISTRIBUTED
+    if (distributed != nullptr) {
+        if (!distributed->mixer(layer, pos, pos_base, bb.mixed, bb.block_out, stream, err)) return false;
+    } else
+#endif
+    if (qsa) {        if (!qsa_layer(tables, g, layer, pos, pos_base, qst, qb, bb.mixed, bb.block_out, stream, err,                            bb.dump))            return false;    } else {        if (!gdn_layer(tables, g, layer, gb, bb.mixed, bb.block_out, stream, err)) return false;    }    st_end(layer, 1, stream);    dump_half(bb, g, layer, bb.block_out, 0, g.n_embd, stream);        }
     if (run2) {
     st_begin(layer, 2, stream);    if (!fused) gr_write(R, bb.block_out, bb.inject, gs, R, stream);    st_end(layer, 2, stream);
 // ---- half 2, UP TO AND INCLUDING THE ROUTER.  `gr_read` leaves the normed activation in `bb.mixed` and
@@ -1605,7 +1685,11 @@ uint64_t ple_run_scratch_bytes() {
     return strata::kernels::ple_block_scratch_bytes() + strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
-bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,                      const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,                      std::string& err) {    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,                      const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,                      std::string& err
+#ifdef STRATA_BUILD_DISTRIBUTED
+                      , DistributedLayerHooks* distributed
+#endif
+                      ) {    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
 // `bb.mixed` and `bb.inject` are what `block_layer_pre` left, and NOTHING between the two calls may touch
 // them - that is what makes `post[l]` safe to launch after the host has run the pool.
 st_begin(layer, 5, stream);
@@ -1614,7 +1698,11 @@ st_begin(layer, 5, stream);
     st_end(layer, 5, stream);    dump_half(bb, g, layer, bb.block_out, (uint64_t) g.n_embd, g.n_embd, stream);    dump_half(bb, g, layer, bb.inject, (uint64_t) 2 * g.n_embd + g.hc, g.hc, stream);    st_begin(layer, 6, stream);
     const bool steer = strata::kernels::cvec().covers(layer);   // --control-vector-scaled: after this write
     try {
-        if (!(g_fused_gr && strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr))) {
+        if (
+#ifdef STRATA_BUILD_DISTRIBUTED
+            distributed != nullptr ||
+#endif
+            !(g_fused_gr && strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr))) {
             gr_write(bb.R, bb.block_out, bb.inject, gs, bb.R, stream);
             if (steer) strata::kernels::cvec_apply(bb.R, layer, 1, g.hc * g.n_embd, nullptr, 0, nullptr, 0, false, stream);
         } else if (layer == g.n_layers - 1) {

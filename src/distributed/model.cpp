@@ -1,0 +1,329 @@
+#include "strata/distributed/model.hpp"
+#include "strata/distributed/qsa_model.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/native_gdn_preprocess.hpp"
+#include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/tp_gdn.hpp"
+
+#include <cuda_runtime.h>
+#include <algorithm>
+#include <stdexcept>
+#include <vector>
+
+namespace strata::distributed {
+namespace {
+void checked(cudaError_t result) {
+    if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
+}
+struct DeviceMemory {
+    void* data = nullptr;
+    ~DeviceMemory() { if (data) cudaFree(data); }
+    void allocate(size_t bytes) { checked(cudaMalloc(&data, bytes)); }
+};
+}
+
+SessionCollectives::SessionCollectives(Session& s, GuardedTransport& t, const Clock& c, uint32_t ms)
+    : session_(s), transport_(t), clock_(c), timeout_ms_(ms) {}
+
+bool SessionCollectives::agree_routes(int64_t layer, const int* ids, int64_t k,
+                                     void* stream, std::string& err) {
+    if (!ids || k != 10 || !stream) { err = "invalid TP route agreement"; return false; }
+    std::array<int, 10> host{};
+    Deadline deadline;
+    if (const auto f = session_.operation_deadline(deadline)) { err = f.detail; return false; }
+    deadline.end = std::min(deadline.end, clock_.now() + std::chrono::milliseconds(timeout_ms_));
+    auto status = cudaMemcpyAsync(host.data(), ids, sizeof(host), cudaMemcpyDeviceToHost,
+                                   static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) { err = cudaGetErrorString(status); return false; }
+    for (;;) {
+        status = cudaStreamQuery(static_cast<cudaStream_t>(stream));
+        if (status == cudaSuccess) break;
+        if (status != cudaErrorNotReady || deadline_passed(clock_, deadline)) {
+            err = "TP route readback failed or exceeded deadline";
+            session_.abort(err); transport_.abort(err); return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    std::string payload = std::to_string(step_) + ":" + std::to_string(layer) + ":";
+    for (const int id : host) payload += std::to_string(id) + ":";
+    if (const auto f = session_.agree_control_payload("routes-v1", payload, deadline)) {
+        err = f.detail; transport_.abort(err); return false;
+    }
+    return true;
+}
+
+bool SessionCollectives::execute(CollectiveDescriptor d, const char* stage, const float* in, float* out,
+                                 void* stream, std::string& err) {
+    std::string actual, planned;
+    if (observed_.size() >= expected_.size() ||
+        canonical_collective(d, actual) ||
+        canonical_collective(expected_[observed_.size()].descriptor, planned) ||
+        actual != planned || expected_[observed_.size()].route != stage) {
+        err = "actual TP operation differs from agreed command schedule";
+        session_.abort(err); transport_.abort(err); return false;
+    }
+    Deadline deadline;
+    if (const auto f = session_.operation_deadline(deadline)) { err = f.detail; return false; }
+    deadline.end = std::min(deadline.end, clock_.now() + std::chrono::milliseconds(timeout_ms_));
+    const std::string stage_payload = actual + ":" + std::to_string(std::char_traits<char>::length(stage)) + ":" + stage;
+    if (const auto f = session_.agree_control_payload("model-stage-v1", stage_payload, deadline)) {
+        err = f.detail; transport_.abort(err); return false;
+    }
+    if (const auto f = session_.agree_operation(d, deadline)) { err = f.detail; return false; }
+    Failure f;
+    if (d.kind == CollectiveKind::all_reduce_sum)
+        f = transport_.all_reduce_sum({const_cast<float*>(in), d.elements, ScalarType::fp32},
+                                     {out, d.elements, ScalarType::fp32}, d.operation,
+                                     static_cast<cudaStream_t>(stream));
+    else
+        f = transport_.all_gather_padded({const_cast<float*>(in), d.elements, ScalarType::fp32},
+                                        {out, 3 * d.elements, ScalarType::fp32}, d.valid_counts,
+                                        d.operation, static_cast<cudaStream_t>(stream));
+    if (!f) f = transport_.wait(deadline);
+    if (f) { err = f.detail; session_.abort(f.detail); return false; }
+    if (const auto complete = session_.complete_operation(d.operation)) { err = complete.detail; return false; }
+    ++sequence_;
+    return true;
+}
+
+bool SessionCollectives::reduce(int64_t layer, const char* stage, const float* in, float* out,
+                                size_t n, void* stream, std::string& err) {
+    CollectiveDescriptor d;
+    d.operation = {sequence_, static_cast<uint32_t>(layer), step_};
+    d.elements = n;
+    if (!execute(d, stage, in, out, stream, err)) return false;
+    observed_.push_back({d, stage});
+    return true;
+}
+
+bool SessionCollectives::gather(int64_t layer, const char* stage, const float* in, float* out,
+                                std::array<uint64_t, 3> valid, void* stream, std::string& err) {
+    CollectiveDescriptor d;
+    d.operation = {sequence_, static_cast<uint32_t>(layer), step_};
+    d.kind = CollectiveKind::all_gather_padded;
+    d.elements = *std::max_element(valid.begin(), valid.end());
+    d.valid_counts.assign(valid.begin(), valid.end());
+    if (!execute(d, stage, in, out, stream, err)) return false;
+    observed_.push_back({d, stage});
+    return true;
+}
+
+struct ModelForward::Impl {
+    const core::WeightTable& weights;
+    core::ModelGeometry geometry;
+    core::SessionState& state;
+    int rank;
+    LayerCollectives& collectives;
+    RoutedExperts& experts;
+    DeviceMemory memory;
+    std::array<kernels::tp::cuda::GdnTpMap, 3> maps;
+    float *qkv = nullptr, *conv = nullptr, *alpha = nullptr, *beta = nullptr;
+    float *dt = nullptr, *a = nullptr, *z = nullptr, *gate = nullptr, *local_y = nullptr;
+    float *conv_raw = nullptr, *norm_qkv = nullptr, *readout = nullptr;
+    float *wire = nullptr, *global_y = nullptr, *embedding = nullptr, *parts = nullptr;
+    float* states = nullptr;
+    float* qsa_partial = nullptr;
+    float* qsa_global = nullptr;
+    const core::NativeHead* head = nullptr;
+    bool ready = false;
+    bool failed = false;
+    int64_t next_position = 0;
+
+    Impl(const core::WeightTable& w, const core::ModelGeometry& g, core::SessionState& s,
+         int r, LayerCollectives& c, RoutedExperts& e)
+        : weights(w), geometry(g), state(s), rank(r), collectives(c), experts(e) {
+        const int starts[4] = {0, 6, 11, 16};
+        for (int i = 0; i < 3; ++i) { maps[i].key_begin = starts[i]; maps[i].key_end = starts[i + 1]; }
+    }
+
+    const core::WeightRef& weight(int64_t layer, const char* name) const {
+        const auto* result = core::LayerView(weights, layer).get(name);
+        if (!result) throw std::runtime_error("missing layer tensor " + std::string(name));
+        return *result;
+    }
+
+    void project(const core::WeightRef& w, const float* x, float* y,
+                 int row_begin, int rows, void* stream) {
+        if (w.native_data && w.native_q8_1) {
+            const auto stride = kernels::native_mmvq_weight_bytes(w.native_type, int(w.ne0), 1);
+            kernels::native_quantize_q8_1(x, w.native_q8_1, int(w.ne0), 1, stream);
+            kernels::native_mmvq(w.native_type, static_cast<const uint8_t*>(w.native_data) + row_begin * stride,
+                                w.native_q8_1, y, int(w.ne0), rows, 1, stream);
+        } else if (w.kind == core::WeightKind::Bf16InF32 && w.data) {
+            kernels::bf16_gemv_fp32_mmvf(x, static_cast<const uint16_t*>(w.data) + row_begin * w.ne0,
+                                        y, w.ne0, rows, stream);
+        } else throw std::runtime_error("TP projection requires original native GGUF or BF16 weights");
+    }
+
+    bool gdn(int64_t layer, const float* x, float* output, void* stream, std::string& err) {
+        using namespace kernels::tp::cuda;
+        const auto& m = maps[rank];
+        const int hk = m.key_heads(), hv = m.value_heads(), s = m.state_size;
+        const auto& q = weight(layer, "attn_qkv.weight");
+        const auto& zw = weight(layer, "attn_gate.weight");
+        const auto& aw = weight(layer, "ssm_alpha.weight");
+        const auto& bw = weight(layer, "ssm_beta.weight");
+        project(q, x, qkv, m.key_begin * s, hk * s, stream);
+        project(q, x, qkv + hk * s, (16 + m.key_begin) * s, hk * s, stream);
+        for (int run = 0; run < 3; ++run) {
+            const int first = run * 16 + m.key_begin;
+            project(q, x, qkv + (2 * hk + run * hk) * s, (32 + first) * s, hk * s, stream);
+            project(zw, x, z + run * hk * s, first * s, hk * s, stream);
+            project(aw, x, alpha + run * hk, first, hk, stream);
+            project(bw, x, beta + run * hk, first, hk, stream);
+        }
+        tp_gdn_compact(m, GdnTpLayout::Qkv, 1, 4,
+                       {static_cast<const float*>(weight(layer, "ssm_conv1d.weight").data), size_t(10240 * 4)},
+                       {conv, size_t(m.channels() * 4)}, stream);
+        tp_gdn_compact(m, GdnTpLayout::Values, 1, 1,
+                       {static_cast<const float*>(weight(layer, "ssm_dt.bias").data), 48}, {dt, size_t(hv)}, stream);
+        tp_gdn_compact(m, GdnTpLayout::Values, 1, 1,
+                       {static_cast<const float*>(weight(layer, "ssm_a").data), 48}, {a, size_t(hv)}, stream);
+        kernels::native_gdn_beta_gate(beta, hv, stream);
+        kernels::native_gdn_gate(alpha, dt, a, gate, hv, stream);
+        const size_t one_state = m.state_elements() + m.history_elements();
+        const int64_t ordinal = layer - layer / geometry.qsa_interval;
+        GdnTpState st{{states + ordinal * one_state, m.state_elements()},
+                      {states + ordinal * one_state + m.state_elements(), m.history_elements()}};
+        tp_gdn_token(m, GdnTpArithmetic::Native, st,
+                     {qkv, size_t(m.channels())}, {conv, size_t(m.channels() * 4)},
+                     {gate, size_t(hv)}, {beta, size_t(hv)}, {z, size_t(hv * s)},
+                     {static_cast<const float*>(weight(layer, "ssm_norm.weight").data), size_t(s)},
+                     float(geometry.rms_eps), {{conv_raw, size_t(m.channels())},
+                     {norm_qkv, size_t(m.channels())}, {readout, size_t(hv * s)}},
+                     {local_y, size_t(hv * s)}, stream);
+        // Equal wire slots are zero padded; the quantizer sees reconstructed
+        // logical head order, including the three interleaved value ranges.
+        checked(cudaMemsetAsync(local_y + hv * s, 0, size_t((18 - hv) * s) * sizeof(float),
+                                static_cast<cudaStream_t>(stream)));
+        if (!collectives.gather(layer, "gdn_values", local_y, wire,
+                                {18 * 128, 15 * 128, 15 * 128}, stream, err)) return false;
+        GdnTpMap all_maps[3] = {maps[0], maps[1], maps[2]};
+        tp_gdn_scatter_gathered(all_maps, 1, 18 * 128, {wire, 3 * 18 * 128}, {global_y, 6144}, stream);
+        if (rank == 0) project(weight(layer, "ssm_out.weight"), global_y, output, 0, int(geometry.n_embd), stream);
+        else checked(cudaMemsetAsync(output, 0, size_t(geometry.n_embd) * sizeof(float),
+                                     static_cast<cudaStream_t>(stream)));
+        return collectives.reduce(layer, "mixer", output, output, size_t(geometry.n_embd), stream, err);
+    }
+};
+
+ModelForward::ModelForward(const core::WeightTable& w, const core::ModelGeometry& g,
+                           core::SessionState& s, int rank, LayerCollectives& c, RoutedExperts& e)
+    : impl_(std::make_unique<Impl>(w, g, s, rank, c, e)) {}
+ModelForward::~ModelForward() = default;
+const core::ModelGeometry& ModelForward::geometry() const { return impl_->geometry; }
+int64_t ModelForward::next_position() const { return impl_->next_position; }
+void ModelForward::invalidate() noexcept { impl_->failed = true; }
+void ModelForward::native_head(const core::NativeHead* head) { impl_->head = head; }
+
+bool ModelForward::initialize(std::string& err) {
+    auto& p = *impl_;
+    if (p.failed || p.ready) { err = "TP model is failed or already initialized"; return false; }
+    if (p.rank < 0 || p.rank >= 3 || p.geometry.n_layers != 48 || p.geometry.n_embd != 2560 ||
+        p.geometry.ssm_k_heads != 16 || p.geometry.ssm_v_heads != 48 || p.geometry.ssm_state_size != 128 ||
+        p.geometry.ssm_d_conv != 4 || p.geometry.ssm_conv_channels != 10240 || p.geometry.ssm_value_dim != 6144 ||
+        p.geometry.qsa_interval != 4 || p.geometry.n_head != 24 || p.geometry.n_head_kv != 2 ||
+        p.geometry.head_dim != 256 || p.geometry.n_ff != 640 || p.geometry.n_expert_used != 10 ||
+        p.geometry.hc != 4 || p.geometry.hc_lr != 320 || p.state.k != 10 || p.state.layer_lo != 0 ||
+        p.state.layer_hi != 48 || !p.state.qsa_states || !p.state.R || !p.state.ple.ready()) {
+        err = "TP3 C1 requires the full 48-layer Qwen geometry, full session and initialized PLE";
+        return false;
+    }
+    try {
+        const auto& m = p.maps[p.rank];
+        const size_t recurrent = (m.state_elements() + m.history_elements()) * 36;
+        const size_t scratch = 10240 * 12 + 6144 * 5 + 2560 * 2 + size_t(p.state.k) * 2560;
+        p.memory.allocate((recurrent + scratch) * sizeof(float));
+        float* next = static_cast<float*>(p.memory.data);
+        auto take = [&next](size_t n) { auto* result = next; next += n; return result; };
+        p.states = take(recurrent);
+        p.qkv = take(10240); p.conv = take(10240 * 4);
+        p.alpha = take(48); p.beta = take(48); p.dt = take(48); p.a = take(48); p.gate = take(48);
+        p.z = take(6144); p.local_y = take(18 * 128); p.conv_raw = take(10240);
+        p.norm_qkv = take(10240); p.readout = take(6144);
+        p.wire = take(3 * 18 * 128); p.global_y = take(6144);
+        p.qsa_partial = take(2560); p.qsa_global = take(6144);
+        p.embedding = take(2560); p.parts = take(size_t(p.state.k) * 2560);
+        p.ready = true;
+        return true;
+    } catch (const std::exception& e) { err = e.what(); return false; }
+}
+
+bool ModelForward::reset(void* stream, std::string& err) {
+    auto& p = *impl_;
+    if (!p.ready || p.failed || !stream) { err = "TP model is not ready for reset"; return false; }
+    try {
+        const auto& m = p.maps[p.rank];
+        checked(cudaMemsetAsync(p.states, 0, 36 * (m.state_elements() + m.history_elements()) * sizeof(float),
+                                static_cast<cudaStream_t>(stream)));
+        checked(cudaMemsetAsync(p.embedding, 0, size_t(p.geometry.n_embd) * sizeof(float),
+                                static_cast<cudaStream_t>(stream)));
+        core::session_zero(p.state, p.geometry, p.embedding, stream);
+        p.next_position = 0;
+        return true;
+    } catch (const std::exception& e) { p.failed = true; err = e.what(); return false; }
+}
+
+bool ModelForward::mixer(int64_t layer, int64_t pos, int32_t base, const float* input,
+                         float* output, void* stream, std::string& err) {
+    auto& p = *impl_;
+    if (core::is_qsa_layer(p.geometry, layer)) {
+        return qsa_layer_tp(p.weights, p.geometry, layer, pos, base,
+                            p.state.qsa_states[layer / 4], p.state.qsa_bufs,
+                            input, output, {p.rank, QsaAttentionPolicy::GatherReference, QsaOutputPolicy::RankZeroReference},
+                            {p.qsa_global, 6144, p.qsa_partial, 2560}, p.collectives, stream, err);
+    }
+    return p.gdn(layer, input, output, stream, err);
+}
+
+bool ModelForward::token(int32_t token, int64_t pos, int32_t base,
+                         float* logits, void* stream, std::string& err) {
+    auto& p = *impl_;
+    if (!p.ready || p.failed || !stream || !logits || pos != p.next_position ||
+        token < 0 || token >= p.geometry.n_vocab || pos >= p.state.max_cells) {
+        err = "TP token requires ready C1 state, consecutive position and valid token/output/stream";
+        return false;
+    }
+    try {
+        for (int64_t j = 0; j < p.geometry.n_qsa_layers(); ++j) {
+            auto& q = p.state.qsa_states[j];
+            kernels::qsa_step_fill(q.host_step, pos, core::qsa_shapes(p.geometry));
+            for (int64_t h = 0; h < p.geometry.n_head; ++h) q.host_pos[h] = int32_t(base + pos);
+        }
+        p.state.ple_token = token;
+        if (!core::ple_stage_token(p.state.ple, stream, err) ||
+            !core::embed_row(p.weights, p.geometry, token, p.embedding, stream, err)) {
+            p.failed = true; return false;
+        }
+        for (int64_t c = 0; c < p.geometry.hc; ++c)
+            checked(cudaMemcpyAsync(p.state.R + c * p.geometry.n_embd, p.embedding,
+                                    size_t(p.geometry.n_embd) * sizeof(float), cudaMemcpyDeviceToDevice,
+                                    static_cast<cudaStream_t>(stream)));
+        for (int64_t layer = 0; layer < p.geometry.n_layers; ++layer) {
+            const auto& qs = p.state.qsa_states[layer / p.geometry.qsa_interval];
+            if (!core::block_layer_pre(p.weights, p.geometry, layer, pos, base, p.state.gdn,
+                                       qs, p.state.qsa_bufs, p.state.moe, p.state.k, p.state.block,
+                                       stream, err, nullptr, &p.state.ple, 0, 0, this) ||
+                !p.collectives.agree_routes(layer, p.state.moe.ids, p.state.k, stream, err) ||
+                !p.experts.forward(layer, p.state.block.mixed, p.state.moe.ids,
+                                   p.state.k, p.parts, stream, err) ||
+                !core::block_layer_post(p.weights, p.geometry, layer, p.state.k, p.state.moe,
+                                        p.state.block, p.parts, stream, err, this)) {
+                p.failed = true; err = "layer " + std::to_string(layer) + ": " + err; return false;
+            }
+        }
+        if (p.head ? (!core::lm_head_mix(p.weights, p.geometry, p.state.block, stream, err) ||
+                       !p.head->run(p.state.block.mixed, logits, stream, err))
+                   : !core::lm_head(p.weights, p.geometry, p.state.block, logits, stream, err)) {
+            p.failed = true; return false;
+        }
+        // The worker polls completion with its deadline and validates logits
+        // before commit. A CUDA stream synchronization here could wait forever
+        // after a peer failure and bypass that bounded completion path.
+        p.state.ple_prev[0] = p.state.ple_prev[1]; p.state.ple_prev[1] = token;
+        ++p.next_position;
+        return true;
+    } catch (const std::exception& e) { p.failed = true; err = e.what(); return false; }
+}
+
+} // namespace strata::distributed

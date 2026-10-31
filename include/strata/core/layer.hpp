@@ -106,6 +106,18 @@ bool gdn_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 
 struct Doorbell;   // defined with the rest of the handoff, below; only a pointer is needed here
 
+#ifdef STRATA_BUILD_DISTRIBUTED
+// Explicit, uncaptured TP seam. The implementation computes only owned heads
+// and returns the globally reduced mixer output before the residual consumes it.
+class DistributedLayerHooks {
+public:
+    virtual ~DistributedLayerHooks() = default;
+    virtual bool mixer(int64_t layer, int64_t pos, int32_t pos_base,
+                       const float* mixed, float* reduced, void* stream,
+                       std::string& err) = 0;
+};
+#endif
+
 /// Buffers for the MoE block, on EVERY layer.
 struct MoEBuffers {
     uint16_t* x_bf16 = nullptr;   ///< n_embd, for the ROUTER's weight, which is BF16
@@ -402,6 +414,27 @@ bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
                const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,
                std::string& err, float* dump = nullptr);
 
+#ifdef STRATA_BUILD_DISTRIBUTED
+// Explicit per-call stages for the experimental TP adapter. The original QSA
+// path supplies no stages. KV/indexer projection, append and selection retain
+// the original implementation and global geometry; only query rows are local.
+class QsaTpStages {
+public:
+    virtual ~QsaTpStages() = default;
+    virtual int local_heads() const = 0;
+    virtual bool query(const WeightRef&, const float* x, float* q_full,
+                        void* stream, std::string& err) = 0;
+    virtual bool attend(const QsaState&, const QsaBuffers&, int64_t cap,
+                         void* stream, std::string& err) = 0;
+    virtual bool output(const WeightRef&, const float* gated, float* out,
+                         void* stream, std::string& err) = 0;
+};
+bool qsa_layer_staged(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
+                       int64_t pos, int32_t pos_base, const QsaState& st,
+                       const QsaBuffers& b, const float* x, float* out,
+                       QsaTpStages& stages, void* stream, std::string& err);
+#endif
+
 // ================================ THE DOORBELL ================================
 
 /// THE HANDOFF: `x_f` and the miss list reach the CPU WHILE THE LAYER IS STILL RUNNING.
@@ -637,10 +670,18 @@ bool block_layer_pre(const WeightTable& tables, const ModelGeometry& g, int64_t 
                      int32_t pos_base, const GdnBuffers& gb, const QsaState& qst, const QsaBuffers& qb,
                      const MoEBuffers& mb, int64_t k, const BlockBuffers& bb, void* stream, std::string& err,
                      const Doorbell* db = nullptr, const PleRun* ple = nullptr, int half = 0,
-                     int stage_prefix = 0);
+                     int stage_prefix = 0
+#ifdef STRATA_BUILD_DISTRIBUTED
+                     , DistributedLayerHooks* distributed = nullptr
+#endif
+                     );
 
 bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,
                       const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,
-                      std::string& err);
+                      std::string& err
+#ifdef STRATA_BUILD_DISTRIBUTED
+                      , DistributedLayerHooks* distributed = nullptr
+#endif
+                      );
 
 }  // namespace strata::core

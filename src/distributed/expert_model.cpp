@@ -1,0 +1,301 @@
+#include "strata/distributed/expert_model.hpp"
+#include "strata/artifact/gguf_reader.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/tp_cuda.hpp"
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <map>
+#include <numeric>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+
+namespace strata::distributed {
+namespace {
+namespace tp = kernels::tp::cuda;
+void check(cudaError_t e) {
+    if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
+}
+void require(bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
+struct Buffer {
+    void* data = nullptr;
+    std::size_t bytes = 0;
+    Buffer() = default;
+    explicit Buffer(std::size_t n) : bytes(n) { check(cudaMalloc(&data, n)); }
+    ~Buffer() { if (data) cudaFree(data); }
+    Buffer(const Buffer&) = delete;
+    Buffer& operator=(const Buffer&) = delete;
+    Buffer(Buffer&& other) noexcept : data(other.data), bytes(other.bytes) { other.data = nullptr; }
+    Buffer& operator=(Buffer&& other) noexcept {
+        if (this != &other) {
+            if (data) cudaFree(data);
+            data = other.data; bytes = other.bytes; other.data = nullptr;
+        }
+        return *this;
+    }
+    uint8_t* byte() const { return static_cast<uint8_t*>(data); }
+    float* floats() const { return static_cast<float*>(data); }
+};
+struct RouteReadback {
+    int* ids = nullptr;
+    cudaEvent_t complete = nullptr;
+    ~RouteReadback() {
+        if (complete) cudaEventDestroy(complete);
+        if (ids) cudaFreeHost(ids);
+    }
+    void initialize(std::size_t count) {
+        check(cudaMallocHost(reinterpret_cast<void**>(&ids), count * sizeof(int)));
+        check(cudaEventCreateWithFlags(&complete, cudaEventDisableTiming));
+    }
+};
+const char* codec(int type) {
+    switch (type) {
+        case 16: return "IQ2_XXS"; case 17: return "IQ2_XS"; case 18: return "IQ3_XXS";
+        case 21: return "IQ3_S"; case 22: return "IQ2_S"; case 23: return "IQ4_XS";
+        case 20: return "IQ4_NL"; case 42: return "Q2_0";
+        default: throw std::runtime_error("TP expert model: unsupported original GGUF codec");
+    }
+}
+int block(int type) { return type == 20 ? 32 : type == 42 ? 64 : 256; }
+tp::MatrixShard shard(int type, int64_t width, int64_t output, int axis, int rank,
+                     int64_t begin, int64_t end, const Buffer& buffer, std::size_t offset,
+                     std::size_t row_stride, std::size_t bytes) {
+    TensorSlice slice;
+    slice.global_shape = {width, output}; slice.local_shape = slice.global_shape;
+    slice.local_shape[axis] = end - begin; slice.axis = axis; slice.rank = rank;
+    slice.range_start = begin; slice.range_end = end;
+    slice.valid_lanes.assign(3, 0); slice.valid_lanes[rank] = end - begin;
+    slice.codec = codec(type); slice.block_size = block(type);
+    slice.scale_kind = "fp16-scale-plus-original-codes";
+    slice.byte_row_stride = int64_t(kernels::iq_row_bytes(type, width));
+    return {std::move(slice), type, buffer.byte() + offset, row_stride, bytes};
+}
+}  // namespace
+
+struct NativeRoutedExperts::Impl {
+    struct Layer {
+        kernels::NativeExpertLayout layout;
+        Buffer gate, up, down;
+        tp::MatrixShard gate_view, up_view, down_view;
+        std::size_t gu_bytes = 0, down_bytes = 0, down_row = 0;
+    };
+    std::string pack, native;
+    core::ModelGeometry geometry;
+    int rank;
+    LayerCollectives& collective;
+    std::array<uint64_t, 3> valid;
+    uint64_t begin = 0, end = 0, owned = 0;
+    std::vector<Layer> layers;
+    Buffer input_q, gate, up, local_hidden, wire, hidden, hidden_q, partial;
+    ActivationContract input_contract, hidden_contract;
+    RouteReadback readback;
+    uint32_t readback_timeout_ms;
+    bool readback_failed = false;
+    bool initialized = false;
+
+    Impl(std::string pack_dir, std::string gguf, const core::ModelGeometry& g, int r,
+         LayerCollectives& c, std::array<uint64_t, 3> counts, uint32_t timeout_ms)
+        : pack(std::move(pack_dir)), native(std::move(gguf)), geometry(g), rank(r), collective(c), valid(counts),
+          readback_timeout_ms(timeout_ms) {
+        require(timeout_ms > 0 && timeout_ms <= 3600000,
+                "TP expert model: readback timeout must be in [1,3600000] ms");
+    }
+
+    void initialize() {
+        require(!initialized && layers.empty(), "TP expert model: initialize called twice");
+        require(rank >= 0 && rank < 3 && geometry.n_embd > 0 && geometry.n_embd % 256 == 0 &&
+                geometry.n_layers > 0 && geometry.n_expert > 0 && geometry.n_expert_used > 0 &&
+                geometry.n_expert_used <= 15, "TP expert model: unsupported geometry/rank");
+        require(std::accumulate(valid.begin(), valid.end(), uint64_t(0)) == uint64_t(geometry.n_ff),
+                "TP expert model: FF ownership does not cover original model");
+        for (int r = 0; r < 3; ++r) {
+            require(valid[r] > 0 && valid[r] % 64 == 0, "TP expert model: FF cut splits original down block");
+            if (r < rank) begin += valid[r];
+        }
+        end = begin + valid[rank];
+        const auto slots = *std::max_element(valid.begin(), valid.end());
+        std::string why;
+        require(std::filesystem::exists(std::filesystem::path(pack) / "native_experts.txt"),
+                "TP expert model requires original native_experts.txt");
+        if (!kernels::cpu::expert_layout_load(pack, geometry.n_layers, geometry.n_expert, why))
+            throw std::runtime_error(why);
+        const auto layout = kernels::cpu::expert_layout();
+        require(layout.native && layout.gguf_off.size() == std::size_t(3 * geometry.n_layers),
+                "TP expert model requires original GGUF role offsets");
+        require(layout.fmt.size() == std::size_t(geometry.n_layers) &&
+                layout.bytes.size() == std::size_t(geometry.n_layers), "TP expert model: incomplete native layer table");
+        // Validate every codec and the aggregate before any large allocation.
+        uint64_t planned = 0;
+        for (int64_t index = 0; index < geometry.n_layers; ++index) {
+            const auto& fmt = layout.fmt[std::size_t(index)];
+            require(fmt.n_embd == geometry.n_embd && fmt.n_ff == geometry.n_ff && !fmt.tail_off &&
+                    !fmt.had_block && !fmt.had_gu && !fmt.had_d,
+                    "TP expert model: scaled/rotated expert is unsupported");
+            (void)codec(fmt.gu_type); (void)codec(fmt.d_type);
+            require(fmt.gu_type != 20 && fmt.gu_type != 42 && (fmt.d_type == 20 || fmt.d_type == 42),
+                    "TP expert model: unsupported codec roles");
+            const uint64_t gu = valid[rank] * fmt.gu_row;
+            const uint64_t down = uint64_t(geometry.n_embd) * kernels::iq_row_bytes(fmt.d_type, int64_t(valid[rank]));
+            require(gu <= UINT64_MAX / 2 && 2 * gu <= UINT64_MAX - down &&
+                    2 * gu + down <= (UINT64_MAX - planned) / uint64_t(geometry.n_expert),
+                    "TP expert model: owned weight size overflow");
+            planned += (2 * gu + down) * geometry.n_expert;
+        }
+        std::size_t free_bytes = 0, total_bytes = 0;
+        check(cudaMemGetInfo(&free_bytes, &total_bytes));
+        require(planned < free_bytes, "TP expert model: owned weights exceed currently free device memory");
+        std::map<std::string, std::unique_ptr<GgufFile>> files;
+        auto source = [&](int64_t layer, int role, int type, int64_t width, int64_t rows,
+                          std::size_t expert_bytes) -> const uint8_t* {
+            const auto i = std::size_t(3 * layer + role);
+            std::filesystem::path path(native);
+            if (i < layout.gguf_file.size() && !layout.gguf_file[i].empty())
+                path = path.parent_path() / layout.gguf_file[i];
+            auto& file = files[path.string()];
+            if (!file) file = std::make_unique<GgufFile>(path.string());
+            static constexpr const char* roles[] = {"gate", "up", "down"};
+            const auto name = "blk." + std::to_string(layer) + ".ffn_" + roles[role] + "_exps.weight";
+            const auto* tensor = file->find(name);
+            require(tensor && tensor->type == uint32_t(type) && tensor->shape.size() == 3 &&
+                    tensor->shape[0] == uint64_t(width) && tensor->shape[1] == uint64_t(rows) &&
+                    tensor->shape[2] == uint64_t(geometry.n_expert), "TP expert model: GGUF tensor identity mismatch");
+            const uint64_t bytes = uint64_t(expert_bytes) * geometry.n_expert;
+            require(file->data_start() + tensor->offset == layout.gguf_off[i] &&
+                    tensor_payload_bytes(*tensor) == bytes && file->data_start() <= file->file_size() &&
+                    tensor->offset <= file->file_size() - file->data_start() &&
+                    bytes <= file->file_size() - file->data_start() - tensor->offset,
+                    "TP expert model: GGUF role span differs from native pack");
+            return file->tensor_data(*tensor);
+        };
+        for (int64_t index = 0; index < geometry.n_layers; ++index) {
+            const auto& fmt = layout.fmt[std::size_t(index)];
+            require(fmt.n_embd == geometry.n_embd && fmt.n_ff == geometry.n_ff && fmt.tail_off == 0 &&
+                    fmt.had_block == 0, "TP expert model: unsupported scaled/rotated or changed geometry");
+            (void)codec(fmt.gu_type); (void)codec(fmt.d_type);
+            require(fmt.gu_type != 20 && fmt.gu_type != 42 && (fmt.d_type == 20 || fmt.d_type == 42),
+                    "TP expert model: unsupported gate/up/down codec roles");
+            Layer layer;
+            layer.layout = kernels::native_expert_layout(fmt.gu_type, fmt.d_type, geometry.n_embd, geometry.n_ff);
+            require(layer.layout.bytes == layout.bytes[std::size_t(index)] &&
+                    layer.layout.gu_row == fmt.gu_row && layer.layout.d_row == fmt.d_row,
+                    "TP expert model: native CPU/CUDA weight layout mismatch");
+            layer.gu_bytes = std::size_t(valid[rank]) * fmt.gu_row;
+            layer.down_row = kernels::iq_row_bytes(fmt.d_type, int64_t(valid[rank]));
+            layer.down_bytes = std::size_t(geometry.n_embd) * layer.down_row;
+            layer.gate = Buffer(layer.gu_bytes * geometry.n_expert);
+            layer.up = Buffer(layer.gu_bytes * geometry.n_expert);
+            layer.down = Buffer(layer.down_bytes * geometry.n_expert);
+            const auto* gate_source = source(index, 0, fmt.gu_type, geometry.n_embd, geometry.n_ff, fmt.up_off);
+            const auto* up_source = source(index, 1, fmt.gu_type, geometry.n_embd, geometry.n_ff, fmt.up_off);
+            const auto down_expert_bytes = std::size_t(geometry.n_embd) * fmt.d_row;
+            const auto* down_source = source(index, 2, fmt.d_type, geometry.n_ff, geometry.n_embd, down_expert_bytes);
+            for (int64_t expert = 0; expert < geometry.n_expert; ++expert) {
+                const auto gu_offset = std::size_t(expert) * fmt.up_off + std::size_t(begin) * fmt.gu_row;
+                check(cudaMemcpy(layer.gate.byte() + expert * layer.gu_bytes, gate_source + gu_offset,
+                                 layer.gu_bytes, cudaMemcpyHostToDevice));
+                check(cudaMemcpy(layer.up.byte() + expert * layer.gu_bytes, up_source + gu_offset,
+                                 layer.gu_bytes, cudaMemcpyHostToDevice));
+                const auto down_offset = std::size_t(expert) * down_expert_bytes + kernels::iq_row_bytes(fmt.d_type, int64_t(begin));
+                check(cudaMemcpy2D(layer.down.byte() + expert * layer.down_bytes, layer.down_row,
+                                   down_source + down_offset, fmt.d_row, layer.down_row, geometry.n_embd,
+                                   cudaMemcpyHostToDevice));
+            }
+            owned += layer.gate.bytes + layer.up.bytes + layer.down.bytes;
+            const auto& l = layer.layout;
+            layer.gate_view = shard(l.gu_type, geometry.n_embd, geometry.n_ff, 1, rank, int64_t(begin), int64_t(end),
+                                    layer.gate, 0, l.gu_row, layer.gu_bytes);
+            layer.up_view = shard(l.gu_type, geometry.n_embd, geometry.n_ff, 1, rank, int64_t(begin), int64_t(end),
+                                  layer.up, 0, l.gu_row, layer.gu_bytes);
+            layer.down_view = shard(l.d_type, geometry.n_ff, geometry.n_embd, 0, rank, int64_t(begin), int64_t(end),
+                                    layer.down, 0, layer.down_row, layer.down_bytes);
+            layers.push_back(std::move(layer));
+        }
+        input_q = Buffer(tp::global_q81_bytes(1, int(geometry.n_embd)));
+        gate = Buffer(valid[rank] * sizeof(float)); up = Buffer(gate.bytes);
+        local_hidden = Buffer(slots * sizeof(float)); wire = Buffer(3 * slots * sizeof(float));
+        hidden = Buffer(geometry.n_ff * sizeof(float)); hidden_q = Buffer(tp::global_q81_bytes(1, int(geometry.n_ff)));
+        partial = Buffer(geometry.n_embd * sizeof(float));
+        readback.initialize(std::size_t(geometry.n_expert_used));
+        input_contract.consumer = "expert_gate_up"; input_contract.gather = "none";
+        input_contract.quantizer = "Q8_1"; input_contract.block_size = 32;
+        input_contract.reference = "global_reference"; input_contract.backend_policy = "cuda_native_expert_grouped";
+        input_contract.layout = "contiguous";
+        hidden_contract = input_contract; hidden_contract.consumer = "expert_down";
+        hidden_contract.gather = "all_gather_padded"; hidden_contract.wire_slots = int64_t(slots);
+        hidden_contract.valid_counts.assign(valid.begin(), valid.end());
+        initialized = true;
+    }
+
+    bool forward(int64_t index, const float* input, const int* ids, int64_t k, float* parts, void* stream,
+                 std::string& err) {
+        require(initialized && !readback_failed && index >= 0 && index < int64_t(layers.size()) && k == geometry.n_expert_used &&
+                input && ids && parts && stream, "TP expert model: invalid forward state/arguments");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(readback_timeout_ms);
+        // An incomplete/failed transfer must never reuse its host buffer or
+        // launch expert work. The caller aborts the request on this failure.
+        readback_failed = true;
+        check(cudaMemcpyAsync(readback.ids, ids, std::size_t(k) * sizeof(int), cudaMemcpyDeviceToHost,
+                              static_cast<cudaStream_t>(stream)));
+        check(cudaEventRecord(readback.complete, static_cast<cudaStream_t>(stream)));
+        for (;;) {
+            require(std::chrono::steady_clock::now() < deadline,
+                    "TP expert model: routed-id readback deadline expired");
+            const auto status = cudaEventQuery(readback.complete);
+            if (status == cudaSuccess) break;
+            if (status != cudaErrorNotReady) check(status);
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        require(std::chrono::steady_clock::now() < deadline,
+                "TP expert model: routed-id readback completed after deadline");
+        readback_failed = false;
+        for (int64_t i = 0; i < k; ++i)
+            require(readback.ids[i] >= 0 && readback.ids[i] < geometry.n_expert,
+                    "TP expert model: routed id outside original experts");
+        const auto q = tp::quantize_global(input_contract, input, 1, int(geometry.n_embd), input_q.data, input_q.bytes, stream);
+        auto& layer = layers[std::size_t(index)];
+        for (int64_t i = 0; i < k; ++i) {
+            const auto expert = std::size_t(readback.ids[i]);
+            layer.gate_view.data = layer.gate.byte() + expert * layer.gu_bytes;
+            layer.up_view.data = layer.up.byte() + expert * layer.gu_bytes;
+            layer.down_view.data = layer.down.byte() + expert * layer.down_bytes;
+            check(cudaMemsetAsync(local_hidden.data, 0, local_hidden.bytes, static_cast<cudaStream_t>(stream)));
+            tp::gate_up(layer.gate_view, layer.up_view, input_contract, q, gate.floats(), up.floats(), local_hidden.floats(), stream);
+            char stage[48];
+            std::snprintf(stage, sizeof(stage), "expert_hidden_%lld", static_cast<long long>(i));
+            if (!collective.gather(index, stage, local_hidden.floats(), wire.floats(), valid, stream, err)) return false;
+            tp::unpack_gathered(hidden_contract, wire.floats(), 1, hidden.floats(), stream);
+            const auto hq = tp::quantize_global(hidden_contract, hidden.floats(), 1, int(geometry.n_ff),
+                                                hidden_q.data, hidden_q.bytes, stream);
+            tp::down(layer.down_view, hidden_contract, hq, partial.floats(), stream);
+            std::snprintf(stage, sizeof(stage), "expert_output_%lld", static_cast<long long>(i));
+            if (!collective.reduce(index, stage, partial.floats(),
+                                   parts + i * geometry.n_embd, std::size_t(geometry.n_embd), stream, err)) return false;
+        }
+        return true;
+    }
+};
+
+NativeRoutedExperts::NativeRoutedExperts(std::string pack, std::string native, const core::ModelGeometry& geometry,
+                                       int rank, LayerCollectives& collective, std::array<uint64_t, 3> valid,
+                                       uint32_t readback_timeout_ms)
+    : impl_(std::make_unique<Impl>(std::move(pack), std::move(native), geometry, rank, collective, valid,
+                                   readback_timeout_ms)) {}
+NativeRoutedExperts::~NativeRoutedExperts() = default;
+bool NativeRoutedExperts::initialize(std::string& err) {
+    try { impl_->initialize(); return true; } catch (const std::exception& e) { err = e.what(); return false; }
+}
+bool NativeRoutedExperts::forward(int64_t layer, const float* input, const int* ids, int64_t k,
+                                  float* parts, void* stream, std::string& err) {
+    try { return impl_->forward(layer, input, ids, k, parts, stream, err); }
+    catch (const std::exception& e) { err = e.what(); return false; }
+}
+uint64_t NativeRoutedExperts::owned_weight_bytes() const { return impl_->owned; }
+}  // namespace strata::distributed
