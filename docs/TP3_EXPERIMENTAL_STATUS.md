@@ -1,17 +1,20 @@
 # Native TP3 experimental acceptance record
 
-**Recorded 31 October 2026, including the later 8K gate. This is a partial acceptance record.**
+**Recorded 31 October 2026, including actual 8K/64K gates. Performance qualification is in progress.**
 Native Strata runs all 48 layers of the original Qwen pack across DG1, DG2 and
 DG3. Short C1 checks match the independent TP1 reference bit for bit. The full
-plan is still open: 64K prompts, useful extra capacity, full MTP state checks
-and matched performance rounds remain unqualified. There is no speed claim
+plan is still open: useful extra capacity, long feature combinations and
+matched performance rounds remain unqualified. The actual 64K prompt and
+256-token continuation pass the full model comparison. Short and extended sampled
+MTP state and C1 full-model graphs pass the scoped checks recorded below. There is no speed claim
 against TP1 or vLLM, and no production recommendation.
 
 The [implementation plan](superpowers/plans/2026-10-30-strata-tp3-implementation.md),
 [design](superpowers/specs/2026-10-30-strata-tp3-design.md) and
 [transport plan](superpowers/plans/2026-10-30-strata-tp3-transport.md) are historical
 planning records. Their original checkboxes are preserved. This document records
-later evidence without closing those plans. Source checkout: `3cc3d77d`; each
+later evidence without closing those plans. The latest native milestone is
+`077f8a83`; HTTP phase propagation is `697ff515`. Each
 window's rank configuration pins its actual binary, source and library hashes.
 This record describes completed experiments, not current service health.
 
@@ -63,8 +66,8 @@ remaining acceptance checks open.
 | 3. Rank artifacts | Passed scope | [Materialized byte check][bytes] and source hashes; immutable original blocks/scales retained. |
 | 4. Native transport | Passed scope | [Window 1 report][transport], mismatch/missing/killed-peer receipts and later `NET/IB` logs; includes unequal padded gathers. |
 | 5. Projection and MoE | Partial | Exact expert gate and short whole-model parity pass after arithmetic fixes; short decode evidence does not qualify GEMM prefill. |
-| 6. GDN, QSA and PLE | Partial | All 48 layers represented in C1 state/trace checks; short 2/4/8 chunk-boundary and RESET parity now pass. Long continuation remains open. |
-| 7. Coordinator and C1 | Partial | Windows 4/6/7 exact logits, state, RESET and traces; 8192 is configured capacity, not an 8K-token prompt. The later 8K gate is recorded below; 64K prompt qualification remains open. |
+| 6. GDN, QSA and PLE | Passed scope | All 48 layers represented in C1 state/trace checks; short 2/4/8 chunk-boundary and RESET parity now pass. The later actual 64K continuation passes as recorded below. |
+| 7. Coordinator and C1 | Passed scope | Windows 4/6/7 exact logits, state, RESET and traces; 8192 is configured capacity, not an 8K-token prompt. The later actual 8K and 64K gates are recorded below. |
 | 8. Capacity, MTP, graphs, C8 | Partial | Short MTP/C4/C8 full-state replay and cancellation checks pass. Full C1 NCCL graphs pass 255 replays/RESET and bounded peer loss. Phase snapshots exist; useful extra capacity and longer feature qualification remain open. |
 | 9. Server and lifecycle | Partial | OpenAI/Anthropic streaming, tools, cancellation and failure-health artifacts; recorded restoration checks through window 7. No automatic rollout. |
 | 10. Performance decision | Partial | Profiling and resident TP1 control established; matched 4K/16K/64K, 256-output, C1/C4/C8, three paired rounds remain open. |
@@ -302,6 +305,35 @@ requests. Each captured canonical input matches on all ranks. The
 final logit rows with zero error. These checks concern short requests and state
 isolation; their overlapping run times are not benchmark results.
 
+## Actual 64K prompt and continuation
+
+The original 65536-token prompt plus 256 teacher-forced continuation tokens
+finishes with exit code zero on all three ranks. The independent same-pack TP1
+reference also finishes. With the original frozen zero-error policy, the model
+comparator passes all four full-vocabulary rows at positions 0, 8191, 65535 and
+65791 and 684 logical state arrays, including reconstructed GDN state and
+replicated KV/indexer/PLE. No NaN/Inf or numerical difference is accepted.
+Evidence:
+`/home/staticduo/tmp/strata-tp3-20261031/long-context/65792/comparison.json`.
+A separate bitwise check also passes 1773 state/replica comparisons across
+5.67 billion elements, with no changed bits.
+The candidate is native revision `29209221` and the reference `d6055ec5`, recorded
+as an explicit revision pair. The TP3 process time includes loading, artifact
+work and overlapping correctness trials. It is not a matched performance rate.
+
+## Extended sampled MTP state
+
+Two sampled MTP4 requests each consume a 747-token prompt and return 128 output
+tokens, using temperature 0.7, top-p 0.9 and seeds 17/29. All ranks record the
+same 874 consumed IDs per request. Independent TP1 teacher-forced replay of those
+exact IDs matches both final full-vocabulary logits and all 342 logical state
+arrays under the unchanged zero-error policy. The group returns ready between
+requests. Evidence:
+`/home/staticduo/tmp/strata-tp3-20261031/mtp-extended-service/both-check/result/comparison.json`.
+This covers longer sampled state and reset continuity. It does not establish
+64K MTP capacity, a real-model output distribution or a performance gain. The
+CPU categorical verifier and short cancellation evidence are separate checks.
+
 ## Explicit memory phase records
 
 `--memory-phase-file` writes a fresh, bounded per-rank JSONL record. It samples
@@ -346,7 +378,7 @@ the qualifying outputs. These failed attempts are not counted as passes.
 
 ## Not run or not yet qualified
 
-- Full 64K prompt C1 state/logit continuation, long resets and failure recovery.
+- Long reset/failure cases beyond the separately qualified 64K continuation.
 - A useful additional capacity case and complete per-rank warmup/prefill/decode accounting.
 - MTP acceptance probabilities, long rollback/reset and failure state against TP1; sampled distribution checks.
 - Longer graph contexts and combined MTP/C4/C8 graph modes; C1 NCCL 255 replay/reset and bounded peer-loss gates pass as recorded.
