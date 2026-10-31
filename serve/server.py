@@ -4550,7 +4550,9 @@ class Service:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
-        recovery = ("Restart the distributed group before serving again."
+        recovery = ("Restart the reference engine explicitly before serving again."
+                    if getattr(self.engine, "reference_health", False) else
+                    "Restart the distributed group before serving again."
                     if getattr(self.engine, "distributed_health", False) else "The next request starts the engine again.")
         print(f"[strata] {e}. {note} {recovery}"
               f"{' Its log: ' + log if log else ''}", flush=True)
@@ -6559,6 +6561,8 @@ class BadBody(Exception):
 
 def make_handler(svc: Service):
     def engine_death_message(error):
+        if getattr(svc.engine, "reference_health", False):
+            return f"{error}; restart the reference engine explicitly before serving again"
         if getattr(svc.engine, "distributed_health", False):
             return f"{error}; restart the distributed group before serving again"
         return f"{error}; the next request restarts it"
@@ -8729,7 +8733,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             event_sink = None
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata", "distributed"], default="mock")
+    ap.add_argument("--engine", choices=["mock", "strata", "distributed", "reference"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
@@ -8913,7 +8917,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     tok = ByteTokenizer()
     tcfg = {}
     tpath = Path(a.tokenizer)
-    if a.engine in ("strata", "distributed") and not (tpath / "vocab.json").exists():
+    if a.engine in ("strata", "distributed", "reference") and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
@@ -8927,8 +8931,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             tcfg = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
-        if a.engine == "distributed" and arch_from_tokenizer(None, tcfg.get("pre")) == "deepseek41":
-            ap.error("distributed engine currently supports Qwen model families only")
+        if a.engine in ("distributed", "reference") and arch_from_tokenizer(None, tcfg.get("pre")) == "deepseek41":
+            ap.error(f"{a.engine} engine currently supports Qwen model families only")
         tok = ST.Tokenizer(tokens, merges, types, tcfg.get("pre") or "qwen35", tcfg.get("special_ids") or None)
     if a.engine == "strata" and not cfg.get("arch") and arch_from_tokenizer(None, tcfg.get("pre")):
         cfg["arch"] = arch_from_tokenizer(None, tcfg.get("pre"))
@@ -8948,17 +8952,19 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
     lazy = False
-    if a.engine == "distributed":
-        from serve.distributed_backend import DistributedEngine
+    if a.engine in ("distributed", "reference"):
+        from serve.distributed_backend import DistributedEngine, ReferenceEngine
         if not a.config:
-            ap.error("--engine distributed needs --config")
+            ap.error(f"--engine {a.engine} needs --config")
         if a.lazy or a.idle_unload or a.before_load or a.slot_save_path or a.batch_groups:
-            ap.error("distributed engine does not support lazy loading, unload hooks, session files or batching")
+            ap.error(f"{a.engine} engine does not support lazy loading, unload hooks, session files or batching")
         if a.offline:
-            ap.error("distributed engine cannot attest that remote ranks are offline")
+            ap.error("distributed engine cannot attest that remote ranks are offline" if a.engine == "distributed"
+                     else "reference engine cannot attest that its worker process is offline")
         sampling_defaults = sampling_defaults_from_config(cfg)
         try:
-            engine = DistributedEngine(cfg, engine_error=EngineDied)
+            engine_type = ReferenceEngine if a.engine == "reference" else DistributedEngine
+            engine = engine_type(cfg, engine_error=EngineDied)
         except (ValueError, EngineDied) as e:
             ap.error(str(e))
         effort_end, vision = None, None
@@ -9236,7 +9242,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                   else "split serve (configured)" if a.engine == "strata" and split
                                   else "layer split (configured)" if a.engine == "strata" and layer_split_of(cfg)
                                   else "single GPU or CPU" if a.engine == "strata"
-                                  else "distributed TP3" if a.engine == "distributed" else "mock")
+                                  else "distributed TP3" if a.engine == "distributed"
+                                  else "monolithic reference (world 1)" if a.engine == "reference" else "mock")
     svc.terminal_configured_split = (layer_split_value(cfg) if a.engine == "strata" and layer_split_of(cfg)
                                      else None)
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)

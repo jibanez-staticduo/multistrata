@@ -1,4 +1,4 @@
-"""Experimental TP3 coordinator boundary; this is not a native autoregressive driver.
+"""Experimental JSONL boundaries for TP3 and a world-one monolithic reference.
 
 The configured command must own all three ranks and speak JSON lines on stdio.
 READY: type=ready, protocol=strata-distributed-v1, mode=autoregressive, world=3,
@@ -10,6 +10,8 @@ alive_ranks) keeps the group lease alive, including while idle. Error, EOF,
 missing ranks, stale health, or invalid output permanently close the session.
 
 The current teacher-forced native worker does not implement this protocol.
+ReferenceEngine uses strata-reference-v1 with world=1 and alive_ranks=[0],
+and always admits one request. Its configuration lives in the reference section.
 No shell, model implementation, sampling, or fallback engine lives here.
 """
 from __future__ import annotations
@@ -123,33 +125,43 @@ def normalize_sampling(sampling: dict | None, n_vocab: int = MAX_TOKEN) -> dict:
     return out
 
 
-def validate_config(cfg: dict) -> dict:
+def _validate_config(cfg: dict, section: str, capacities: tuple[int, ...]) -> dict:
     """Validate before starting any process; never include configured argv in errors."""
-    spec = cfg.get("distributed")
+    spec = cfg.get(section)
     if not isinstance(spec, dict):
-        raise ValueError('distributed engine needs a "distributed" config section')
+        raise ValueError(f'{section} engine needs a "{section}" config section')
     command = spec.get("command")
     if not isinstance(command, list) or not command or any(not isinstance(x, str) or not x or "\0" in x for x in command):
-        raise ValueError("distributed.command must be a nonempty argv list")
+        raise ValueError(f"{section}.command must be a nonempty argv list")
     for key in ("vision", "images", "replicas", "split_serve", "lazy_load", "idle_unload_s", "slot_save_path", "before_load"):
         if cfg.get(key):
-            raise ValueError(f"distributed engine does not support {key}")
+            raise ValueError(f"{section} engine does not support {key}")
     parallel = cfg.get("parallel", spec.get("parallel", 1))
-    if type(parallel) is not int or parallel not in (1, 4, 8):
-        raise ValueError("distributed parallel must be 1, 4 or 8")
+    if type(parallel) is not int or parallel not in capacities:
+        raise ValueError(f"{section} parallel must be " + ("1, 4 or 8" if len(capacities) > 1 else "1"))
     if "parallel" in spec and (type(spec["parallel"]) is not int or spec["parallel"] != parallel):
-        raise ValueError("distributed parallel settings must agree")
+        raise ValueError(f"{section} parallel settings must agree")
     if cfg.get("arch") not in (None, "", "qwen4exp", "qwen35moe"):
-        raise ValueError("distributed engine currently supports Qwen model families only")
+        raise ValueError(f"{section} engine currently supports Qwen model families only")
     out = dict(spec)
     out["parallel"] = parallel
     for key, default in (("ready_timeout", 60.0), ("health_timeout", 15.0),
                          ("process_deadline", 900.0), ("cancel_timeout", 10.0), ("shutdown_timeout", 5.0)):
         value = spec.get(key, default)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-            raise ValueError(f"distributed.{key} must be positive finite seconds")
+            raise ValueError(f"{section}.{key} must be positive finite seconds")
         out[key] = float(value)
     return out
+
+
+def validate_config(cfg: dict) -> dict:
+    """Validate the TP3 coordinator configuration."""
+    return _validate_config(cfg, "distributed", (1, 4, 8))
+
+
+def validate_reference_config(cfg: dict) -> dict:
+    """Validate the opt-in C1 monolithic reference configuration."""
+    return _validate_config(cfg, "reference", (1,))
 
 
 @dataclass
@@ -171,6 +183,10 @@ class DistributedEngine:
 
     batch = 0
     distributed_health = True
+    _protocol = PROTOCOL
+    _expected_ranks = tuple(ROSTER)
+    _backend = "distributed"
+    _validate_config = staticmethod(validate_config)
 
     def __init__(self, cfg: dict, *, engine_error: type[RuntimeError] | None = None):
         # The actual entrypoint supplies its class: python -m runs server as __main__.
@@ -178,7 +194,7 @@ class DistributedEngine:
             from serve.server import EngineDied
             engine_error = EngineDied
         self._error_type = engine_error
-        self.spec = validate_config(cfg)
+        self.spec = self._validate_config(cfg)
         self.parallel = self.spec["parallel"]
         self.batch = self.parallel if self.parallel > 1 else 0
         self.n_vocab = MAX_TOKEN
@@ -189,9 +205,9 @@ class DistributedEngine:
                     raise ValueError
                 self.n_vocab = len(vocab)
             except (OSError, ValueError):
-                raise ValueError("distributed engine needs the native pack vocabulary") from None
+                raise ValueError(f"{self._backend} engine needs the native pack vocabulary") from None
         self.max_context = 0
-        self.info = {"backend": "distributed", "world": 3, "batch_slots": self.batch}
+        self.info = {"backend": self._backend, "world": len(self._expected_ranks), "batch_slots": self.batch}
         self._local = threading.local()
         self.last = None
         self._lock = threading.RLock()
@@ -260,10 +276,10 @@ class DistributedEngine:
         if cleanup:
             threading.Thread(target=self.close, daemon=True, name="strata-distributed-cleanup").start()
 
-    @staticmethod
-    def _ranks(message: dict) -> bool:
+    def _ranks(self, message: dict) -> bool:
         ranks = message.get("alive_ranks")
-        return isinstance(ranks, list) and all(type(x) is int for x in ranks) and sorted(ranks) == ROSTER
+        return (isinstance(ranks, list) and all(type(x) is int for x in ranks)
+                and sorted(ranks) == list(self._expected_ranks))
 
     def _read(self) -> None:
         try:
@@ -280,7 +296,7 @@ class DistributedEngine:
                 if not self._ranks(msg):
                     with self._lock:
                         self._roster = [x for x in msg.get("alive_ranks", [])
-                                        if type(x) is int and x in ROSTER] if isinstance(msg.get("alive_ranks"), list) else []
+                                        if type(x) is int and x in self._expected_ranks] if isinstance(msg.get("alive_ranks"), list) else []
                     raise ValueError
                 kind = msg.get("type")
                 event = None
@@ -290,8 +306,8 @@ class DistributedEngine:
                     if kind == "ready" and not self._ready.is_set():
                         ctx = msg.get("max_context")
                         slots = msg.get("slots", 1)
-                        if (msg.get("protocol") != PROTOCOL or msg.get("mode") != "autoregressive"
-                                or type(msg.get("world")) is not int or msg["world"] != 3
+                        if (msg.get("protocol") != self._protocol or msg.get("mode") != "autoregressive"
+                                or type(msg.get("world")) is not int or msg["world"] != len(self._expected_ranks)
                                 or type(ctx) is not int or ctx <= 0
                                 or type(slots) is not int or slots != self.parallel):
                             raise ValueError
@@ -329,7 +345,7 @@ class DistributedEngine:
                         event = request.events
                     else:
                         raise ValueError
-                    self._roster, self._last_health = list(ROSTER), time.monotonic()
+                    self._roster, self._last_health = list(self._expected_ranks), time.monotonic()
                 if event is not None:
                     event.put_nowait(msg)
         except (OSError, ValueError, TypeError, UnicodeError, queue.Full):
@@ -343,8 +359,8 @@ class DistributedEngine:
                     self._fail("the distributed coordinator ended")
                 elif time.monotonic() - self._last_health > self.spec["health_timeout"]:
                     self._fail("the distributed group health deadline expired")
-            ok = self._terminal is None and self._ready.is_set() and self._roster == ROSTER
-            return {"status": "ok" if ok else "unavailable", "ready": ok, "world": 3,
+            ok = self._terminal is None and self._ready.is_set() and self._roster == list(self._expected_ranks)
+            return {"status": "ok" if ok else "unavailable", "ready": ok, "world": len(self._expected_ranks),
                     "alive_ranks": list(self._roster), "state": self._state}
 
     def alive(self) -> bool:
@@ -539,3 +555,16 @@ class DistributedEngine:
                 for pipe in pipes:
                     if pipe is not None:
                         pipe.close()
+
+
+class ReferenceEngine(DistributedEngine):
+    """Opt-in C1 monolithic reference using the same bounded JSONL boundary."""
+
+    reference_health = True
+    _protocol = "strata-reference-v1"
+    _expected_ranks = (0,)
+    _backend = "reference"
+    _validate_config = staticmethod(validate_reference_config)
+
+    def restart(self) -> None:
+        raise self._error_type("the reference engine stopped; restart it explicitly before serving again")

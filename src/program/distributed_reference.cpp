@@ -1,5 +1,6 @@
 // Independent, uncaptured C1 teacher-forcing oracle. No distributed model kernels.
 #include "strata/distributed/reference.hpp"
+#include "strata/distributed/reference_service.hpp"
 #include "strata/distributed/capture_positions.hpp"
 #include "strata/distributed/parity_trace_writer.hpp"
 #include "strata/distributed/state_evidence.hpp"
@@ -109,7 +110,7 @@ int main(int argc, char** argv) {
     try {
         std::map<std::string, std::string> args;
         const std::set<std::string> allowed = {"pack", "native", "ple", "context", "logits-dir", "logits-positions",
-            "state-dir", "state-positions", "state-max-bytes", "trace-dir", "expert-residency"};
+            "state-dir", "state-positions", "state-max-bytes", "trace-dir", "expert-residency", "mode"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) ||
@@ -131,6 +132,17 @@ int main(int argc, char** argv) {
         const auto residency_text = args.contains("expert-residency") ? args.at("expert-residency") : "selected";
         require(residency_text == "all" || residency_text == "selected", "--expert-residency must be all or selected");
         const auto residency = residency_text == "all" ? ExpertResidency::AllResident : ExpertResidency::SelectedStaging;
+        const auto mode = args.contains("mode") ? args.at("mode") : "teacher-forced";
+        require(mode == "teacher-forced" || mode == "autoregressive", "--mode must be teacher-forced or autoregressive");
+        const bool autoregressive = mode == "autoregressive";
+        if (autoregressive) {
+            require(residency == ExpertResidency::AllResident,
+                    "autoregressive reference requires --expert-residency all");
+            require(context <= 65536, "autoregressive reference context must not exceed 65536");
+            for (const char* key : {"logits-dir", "logits-positions", "state-dir", "state-positions",
+                                    "state-max-bytes", "trace-dir"})
+                require(!args.contains(key), std::string("autoregressive reference does not support --") + key);
+        }
         const bool selected_logits = args.contains("logits-positions");
         require(!selected_logits || args.contains("logits-dir"), "--logits-positions requires --logits-dir");
         const auto logits_positions = selected_logits ?
@@ -167,6 +179,7 @@ int main(int argc, char** argv) {
             require(!value || value[0] != '1', std::string("oracle requires ") + name + " disabled");
         }
         const auto pack = get("pack"), native = get("native"), ple = get("ple");
+        if (autoregressive) prepare_reference_service();
         const auto shards = gguf_split_paths(native);
         const GgufFile metadata(shards.front());
         core::ModelGeometry geometry;
@@ -235,8 +248,14 @@ int main(int argc, char** argv) {
             });
         }
         require(model.initialize(err), err);
-        require(model.reset(stream.value, err), err);
+        if (!autoregressive) require(model.reset(stream.value, err), err);
         logits.allocate(size_t(geometry.n_vocab) * sizeof(float));
+        if (autoregressive) {
+            const auto failure = run_reference_service(model, int32_t(geometry.n_vocab), uint32_t(context),
+                                                       static_cast<float*>(logits.pointer), stream.value);
+            require(!failure, failure.detail);
+            return 0;
+        }
         std::vector<float> host_logits(size_t(geometry.n_vocab));
         uint64_t request_sequence = 0;
         std::set<uint64_t> dumped_positions;

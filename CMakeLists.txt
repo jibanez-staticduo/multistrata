@@ -2850,9 +2850,12 @@ if(STRATA_BUILD_DISTRIBUTED)
   target_link_libraries(strata-distributed PRIVATE strata_engine strata_tp_cuda strata_kernels_cpu
                         ${CMAKE_DL_LIBS} Threads::Threads)
   add_executable(strata-tp-reference src/program/distributed_reference.cpp src/distributed/reference.cpp
-                                   src/distributed/state_evidence.cpp src/distributed/parity_trace_writer.cpp)
+                                   src/distributed/state_evidence.cpp src/distributed/parity_trace_writer.cpp
+                                   src/distributed/reference_service.cpp src/distributed/autoregressive.cpp
+                                   src/distributed/serve_protocol.cpp src/distributed/speculative.cpp)
   target_compile_definitions(strata-tp-reference PRIVATE STRATA_BUILD_DISTRIBUTED
-                             STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE)
+                             STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE
+                             STRATA_REFERENCE_CUDA)
   target_include_directories(strata-tp-reference PRIVATE include src
                             ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata-tp-reference PRIVATE strata_engine strata_kernels_cpu Threads::Threads)
@@ -2970,6 +2973,13 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_include_directories(test_reference_residency PRIVATE include)
   target_link_libraries(test_reference_residency PRIVATE strata_warnings)
   add_test(NAME test_reference_residency COMMAND test_reference_residency)
+
+  add_executable(test_reference_service tests/distributed/test_reference_service.cpp
+                 src/distributed/reference_service.cpp src/distributed/autoregressive.cpp
+                 src/distributed/serve_protocol.cpp src/distributed/speculative.cpp)
+  target_include_directories(test_reference_service PRIVATE include)
+  target_link_libraries(test_reference_service PRIVATE strata_warnings)
+  add_test(NAME test_reference_service COMMAND test_reference_service)
 
   add_executable(test_model_worker_command tests/distributed/test_model_worker_command.cpp
                                           src/distributed/model_worker.cpp)

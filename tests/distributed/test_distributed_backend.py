@@ -15,7 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from serve.distributed_backend import DistributedEngine, normalize_sampling, validate_config
+from serve.distributed_backend import (DistributedEngine, ReferenceEngine, normalize_sampling,
+                                       validate_config, validate_reference_config)
 from serve.frontend import ChatTemplate
 from serve.server import ByteTokenizer, EngineDied, Service, main, serve
 
@@ -220,21 +221,24 @@ def test_non_qwen_family_rejected_before_process_start(arch):
         validate_config(cfg)
 
 
-def test_real_module_entrypoint_handles_adapter_errors(tmp_path):
+@pytest.mark.parametrize("backend", ["distributed", "reference"])
+def test_real_module_entrypoint_handles_adapter_errors(tmp_path, backend):
     tokenizer = tmp_path / "tokenizer"
     tokenizer.mkdir()
     (tokenizer / "vocab.json").write_text(json.dumps({"a": 0, "aa": 1}))
     (tokenizer / "merges.txt").write_text("a a")
     (tokenizer / "token_type.json").write_text("[1,1]")
-    cfg = {"tokenizer": str(tokenizer), "distributed": {"command": ["/missing/coordinator"]}}
+    cfg = {"tokenizer": str(tokenizer), backend: {"command": ["/missing/private-api-key", "private-argument"]}}
     path = tmp_path / "config.json"
     path.write_text(json.dumps(cfg))
     env = dict(os.environ, PYTHONPATH=str(tmp_path) + os.pathsep + str(ROOT))
-    run = subprocess.run([sys.executable, "-m", "serve.server", "--engine", "distributed", "--config", str(path),
+    run = subprocess.run([sys.executable, "-m", "serve.server", "--engine", backend, "--config", str(path),
                           "--port", "0"], cwd=ROOT, env=env, capture_output=True, text=True, timeout=5)
     assert run.returncode == 2
     assert "Traceback" not in run.stderr
     assert "distributed coordinator could not start" in run.stderr
+    assert "private-api-key" not in run.stdout + run.stderr
+    assert "private-argument" not in run.stdout + run.stderr
 
 
 def test_tokens_over_budget_fail_whole_group(make_engine):
@@ -346,13 +350,14 @@ def test_deadlines_must_be_positive_finite(value):
         validate_config(config(health_timeout=value))
 
 
-def test_cli_requires_pack_tokenizer_before_starting(tmp_path):
-    cfg = config()
+@pytest.mark.parametrize("backend", ["distributed", "reference"])
+def test_cli_requires_pack_tokenizer_before_starting(tmp_path, backend):
+    cfg = config() if backend == "distributed" else reference_config()
     cfg["tokenizer"] = str(tmp_path / "missing")
     path = tmp_path / "config.json"
     path.write_text(json.dumps(cfg))
     with pytest.raises(SystemExit) as exc:
-        main(["--engine", "distributed", "--config", str(path), "--port", "0"])
+        main(["--engine", backend, "--config", str(path), "--port", "0"])
     assert exc.value.code == 2
 
 
@@ -421,6 +426,247 @@ def test_http_failed_distributed_group_requires_explicit_restart(make_engine):
     message = json.loads(body)["error"]["message"]
     assert "restart the distributed group" in message
     assert "next request restarts" not in message
+
+
+# A literal world-one fixture: never rewrite the TP3 fixture into a reference worker.
+REFERENCE_WORKER = r'''
+import json, sys, threading, time
+mode = sys.argv[1]
+output = threading.Lock()
+def emit(kind, **kw):
+    with output:
+        print(json.dumps(dict(type=kind, alive_ranks=[0], **kw)), flush=True)
+ready = dict(type='ready', protocol='strata-reference-v1', mode='autoregressive',
+             world=1, alive_ranks=[0], max_context=32768, slots=1)
+if mode == 'wrong_protocol': ready['protocol'] = 'strata-distributed-v1'
+if mode == 'wrong_world': ready['world'] = 3
+if mode == 'wrong_rank': ready['alive_ranks'] = [2]
+if mode == 'extra_rank': ready['alive_ranks'] = [0,1,2]
+if mode == 'teacher': ready['mode'] = 'teacher-forced'
+if mode == 'wrong_slots': ready['slots'] = 4
+if mode == 'legacy_slots': ready.pop('slots')
+print(json.dumps(ready), flush=True)
+def beat():
+    while True:
+        time.sleep(.03)
+        emit('health', state='ready')
+if mode != 'stale': threading.Thread(target=beat, daemon=True).start()
+turn = 0
+cancelled = False
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg['type'] == 'shutdown': break
+    rid = msg['request_id']
+    if msg['type'] == 'cancel':
+        if mode == 'no_cancel_ack': continue
+        time.sleep(.05)
+        cancelled = True
+        emit('cancelled', request_id=rid, state='ready')
+        continue
+    turn += 1
+    if mode == 'death': sys.exit(1)
+    if mode == 'invalid_rank':
+        print(json.dumps(dict(type='token', alive_ranks=[2], request_id=rid, id=65, committed=True)), flush=True)
+        continue
+    if mode in ('cancel', 'no_cancel_ack') and turn == 1:
+        emit('token', request_id=rid, id=65, committed=True)
+        continue
+    if mode == 'stop' and turn == 1:
+        for token in list(b'</think>\n\nSTOP'):
+            emit('token', request_id=rid, id=token, committed=True)
+        continue
+    if mode in ('cancel', 'stop') and not cancelled:
+        emit('error')
+        continue
+    if mode == 'echo': values = msg['ids']
+    else:
+        text = '</think>\n\nHello.'
+        if msg['sampling'].get('seed') == 7:
+            text = '</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>'
+        values = list(text.encode()) + [257]
+    for token in values[:msg['max_new']]: emit('token', request_id=rid, id=token, committed=True)
+    emit('done', request_id=rid, state='ready')
+'''
+
+
+def reference_config(mode="normal", **options):
+    return {"reference": {"command": [sys.executable, "-u", "-c", REFERENCE_WORKER, mode],
+                          "ready_timeout": 2, "health_timeout": 1, "process_deadline": 2,
+                          "cancel_timeout": .3, "shutdown_timeout": .3, **options}}
+
+
+@pytest.fixture
+def make_reference():
+    engines = []
+
+    def make(mode="normal", **options):
+        engine = ReferenceEngine(reference_config(mode, **options))
+        engines.append(engine)
+        return engine
+
+    yield make
+    for engine in engines:
+        engine.close()
+
+
+@pytest.mark.parametrize("mode", ["wrong_protocol", "wrong_world", "wrong_rank", "extra_rank", "teacher", "wrong_slots"])
+def test_reference_requires_its_own_world_one_handshake(mode):
+    with pytest.raises(EngineDied):
+        ReferenceEngine(reference_config(mode))
+
+
+@pytest.mark.parametrize("mode", ["echo", "legacy_slots"])
+def test_reference_reports_world_one_and_uses_single_slot(make_reference, mode):
+    engine = make_reference(mode)
+    assert engine.batch == 0 and engine.parallel == 1
+    assert engine.info == {"backend": "reference", "world": 1, "batch_slots": 0}
+    assert engine.health()["world"] == 1 and engine.health()["alive_ranks"] == [0]
+    values = list(engine.generate([17, 42], 2, {}, threading.Event()))
+    assert values == ([17, 42] if mode == "echo" else list(b'</'))
+
+
+@pytest.mark.parametrize("value", [0, 2, 4, 8, True, "1", 1.0])
+def test_reference_rejects_parallel_capacity(value):
+    cfg = reference_config(parallel=value)
+    with pytest.raises(ValueError, match="parallel"):
+        validate_reference_config(cfg)
+    cfg = reference_config()
+    cfg["parallel"] = value
+    with pytest.raises(ValueError, match="parallel"):
+        validate_reference_config(cfg)
+
+
+def test_reference_requires_unambiguous_section_and_does_not_trust_protocol_overrides():
+    with pytest.raises(ValueError, match='"reference" config section'):
+        ReferenceEngine(config())
+    with pytest.raises(EngineDied):
+        ReferenceEngine(reference_config("wrong_world", world=3, protocol="strata-distributed-v1", alive_ranks=[0, 1, 2]))
+    with pytest.raises(EngineDied):
+        DistributedEngine({"distributed": reference_config()["reference"]})
+
+
+@pytest.mark.parametrize("key,value", [("vision", {"exe": "x"}), ("images", {"exe": "x"}),
+                                       ("lazy_load", True), ("idle_unload_s", 1), ("arch", "deepseek41")])
+def test_reference_rejects_unsupported_profiles(key, value):
+    cfg = reference_config()
+    cfg[key] = value
+    with pytest.raises(ValueError):
+        validate_reference_config(cfg)
+
+
+def test_reference_preflight_keeps_session_and_vocab_bounds(tmp_path):
+    (tmp_path / "vocab.json").write_text(json.dumps({"a": 0, "b": 1}))
+    cfg = reference_config("echo")
+    cfg["tokenizer"] = str(tmp_path)
+    engine = ReferenceEngine(cfg)
+    try:
+        for ids, sampling in (([2], {}), ([1], {"logit_bias": {"2": 1}}), ([1], {"strata_tune": {}})):
+            with pytest.raises(ValueError):
+                list(engine.generate(ids, 1, sampling, threading.Event()))
+        assert engine.alive() and engine._request is None
+        assert list(engine.generate([1], 1, {}, threading.Event())) == [1]
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("close", [False, True])
+def test_reference_cancel_drains_before_next_request(make_reference, close):
+    engine = make_reference("cancel")
+    cancel = threading.Event()
+    stream = engine.generate([1], 20, {}, cancel)
+    assert next(stream) == 65
+    if close:
+        stream.close()
+    else:
+        cancel.set()
+        assert list(stream) == []
+    assert list(engine.generate([1], 20, {}, threading.Event()))
+    assert engine.health()["state"] == "ready"
+
+
+def test_reference_missing_cancel_ack_requires_restart(make_reference):
+    engine = make_reference("no_cancel_ack", cancel_timeout=.1)
+    stream = engine.generate([1], 20, {}, threading.Event())
+    assert next(stream) == 65
+    with pytest.raises(EngineDied):
+        stream.close()
+    assert not engine.alive()
+    with pytest.raises(EngineDied, match="reference engine.*explicitly"):
+        engine.restart()
+
+
+@pytest.mark.parametrize("mode", ["death", "invalid_rank"])
+def test_reference_failure_exposes_no_tokens_and_has_no_fallback(make_reference, mode):
+    engine = make_reference(mode)
+    with pytest.raises(EngineDied):
+        list(engine.generate([1], 20, {}, threading.Event()))
+    assert not engine.alive()
+    with pytest.raises(EngineDied):
+        list(engine.generate([1], 20, {}, threading.Event()))
+
+
+def test_reference_http_health_reports_actual_world_and_expiry(make_reference):
+    engine = make_reference("stale", health_timeout=5)
+    with http_service(engine) as port:
+        status, raw = request(port, "/health")
+        body = json.loads(raw)
+        assert status == 200 and body["world"] == 1 and body["alive_ranks"] == [0]
+        with engine._lock:
+            engine._last_health -= 6
+        status, raw = request(port, "/api/health")
+        assert status == 503 and json.loads(raw)["loaded"] is False
+
+
+@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/messages"])
+@pytest.mark.parametrize("stream", [False, True])
+def test_reference_http_uses_existing_token_parser(make_reference, path, stream):
+    test_existing_http_apis_parse_adapter_tokens(make_reference, path, stream)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_reference_http_uses_existing_tool_parser(make_reference, stream):
+    engine = make_reference()
+    with http_service(engine) as port, contextlib.redirect_stdout(io.StringIO()):
+        status, raw = request(port, "/v1/chat/completions", {
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 200,
+            "stream": stream, "seed": 7,
+            "tools": [{"type": "function", "function": {"name": "get_weather",
+                      "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+        })
+    assert status == 200
+    if stream:
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+        calls = [call for event in events for choice in event.get("choices", [])
+                 for call in choice.get("delta", {}).get("tool_calls", [])]
+    else:
+        calls = json.loads(raw)["choices"][0]["message"]["tool_calls"]
+    assert any(call.get("function", {}).get("name") == "get_weather" for call in calls)
+    assert "Paris" in "".join(call.get("function", {}).get("arguments", "") for call in calls)
+
+
+def test_reference_http_failure_requires_explicit_reference_restart(make_reference):
+    engine = make_reference("death")
+    with http_service(engine) as port:
+        status, raw = request(port, "/v1/chat/completions", {
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1})
+    assert status == 503
+    message = json.loads(raw)["error"]["message"]
+    assert "restart the reference engine explicitly" in message
+    assert "next request restarts" not in message
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_reference_http_stop_cancels_and_resets_before_next_turn(make_reference, stream):
+    engine = make_reference("stop")
+    with http_service(engine) as port, contextlib.redirect_stdout(io.StringIO()):
+        payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                   "max_tokens": 100, "stream": stream, "stop": ["STOP"]}
+        status, raw = request(port, "/v1/chat/completions", payload)
+        assert status == 200 and "STOP" not in raw
+        status, raw = request(port, "/v1/chat/completions", {**payload, "stream": False})
+        assert status == 200
+        assert json.loads(raw)["choices"][0]["message"]["content"] == "Hello."
+    assert engine.alive() and engine._request is None
 
 
 MULTISLOT_COORDINATOR = r'''
