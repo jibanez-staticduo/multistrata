@@ -158,6 +158,34 @@ def test_identity_mismatch_is_rejected(evidence, field, value):
         cm.compare(a, b, policy, product_comparison=True)
 
 
+def test_explicit_revision_pair_preserves_real_provenance_and_numerical_gate(evidence):
+    a, b, policy = evidence
+    add_states(a, b)
+    change(b, lambda m: m.update(commit="c" * 40))
+    report, code = cm.compare(a, b, policy, expected_revisions=("a" * 40, "c" * 40))
+    assert code == 0 and report["full_model_pass"]
+    assert report["approved_revision_pair"] == {"baseline": "a" * 40, "candidate": "c" * 40}
+    assert report["provenance"]["candidate"]["commit"] == "c" * 40
+    np.array([1, 2, 3, 8], dtype="<f2").tofile(a.parent / "state-1-gdn-1.bin")
+    report, code = cm.compare(a, b, policy, expected_revisions=("a" * 40, "c" * 40))
+    assert code == 1 and not report["full_model_pass"]
+
+
+@pytest.mark.parametrize("pair", [("a" * 40, "d" * 40), ("HEAD", "c" * 40), ("a" * 40,)])
+def test_revision_pair_must_name_both_exact_actual_revisions(evidence, pair):
+    a, b, policy = evidence
+    change(b, lambda m: m.update(commit="c" * 40))
+    with pytest.raises(cm.EvidenceError):
+        cm.compare(a, b, policy, expected_revisions=pair)
+
+
+def test_revision_pair_does_not_allow_different_pack(evidence):
+    a, b, policy = evidence
+    change(b, lambda m: m.update(commit="c" * 40, pack_sha256="d" * 64))
+    with pytest.raises(cm.EvidenceError, match="pack_sha256"):
+        cm.compare(a, b, policy, expected_revisions=("a" * 40, "c" * 40))
+
+
 @pytest.mark.parametrize("field,value", [("settings", {"context": 8192}), ("backend", "cpu"), ("mode", "prefill")])
 def test_settings_need_explicit_product_comparison(evidence, field, value):
     a, b, policy = evidence

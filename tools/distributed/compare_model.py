@@ -5,6 +5,9 @@ Usage: compare_model.py baseline.json candidate.json --policy policy.json --outp
 Exit 0: logits and declared KV/GDN state pass; 1: numerical failure; 2: invalid
 evidence; 77: unqualified (measure-only or missing state evidence).
 
+The default requires matching commits. --expected-revisions names an exact
+baseline/candidate pair without changing pack, input, state or numerical gates.
+
 Metadata schema 1 requires commit, pack_sha256, policy_sha256, settings, backend,
 mode, started_at (timezone ISO8601), command (argv), n_vocab, token_ids, and rows.
 Rows are {request_id, position, path}; paths are relative to metadata. Format
@@ -319,13 +322,22 @@ def numerical_pass(values: dict, limits: dict) -> bool:
 
 
 def compare(baseline: Path, candidate: Path, policy_path: Path, *,
-            product_comparison: bool = False, measure_only: bool = False) -> tuple[dict, int]:
+            product_comparison: bool = False, measure_only: bool = False,
+            expected_revisions: tuple[str, str] | None = None) -> tuple[dict, int]:
     """Validate artifact identity before computing any numerical verdict."""
     files = {str(policy_path.resolve()): sha256(policy_path)}
     policy = read_policy(policy_path)
     left = load(baseline, policy_path, policy, files)
     right = load(candidate, policy_path, policy, files)
-    required = ("commit", "pack_sha256", "policy_sha256", "n_vocab", "token_ids")
+    required = ("pack_sha256", "policy_sha256", "n_vocab", "token_ids")
+    if expected_revisions is None:
+        require(left["metadata"]["commit"] == right["metadata"]["commit"], "mismatched commit")
+    else:
+        require(isinstance(expected_revisions, (tuple, list)) and len(expected_revisions) == 2 and
+                all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
+                    for value in expected_revisions), "revision pair requires two exact commit IDs")
+        require(tuple(expected_revisions) == (left["metadata"]["commit"], right["metadata"]["commit"]),
+                "actual revisions do not match the approved revision pair")
     for key in required:
         require(left["metadata"][key] == right["metadata"][key], f"mismatched {key}")
     differences = [key for key in ("settings", "backend", "mode")
@@ -392,6 +404,8 @@ def compare(baseline: Path, candidate: Path, policy_path: Path, *,
               "rows": rows, "states": states, "policy": policy,
               "provenance": {"baseline": left["metadata"], "candidate": right["metadata"]},
               "files_sha256": files}
+    if expected_revisions is not None:
+        report["approved_revision_pair"] = dict(zip(("baseline", "candidate"), expected_revisions))
     failed = not logits_pass or any(not s["numerical_pass"] for s in states)
     return report, 77 if measure_only else (1 if failed else (0 if full_pass else 77))
 
@@ -404,10 +418,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--product-comparison", action="store_true")
     parser.add_argument("--measure-only", action="store_true")
+    parser.add_argument("--expected-revisions", nargs=2, metavar=("BASELINE_COMMIT", "CANDIDATE_COMMIT"),
+                        help="explicitly compare these two source revisions; all numerical and model gates remain")
     args = parser.parse_args(argv)
     try:
         report, code = compare(args.baseline, args.candidate, args.policy,
-                               product_comparison=args.product_comparison, measure_only=args.measure_only)
+                               product_comparison=args.product_comparison, measure_only=args.measure_only,
+                               expected_revisions=args.expected_revisions)
     except (EvidenceError, OSError, ValueError, KeyError, TypeError) as exc:
         report, code = {"schema_version": 1, "qualified": False, "full_model_pass": False,
                         "error": str(exc)}, 2
