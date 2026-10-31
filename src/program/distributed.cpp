@@ -2,6 +2,10 @@
 // Opt-in, uncaptured C1 driver. Teacher forcing keeps the original per-rank input;
 // autoregressive mode lets rank zero coordinate JSONL requests and sampled IDs.
 #include "distributed/nccl_transport.cpp"
+#include "strata/distributed/hybrid_backend.hpp"
+#if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
+#include "strata/distributed/roce_backend.hpp"
+#endif
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/distributed/expert_model.hpp"
@@ -85,6 +89,33 @@ struct Event {
     Event() { cuda_check(cudaEventCreateWithFlags(&value, cudaEventDisableTiming)); }
     ~Event() { if (value) cudaEventDestroy(value); }
 };
+
+#if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
+struct RoceLifetime {
+    strata::distributed::roce::RoceBackend& backend;
+    bool requires_process_exit() const noexcept { return backend.requires_process_exit(); }
+};
+
+std::vector<std::string> split_csv(const std::string& value, const char* what) {
+    std::vector<std::string> result;
+    std::istringstream input(value);
+    std::string item;
+    while (std::getline(input, item, ',')) {
+        if (item.empty()) throw std::runtime_error(std::string("invalid ") + what);
+        result.push_back(std::move(item));
+    }
+    if (result.empty() || value.back() == ',') throw std::runtime_error(std::string("invalid ") + what);
+    return result;
+}
+
+int signed_number(const std::string& value, const char* what) {
+    size_t used = 0;
+    const long parsed = std::stol(value, &used);
+    if (used != value.size() || parsed < INT32_MIN || parsed > INT32_MAX)
+        throw std::runtime_error(std::string("invalid ") + what);
+    return static_cast<int>(parsed);
+}
+#endif
 
 class ServiceStateReadback final {
 public:
@@ -372,12 +403,18 @@ int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
         std::map<std::string, std::string> args;
-        const std::set<std::string> allowed = {"rank", "rank0-address", "port", "session-uuid",
+        std::set<std::string> allowed = {"rank", "rank0-address", "port", "session-uuid",
             "library-path", "nccl-version", "library-provenance", "model-hash", "config-fingerprint",
             "pack", "native", "ple", "context", "logits-dir", "logits-positions", "timeout-ms",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
             "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel", "profile-dir",
             "collective-agreement", "service-state-dir", "timing-file", "expert-operands"};
+#if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
+        allowed.insert("gather-transport");
+        allowed.insert("roce-hca-list");
+        allowed.insert("roce-route-hca");
+        allowed.insert("roce-gid-index");
+#endif
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) || args.contains(key.substr(2)))
@@ -419,6 +456,20 @@ int main(int argc, char** argv) {
         require(expert_operands_value == "full" || expert_operands_value == "compact",
                 "invalid expert operand policy");
         const bool compact_expert_operands = expert_operands_value == "compact";
+        const auto gather_transport = args.contains("gather-transport") ? args.at("gather-transport") : "nccl";
+        require(gather_transport == "nccl" || gather_transport == "roce", "invalid gather transport");
+        const bool hybrid_roce = gather_transport == "roce";
+#if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
+        require(!hybrid_roce || (args.contains("roce-hca-list") && args.contains("roce-route-hca")),
+                "--gather-transport roce requires --roce-hca-list and --roce-route-hca");
+        require(hybrid_roce || (!args.contains("roce-hca-list") && !args.contains("roce-route-hca") &&
+                                !args.contains("roce-gid-index")),
+                "RoCE options require --gather-transport roce");
+#else
+        require(!hybrid_roce && !args.contains("roce-hca-list") && !args.contains("roce-route-hca") &&
+                    !args.contains("roce-gid-index"),
+                "RoCE gather transport is unavailable in this build");
+#endif
         const auto agreement = args.contains("collective-agreement") ? args.at("collective-agreement") : "per-op";
         require(agreement == "per-op" || agreement == "step", "invalid collective agreement policy");
         const bool preagreed_collectives = agreement == "step";
@@ -568,9 +619,50 @@ int main(int argc, char** argv) {
         if (multislot) join.config_fingerprint += ":multislot-v1:slots=" + std::to_string(parallel) +
                                                   ":context=" + std::to_string(context);
         if (compact_expert_operands) join.config_fingerprint += ":expert-operands-v1:compact";
-        join.backend_identity = "nccl"; join.nccl_version_expected = version; join.library_provenance = provenance;
+        join.backend_identity = hybrid_roce ? std::string(kHybridBackendIdentity) : "nccl";
+        if (hybrid_roce) join.config_fingerprint += ":gather-transport=hybrid-roce-v1";
+        join.nccl_version_expected = version; join.library_provenance = provenance;
         join.nccl_bootstrap_id = std::string(256, '0');
+#if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
+        std::unique_ptr<roce::RoceBackend> roce_backend;
+        std::unique_ptr<RoceLifetime> roce_owner;
+        std::unique_ptr<PendingDmaExitGuard<RoceLifetime>> roce_lifetime;
+        std::vector<uint8_t> local_roce_blob;
+        if (hybrid_roce) {
+            const auto hca_names = split_csv(get("roce-hca-list"), "--roce-hca-list");
+            require(hca_names.size() <= 4, "--roce-hca-list supports at most four HCAs");
+            const auto routes = split_csv(get("roce-route-hca"), "--roce-route-hca");
+            require(routes.size() == kTpWorld, "--roce-route-hca must contain exactly three integers");
+            roce::Config roce_config;
+            roce_config.rank = uint32_t(rank);
+            roce_config.world = kTpWorld;
+            roce_config.hca_names = hca_names;
+            for (const auto& route : routes) roce_config.route_hca.push_back(signed_number(route, "--roce-route-hca"));
+            roce_config.gid_index = args.contains("roce-gid-index")
+                                        ? signed_number(args.at("roce-gid-index"), "--roce-gid-index")
+                                        : -1;
+            roce_config.timeout_ms = uint32_t(timeout);
+            roce_config.approved_proxy_sha256 = STRATA_ROCE_PROXY_SHA256;
+            roce_backend = std::make_unique<roce::RoceBackend>(std::move(roce_config));
+            roce_owner = std::make_unique<RoceLifetime>(RoceLifetime{*roce_backend});
+            // This guard is declared before any transport borrows the RoCE-owned resources.
+            roce_lifetime = std::make_unique<PendingDmaExitGuard<RoceLifetime>>(*roce_owner);
+            require(roce_backend->create());
+            require(roce_backend->local_blob(local_roce_blob));
+            join.library_provenance += ";roce=" + roce_backend->provenance();
+        }
+#endif
         if (rank == 0) require(make_nccl_bootstrap_id(nccl_config.library_path, join.nccl_bootstrap_id, err), err);
+        if (hybrid_roce) {
+#if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
+            HybridBootstrap bundle;
+            if (rank == 0) bundle.nccl_id_hex = join.nccl_bootstrap_id;
+            bundle.roce_blob = std::move(local_roce_blob);
+            require(encode_hybrid_bootstrap(bundle, join.nccl_bootstrap_id));
+#else
+            throw std::runtime_error("RoCE gather transport is unavailable in this build");
+#endif
+        }
         TcpChannelConfig tcp;
         tcp.rank = rank; tcp.world = 3; tcp.self = {get("rank0-address"), uint16_t(port)};
         tcp.rank0 = tcp.self; tcp.credential = credential.secret();
@@ -579,14 +671,37 @@ int main(int argc, char** argv) {
         SessionConfig config;
         config.rank = rank; config.session_uuid = join.session_uuid; config.credential = credential;
         config.approved_nccl_version = version; config.approved_library_provenance = provenance;
+        if (hybrid_roce) config.approved_library_provenance = join.library_provenance;
         config.budgets = {uint32_t(timeout), uint32_t(timeout), uint32_t(timeout), uint32_t(timeout)};
         Session session(config, join, *channel, clock);
         std::cerr << "LOAD rank=" << rank << " stage=join" << std::endl;
         require(session.start());
+#if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
+        if (hybrid_roce) {
+            std::array<std::string, kTpWorld> fields;
+            for (uint32_t peer = 0; peer < kTpWorld; ++peer)
+                fields[peer] = session.roster().ranks[peer].nccl_bootstrap_id;
+            std::string bootstrap_hex;
+            std::vector<uint8_t> rank_ordered_blobs;
+            require(decode_hybrid_bootstrap_roster(fields, bootstrap_hex, rank_ordered_blobs));
+            nccl_config.bootstrap_id = std::move(bootstrap_hex);
+            require(roce_backend->connect(rank_ordered_blobs));
+        } else
+#endif
         require(session.bootstrap_id(0, nccl_config.bootstrap_id));
         nccl_config.initialize_ms = std::min(config.budgets.initialize_ms, session.roster().budgets.initialize_ms);
         NcclBackend nccl_backend(std::move(api), nccl_config, {version, provenance});
+#if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
+        std::unique_ptr<HybridBackend> hybrid_backend;
+        Backend* active_backend = &nccl_backend;
+        if (hybrid_roce) {
+            hybrid_backend = std::make_unique<HybridBackend>(nccl_backend, *roce_backend);
+            active_backend = hybrid_backend.get();
+        }
+        GuardedTransport transport(*active_backend, clock);
+#else
         GuardedTransport transport(nccl_backend, clock);
+#endif
         transport.set_poll_interval_ms(uint32_t(poll_interval));
         require(nccl_backend.init());
         try {

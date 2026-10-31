@@ -2849,6 +2849,7 @@ if(STRATA_BUILD_DISTRIBUTED)
     target_link_libraries(test_roce_backend_state PRIVATE Threads::Threads)
     add_test(NAME test_roce_backend_state COMMAND test_roce_backend_state)
     set_tests_properties(test_roce_backend_state PROPERTIES LABELS "distributed;cuda;contract")
+
   endif()
 
   # Preserve the original native CUDA arithmetic; these files do not inherit fast-math source flags.
@@ -2893,6 +2894,15 @@ if(STRATA_BUILD_DISTRIBUTED)
                             ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata-distributed PRIVATE strata_engine strata_tp_cuda strata_kernels_cpu
                         ${CMAKE_DL_LIBS} Threads::Threads)
+  if(STRATA_BUILD_ROCE_EXPERIMENTAL)
+    target_sources(strata-distributed PRIVATE src/distributed/roce_backend.cpp
+                   src/kernels/cuda/tp/roce_collective.cu third_party/rocenante/proxy.c)
+    target_compile_definitions(strata-distributed PRIVATE STRATA_BUILD_ROCE_EXPERIMENTAL
+                               STRATA_ROCE_PROXY_SHA256="${STRATA_ROCE_PROXY_SHA256}")
+    target_include_directories(strata-distributed PRIVATE ${STRATA_IBVERBS_INCLUDE_DIR})
+    target_link_libraries(strata-distributed PRIVATE ${STRATA_IBVERBS_LIBRARY})
+    set_property(TARGET strata-distributed APPEND PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+  endif()
   add_executable(strata-tp-reference src/program/distributed_reference.cpp src/distributed/reference.cpp
                                    src/distributed/state_evidence.cpp src/distributed/parity_trace_writer.cpp
                                    src/distributed/reference_service.cpp src/distributed/autoregressive.cpp
@@ -2933,6 +2943,12 @@ endif()
 if(STRATA_BUILD_DISTRIBUTED_TESTS)
   enable_testing()
   find_package(Threads REQUIRED)  # test_session drives three ranks in three threads over real loopback TCP
+
+  add_executable(test_hybrid_backend tests/distributed/test_hybrid_backend.cpp)
+  target_include_directories(test_hybrid_backend PRIVATE include)
+  target_link_libraries(test_hybrid_backend PRIVATE strata_warnings)
+  add_test(NAME test_hybrid_backend COMMAND test_hybrid_backend)
+  set_tests_properties(test_hybrid_backend PROPERTIES LABELS "distributed;contract;hybrid")
 
   # the shard plan: coverage, quantized-block boundaries and the global-activation contract (synthetic tensors)
   add_executable(shard_plan_test tests/distributed/shard_plan_test.cpp)
