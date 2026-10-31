@@ -1727,11 +1727,12 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
 #ifdef STRATA_BUILD_DISTRIBUTED
                       , DistributedLayerHooks* distributed
 #endif
+                      , bool shared_ready
                       ) {    const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
 // `bb.mixed` and `bb.inject` are what `block_layer_pre` left, and NOTHING between the two calls may touch
 // them - that is what makes `post[l]` safe to launch after the host has run the pool.
 st_begin(layer, 5, stream);
-    if (g_shared_early ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
+    if (g_shared_early || shared_ready ? !moe_combine_parts(g, layer, k, mb, parts, bb.block_out, stream, err)
                        : !moe_finish(tables, g, layer, k, mb, bb.mixed, parts, bb.block_out, stream, err)) return false;
     st_end(layer, 5, stream);    dump_half(bb, g, layer, bb.block_out, (uint64_t) g.n_embd, g.n_embd, stream);    dump_half(bb, g, layer, bb.inject, (uint64_t) 2 * g.n_embd + g.hc, g.hc, stream);    st_begin(layer, 6, stream);
     const bool steer = strata::kernels::cvec().covers(layer);   // --control-vector-scaled: after this write

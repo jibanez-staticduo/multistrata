@@ -23,6 +23,14 @@ struct DeviceMemory {
     ~DeviceMemory() { if (data) cudaFree(data); }
     void allocate(size_t bytes) { checked(cudaMalloc(&data, bytes)); }
 };
+size_t checked_add(size_t total, size_t value) {
+    if (value > SIZE_MAX - total) throw std::overflow_error("TP prefill batch scratch size overflow");
+    return total + value;
+}
+size_t checked_product(size_t a, size_t b) {
+    if (b && a > SIZE_MAX / b) throw std::overflow_error("TP prefill batch scratch size overflow");
+    return a * b;
+}
 // A null counter takes no timestamps, keeping disabled profiling off the clock path.
 struct ProfileSpan {
     uint64_t* counter;
@@ -200,18 +208,24 @@ struct ModelForward::Impl {
     RoutedExperts& experts;
     DeviceMemory memory;
     DeviceMemory batch_memory;
+    DeviceMemory batch_moe_memory;
+    DeviceMemory batch_expert_memory;
     std::array<kernels::tp::cuda::GdnTpMap, 3> maps;
     float *qkv = nullptr, *conv = nullptr, *alpha = nullptr, *beta = nullptr;
     float *dt = nullptr, *a = nullptr, *z = nullptr, *gate = nullptr, *local_y = nullptr;
     float *conv_raw = nullptr, *norm_qkv = nullptr, *readout = nullptr;
     float *wire = nullptr, *global_y = nullptr, *embedding = nullptr, *parts = nullptr;
     float *batch_input = nullptr, *batch_qkv = nullptr, *batch_z = nullptr;
+    int* batch_route_ids = nullptr;
+    float* batch_parts = nullptr;
     float *batch_alpha = nullptr, *batch_beta = nullptr, *batch_projected = nullptr;
     void* batch_q8_1 = nullptr;
     std::array<core::BlockBuffers, 8> batch_blocks{};
+    std::array<core::MoEBuffers, 8> batch_moe{};
     bool batch_projections_active = false;
     int batch_projection_row = 0;
     bool batch_enabled = false;
+    bool batch_experts_enabled = false;
     float* states = nullptr;
     float* qsa_partial = nullptr;
     float* qsa_global = nullptr;
@@ -475,6 +489,10 @@ void ModelForward::parity_observer(ParityObserver observer) { impl_->observer = 
 bool ModelForward::initialize(std::string& err) {
     auto& p = *impl_;
     if (p.failed || p.ready) { err = "TP model is failed or already initialized"; return false; }
+    if (p.batch_experts_enabled && (!p.batch_enabled || !p.experts.supports_batch())) {
+        err = "TP prefill expert batch requires exact-native batch mode and a batch-capable provider";
+        return false;
+    }
     if (p.rank < 0 || p.rank >= 3 || p.geometry.n_layers != 48 || p.geometry.n_embd != 2560 ||
         p.geometry.ssm_k_heads != 16 || p.geometry.ssm_v_heads != 48 || p.geometry.ssm_state_size != 128 ||
         p.geometry.ssm_d_conv != 4 || p.geometry.ssm_conv_channels != 10240 || p.geometry.ssm_value_dim != 6144 ||
@@ -502,14 +520,51 @@ bool ModelForward::initialize(std::string& err) {
         p.embedding = take(2560); p.parts = take(size_t(p.state.k) * 2560);
         if (p.batch_enabled) {
             const auto block_bytes = core::block_buffers_bytes(p.geometry);
+            const auto moe_bytes = core::moe_buffers_bytes(p.geometry, p.state.k);
             const size_t q8_bytes = kernels::native_q8_1_bytes(int(p.geometry.n_embd), 8);
-            const size_t batch_bytes = size_t(8) * block_bytes +
-                size_t(8 * p.geometry.n_embd) * sizeof(float) +
-                size_t(8 * m.channels()) * sizeof(float) +
-                size_t(8 * m.value_heads() * m.state_size) * sizeof(float) +
-                size_t(8 * 3 * m.key_heads()) * sizeof(float) * 2 +
-                size_t(8 * 2304) * sizeof(float) + q8_bytes + 256;
+            size_t batch_bytes = 0;
+            batch_bytes = checked_add(batch_bytes, checked_product(8, block_bytes));
+            batch_bytes = checked_add(batch_bytes, checked_product(checked_product(8, size_t(p.geometry.n_embd)), sizeof(float)));
+            batch_bytes = checked_add(batch_bytes, checked_product(checked_product(8, size_t(m.channels())), sizeof(float)));
+            batch_bytes = checked_add(batch_bytes, checked_product(checked_product(8, size_t(m.value_heads() * m.state_size)), sizeof(float)));
+            batch_bytes = checked_add(batch_bytes, checked_product(
+                checked_product(checked_product(8, size_t(3 * m.key_heads())), sizeof(float)), 2));
+            batch_bytes = checked_add(batch_bytes, checked_product(checked_product(8, size_t(2304)), sizeof(float)));
+            batch_bytes = checked_add(batch_bytes, q8_bytes);
+            batch_bytes = checked_add(batch_bytes, 256);
+            size_t batch_moe_bytes = 0;
+            size_t batch_expert_bytes = 0;
+            if (p.batch_experts_enabled) {
+                batch_moe_bytes = checked_product(8, size_t(moe_bytes));
+                const auto route_count = checked_product(8, size_t(p.state.k));
+                const auto part_count = checked_product(route_count, size_t(p.geometry.n_embd));
+                batch_expert_bytes = checked_add(checked_product(route_count, sizeof(int)), 15);
+                batch_expert_bytes = checked_add(batch_expert_bytes, checked_product(part_count, sizeof(float)));
+            }
+            size_t required_batch_bytes = batch_bytes;
+            required_batch_bytes = checked_add(required_batch_bytes, batch_moe_bytes);
+            required_batch_bytes = checked_add(required_batch_bytes, batch_expert_bytes);
+            size_t free_bytes = 0, total_bytes = 0;
+            checked(cudaMemGetInfo(&free_bytes, &total_bytes));
+            if (required_batch_bytes >= free_bytes)
+                throw std::runtime_error("TP prefill batch scratch exceeds currently free device memory");
             p.batch_memory.allocate(batch_bytes);
+            if (p.batch_experts_enabled)
+                p.batch_moe_memory.allocate(batch_moe_bytes);
+            if (p.batch_experts_enabled) {
+                const auto route_count = size_t(8) * size_t(p.state.k);
+                p.batch_expert_memory.allocate(batch_expert_bytes);
+                p.batch_route_ids = static_cast<int*>(p.batch_expert_memory.data);
+                p.batch_parts = reinterpret_cast<float*>(
+                    (reinterpret_cast<uintptr_t>(p.batch_route_ids + route_count) + 15) & ~uintptr_t(15));
+            }
+            if (p.batch_experts_enabled) {
+                auto* moe_next = static_cast<uint8_t*>(p.batch_moe_memory.data);
+                for (auto& moe : p.batch_moe) {
+                    const auto used = core::moe_buffers_init(p.geometry, p.state.k, moe_next, moe);
+                    moe_next += (used + 15) & ~size_t(15);
+                }
+            }
             uint8_t* batch_next = static_cast<uint8_t*>(p.batch_memory.data);
             for (auto& block : p.batch_blocks) {
                 const auto used = core::block_buffers_init(p.geometry, batch_next, block);
@@ -541,6 +596,16 @@ bool ModelForward::configure_prefill_batch_exactnative(bool enabled, std::string
         return false;
     }
     p.batch_enabled = enabled;
+    return true;
+}
+
+bool ModelForward::configure_prefill_expert_batch(bool enabled, std::string& err) {
+    auto& p = *impl_;
+    if (p.ready || p.failed) {
+        err = "prefill expert batch mode must be configured before model initialization";
+        return false;
+    }
+    p.batch_experts_enabled = enabled;
     return true;
 }
 
@@ -664,6 +729,10 @@ bool ModelForward::tokens(const std::vector<int32_t>& tokens, int64_t pos, int32
         err = "TP exact-native prefill requires enabled model, exact MMVQ, 2..8 rows and valid context";
         return false;
     }
+    if (p.batch_experts_enabled && !p.experts.supports_batch()) {
+        err = "TP prefill expert batch provider is unavailable";
+        return false;
+    }
     for (size_t row = 0; row < tokens.size(); ++row) {
         if (tokens[row] < 0 || tokens[row] >= p.geometry.n_vocab) {
             err = "TP exact-native prefill contains an invalid token";
@@ -689,6 +758,7 @@ bool ModelForward::tokens(const std::vector<int32_t>& tokens, int64_t pos, int32
             const bool qsa = core::is_qsa_layer(p.geometry, layer);
             for (size_t row = 0; row < rows; ++row) {
                 auto& block = p.batch_blocks[row];
+                auto& moe = p.batch_experts_enabled ? p.batch_moe[row] : p.state.moe;
                 const int64_t row_pos = pos + int64_t(row);
                 if (p.observer && !p.observer({"residual_pre", layer, row_pos, block.R,
                                                residual_floats}, stream, err)) {
@@ -707,7 +777,7 @@ bool ModelForward::tokens(const std::vector<int32_t>& tokens, int64_t pos, int32
                 const auto& qs = p.state.qsa_states[layer / p.geometry.qsa_interval];
                 if (!core::block_layer_prefill_stage(
                         p.weights, p.geometry, layer, row_pos, base, p.state.gdn, qs,
-                        p.state.qsa_bufs, p.state.moe, p.state.k, block, stream, err, this,
+                        p.state.qsa_bufs, moe, p.state.k, block, stream, err, this,
                         layer == 1 ? &p.state.ple : nullptr, core::DistributedPrefillStage::attention_read)) {
                     p.failed = true;
                     err = "layer " + std::to_string(layer) + ": " + err;
@@ -730,6 +800,7 @@ bool ModelForward::tokens(const std::vector<int32_t>& tokens, int64_t pos, int32
 
             for (size_t row = 0; row < rows; ++row) {
                 auto& block = p.batch_blocks[row];
+                auto& moe = p.batch_experts_enabled ? p.batch_moe[row] : p.state.moe;
                 const int64_t row_pos = pos + int64_t(row);
                 p.batch_projection_row = int(row);
                 p.batch_projections_active = !qsa;
@@ -742,39 +813,86 @@ bool ModelForward::tokens(const std::vector<int32_t>& tokens, int64_t pos, int32
                 if (!core::block_layer_prefill_stage(
                         p.weights, p.geometry, layer, row_pos, base, p.state.gdn,
                         p.state.qsa_states[layer / p.geometry.qsa_interval], p.state.qsa_bufs,
-                        p.state.moe, p.state.k, block, stream, err, this, nullptr,
+                        moe,
+                        p.state.k, block, stream, err, this, nullptr,
                         core::DistributedPrefillStage::mixer) ||
                     !core::block_layer_prefill_stage(
                         p.weights, p.geometry, layer, row_pos, base, p.state.gdn,
                         p.state.qsa_states[layer / p.geometry.qsa_interval], p.state.qsa_bufs,
-                        p.state.moe, p.state.k, block, stream, err, this, nullptr,
+                        moe, p.state.k, block, stream, err, this, nullptr,
                         core::DistributedPrefillStage::attention_write) ||
                     !core::block_layer_prefill_stage(
                         p.weights, p.geometry, layer, row_pos, base, p.state.gdn,
                         p.state.qsa_states[layer / p.geometry.qsa_interval], p.state.qsa_bufs,
-                        p.state.moe, p.state.k, block, stream, err, this, nullptr,
+                        moe, p.state.k, block, stream, err, this, nullptr,
                         core::DistributedPrefillStage::ffn_read) ||
                     !core::block_layer_prefill_stage(
                         p.weights, p.geometry, layer, row_pos, base, p.state.gdn,
                         p.state.qsa_states[layer / p.geometry.qsa_interval], p.state.qsa_bufs,
-                        p.state.moe, p.state.k, block, stream, err, this, nullptr,
+                        moe, p.state.k, block, stream, err, this, nullptr,
                         core::DistributedPrefillStage::route) ||
                     (p.observer && !p.observer({"expert_input", layer, row_pos, block.mixed,
-                                                size_t(p.geometry.n_embd)}, stream, err)) ||
-                    !p.collectives.agree_routes(layer, p.state.moe.ids, p.state.k, stream, err) ||
-                    !p.experts.forward(layer, block.mixed, p.state.moe.ids, p.state.k, p.parts,
-                                       stream, err) ||
-                    (p.observer && !p.observer({"expert_output", layer, row_pos, p.parts,
-                                                size_t(p.state.k * p.geometry.n_embd)}, stream, err)) ||
-                    !core::block_layer_post(p.weights, p.geometry, layer, p.state.k, p.state.moe,
-                                            block, p.parts, stream, err, this) ||
-                    (p.observer && !p.observer({"residual_post", layer, row_pos, block.R,
-                                                residual_floats}, stream, err))) {
+                                                size_t(p.geometry.n_embd)}, stream, err))) {
+                    p.failed = true;
+                    err = "layer " + std::to_string(layer) + ": " + err;
+                    return false;
+                }
+                if (p.batch_experts_enabled) {
+                    if (!p.collectives.agree_routes(layer, moe.ids, p.state.k, stream, err)) {
+                        p.failed = true;
+                        err = "layer " + std::to_string(layer) + ": " + err;
+                        return false;
+                    }
+                } else if (!p.collectives.agree_routes(layer, p.state.moe.ids, p.state.k, stream, err) ||
+                           !p.experts.forward(layer, block.mixed, p.state.moe.ids, p.state.k, p.parts,
+                                              stream, err) ||
+                           (p.observer && !p.observer({"expert_output", layer, row_pos, p.parts,
+                                                       size_t(p.state.k * p.geometry.n_embd)}, stream, err)) ||
+                           !core::block_layer_post(p.weights, p.geometry, layer, p.state.k, p.state.moe,
+                                                   block, p.parts, stream, err, this) ||
+                           (p.observer && !p.observer({"residual_post", layer, row_pos, block.R,
+                                                       residual_floats}, stream, err))) {
                     p.failed = true;
                     err = "layer " + std::to_string(layer) + ": " + err;
                     return false;
                 }
                 p.batch_projections_active = false;
+            }
+            if (p.batch_experts_enabled) {
+                for (size_t row = 0; row < rows; ++row) {
+                    auto& block = p.batch_blocks[row];
+                    checked(cudaMemcpyAsync(p.batch_input + row * size_t(p.geometry.n_embd),
+                                            block.mixed, size_t(p.geometry.n_embd) * sizeof(float),
+                                            cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream)));
+                }
+                // Routes are stable row-major snapshots; the exact provider scatters outputs back by slot.
+                for (size_t row = 0; row < rows; ++row)
+                    checked(cudaMemcpyAsync(p.batch_route_ids + row * size_t(p.state.k),
+                                            p.batch_moe[row].ids,
+                                            size_t(p.state.k) * sizeof(int), cudaMemcpyDeviceToDevice,
+                                            static_cast<cudaStream_t>(stream)));
+                if (!p.experts.forward_batch(layer, int64_t(rows), p.batch_input, p.batch_route_ids,
+                                             p.state.k, p.batch_parts, stream, err)) {
+                    p.failed = true;
+                    err = "layer " + std::to_string(layer) + ": " + err;
+                    return false;
+                }
+                for (size_t row = 0; row < rows; ++row) {
+                    auto& block = p.batch_blocks[row];
+                    auto& moe = p.batch_moe[row];
+                    const float* row_parts = p.batch_parts + row * size_t(p.state.k * p.geometry.n_embd);
+                    if ((p.observer && !p.observer({"expert_output", layer, pos + int64_t(row), row_parts,
+                                                    size_t(p.state.k * p.geometry.n_embd)}, stream, err)) ||
+                        !core::block_layer_post(p.weights, p.geometry, layer, p.state.k, moe,
+                                                block, row_parts, stream, err, this,
+                                                core::layer_shared_early()) ||
+                        (p.observer && !p.observer({"residual_post", layer, pos + int64_t(row), block.R,
+                                                    residual_floats}, stream, err))) {
+                        p.failed = true;
+                        err = "layer " + std::to_string(layer) + ": " + err;
+                        return false;
+                    }
+                }
             }
         }
 

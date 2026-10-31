@@ -152,6 +152,45 @@ void model_schedule() {
           layer_major[44].descriptor.operation.layer == 1 &&
           layer_major[44].descriptor.operation.sequence == 45,
           "exact-native prefill schedule is layer-major and complete");
+    auto row_batch = command;
+    row_batch.tokens.resize(2);
+    row_batch.positions.resize(2);
+    row_batch.expected_collective_schedule.clear();
+    ExpertOperandSchedule row_operands;
+    row_operands.compact = true;
+    row_operands.valid_counts = {256, 192, 192};
+    row_operands.down_codecs.assign(48, 20);
+    row_operands.down_codecs[1] = 42;
+    std::vector<ScheduledCollective> row_schedule;
+    check(!model_forward_schedule(row_batch, g, 1, row_schedule, true, row_operands, true, true) &&
+          row_schedule.size() == 48 * 6, "routed expert batch schedules two operations after all rows per layer");
+    check(row_schedule[0].route == "gdn_values" && row_schedule[1].route == "mixer" &&
+          row_schedule[2].route == "gdn_values" && row_schedule[3].route == "mixer" &&
+          row_schedule[4].route == "expert_hidden_rows" &&
+          row_schedule[4].descriptor.elements == 5120 &&
+          row_schedule[4].descriptor.valid_counts == std::vector<uint64_t>{5120, 5120, 5120},
+          "routed batch gathers 2*K hidden rows after both mixer rows");
+    check(row_schedule[5].route == "expert_lane_terms_rows" &&
+          row_schedule[5].descriptor.elements == 2 * 10 * 2560 * 32 &&
+          row_schedule[11].route == "expert_lane_terms_rows" &&
+          row_schedule[11].descriptor.elements == 2 * 10 * 2560 * 16 &&
+          row_operands.down_codecs[1] == 42,
+          "routed batch operand widths follow each layer's down codec");
+    auto eight_rows = row_batch;
+    for (int token = 6; token <= 11; ++token) {
+        eight_rows.tokens.push_back(token);
+        eight_rows.positions.push_back(token - 5);
+    }
+    std::vector<ScheduledCollective> eight_schedule;
+    check(!model_forward_schedule(eight_rows, g, 1, eight_schedule, true, row_operands, true, true) &&
+          eight_schedule.size() == 48 * 18 &&
+          eight_schedule[16].route == "expert_hidden_rows" &&
+          eight_schedule[16].descriptor.elements == 8 * 10 * 256,
+          "eight-row routed batch stays within its declared 80-entry cap");
+    check(bool(model_forward_schedule(row_batch, g, 1, row_schedule, false, row_operands, true, true)),
+          "routed batch rejects sequential expert collectives");
+    check(bool(model_forward_schedule(row_batch, g, 1, row_schedule, true, {}, true, true)),
+          "routed batch rejects noncompact exact operand scheduling");
     auto single = command;
     single.tokens.resize(1);
     single.positions.resize(1);

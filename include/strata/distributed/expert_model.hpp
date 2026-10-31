@@ -35,9 +35,14 @@ public:
     ~NativeRoutedExperts();
     NativeRoutedExperts(const NativeRoutedExperts&) = delete;
     NativeRoutedExperts& operator=(const NativeRoutedExperts&) = delete;
+    bool configure_prefill_batch(bool enabled, std::string& err);
     bool initialize(std::string& err);
+    bool supports_batch() const noexcept override;
     bool forward(int64_t layer, const float* input, const int* ids,
                  int64_t k, float* parts, void* stream, std::string& err) override;
+    bool forward_batch(int64_t layer, int64_t rows, const float* inputs,
+                       const int* ids, int64_t k, float* parts, void* stream,
+                       std::string& err) override;
     uint64_t owned_weight_bytes() const;
     std::array<uint64_t, 3> valid_counts() const;
     std::vector<int> down_codecs() const;

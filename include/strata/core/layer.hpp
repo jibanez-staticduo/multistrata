@@ -699,8 +699,9 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
                       const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,
                       std::string& err
 #ifdef STRATA_BUILD_DISTRIBUTED
-                      , DistributedLayerHooks* distributed = nullptr
+                      , DistributedLayerHooks* distributed = nullptr,
 #endif
+                      bool shared_ready = false
                       );
 
 }  // namespace strata::core

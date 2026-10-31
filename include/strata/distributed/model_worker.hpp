@@ -26,7 +26,8 @@ Failure canonical_step_command(const StepCommand&, std::string& out);
 Failure model_forward_schedule(const StepCommand&, const core::ModelGeometry&, uint64_t first_sequence,
                                std::vector<ScheduledCollective>& out, bool batched_expert_collectives = false,
                                const ExpertOperandSchedule& expert_operands = {},
-                               bool layer_major_prefill_batch = false);
+                               bool layer_major_prefill_batch = false,
+                               bool prefill_expert_batch = false);
 
 struct ModelWorkerConfig {
     WorkerConfig worker;
@@ -39,6 +40,7 @@ struct ModelWorkerConfig {
     bool preagreed_collectives = false;
     ExpertOperandSchedule expert_operands;
     bool prefill_batch_exactnative = false;
+    bool prefill_expert_batch = false;
 };
 
 // CUDA single-slot uncaptured bridge. Every slot owns a model; serialized slots may share collectives.

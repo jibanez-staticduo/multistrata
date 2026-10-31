@@ -111,6 +111,12 @@ struct NativeRoutedExperts::Impl {
     std::vector<Layer> layers;
     Buffer input_q, gate, up, local_hidden, wire, hidden, hidden_q, partial;
     Buffer lane_terms, lane_wire;
+    Buffer batch_input_q, batch_packed_input_q, batch_gate, batch_up;
+    Buffer batch_gu_hidden, batch_hidden;
+    Buffer batch_packed_hidden_q;
+    Buffer batch_hidden_local, batch_hidden_wire, batch_lane_group, batch_lane_local;
+    Buffer batch_lane_wire, batch_parts;
+    std::vector<int> batch_expert_starts;
     std::unique_ptr<FinishGraphs> finish_graphs;
     ExpertDownPolicy down_policy;
     ExpertCollectivePolicy collective_policy;
@@ -122,6 +128,7 @@ struct NativeRoutedExperts::Impl {
     uint32_t readback_timeout_ms;
     bool readback_failed = false;
     bool initialized = false;
+    bool batch_enabled = false;
 
     Impl(std::string pack_dir, std::string gguf, const core::ModelGeometry& g, int r,
          LayerCollectives& c, std::array<uint64_t, 3> counts, uint32_t timeout_ms, ExpertDownPolicy policy,
@@ -198,9 +205,33 @@ struct NativeRoutedExperts::Impl {
                     "TP expert model: owned weight size overflow");
             planned += (2 * gu + down) * geometry.n_expert;
         }
+        uint64_t planned_batch_scratch = 0;
+        if (batch_enabled && collective_policy == ExpertCollectivePolicy::Batched &&
+            compact_operands && down_policy == ExpertDownPolicy::ExactLaneReference) {
+            const uint64_t entries = 8 * uint64_t(geometry.n_expert_used);
+            const uint64_t hidden_slots = uint64_t(*std::max_element(valid.begin(), valid.end()));
+            auto add_product = [&](uint64_t a, uint64_t b) {
+                require(!b || a <= (UINT64_MAX - planned_batch_scratch) / b,
+                        "TP expert model: routed batch scratch size overflow");
+                planned_batch_scratch += a * b;
+            };
+            add_product(8, tp::global_q81_bytes(1, int(geometry.n_embd)));
+            add_product(entries, tp::global_q81_bytes(1, int(geometry.n_embd)));
+            add_product(entries, tp::global_q81_bytes(1, int(geometry.n_ff)));
+            add_product(3 * entries * valid[rank], sizeof(float)); // gate, up and local hidden
+            add_product(entries * uint64_t(geometry.n_ff), sizeof(float));
+            add_product(entries * hidden_slots, sizeof(float));
+            add_product(3 * entries * hidden_slots, sizeof(float));
+            add_product(2 * entries * uint64_t(geometry.n_embd) * 32, sizeof(float));
+            add_product(3 * entries * uint64_t(geometry.n_embd) * 32, sizeof(float));
+            add_product(entries * uint64_t(geometry.n_embd), sizeof(float));
+            require(planned <= UINT64_MAX - planned_batch_scratch,
+                    "TP expert model: routed batch total size overflow");
+            planned += planned_batch_scratch;
+        }
         std::size_t free_bytes = 0, total_bytes = 0;
         check(cudaMemGetInfo(&free_bytes, &total_bytes));
-        require(planned < free_bytes, "TP expert model: owned weights exceed currently free device memory");
+        require(planned < free_bytes, "TP expert model: owned weights and routed batch scratch exceed currently free device memory");
         std::map<std::string, std::unique_ptr<GgufFile>> files;
         auto source = [&](int64_t layer, int role, int type, int64_t width, int64_t rows,
                           std::size_t expert_bytes) -> const uint8_t* {
@@ -288,7 +319,27 @@ struct NativeRoutedExperts::Impl {
             lane_terms = Buffer(scratch_experts * geometry.n_embd * lane_width * sizeof(float));
             lane_wire = Buffer(3 * lane_terms.bytes);
         }
-        readback.initialize(std::size_t(geometry.n_expert_used));
+        if (batch_enabled && collective_policy == ExpertCollectivePolicy::Batched && compact_operands &&
+            down_policy == ExpertDownPolicy::ExactLaneReference) {
+            const auto entries = std::size_t(8 * geometry.n_expert_used);
+            const auto q_input_bytes = tp::global_q81_bytes(8, int(geometry.n_embd));
+            batch_input_q = Buffer(q_input_bytes);
+            batch_packed_input_q = Buffer(tp::global_q81_bytes(int(entries), int(geometry.n_embd)));
+            batch_packed_hidden_q = Buffer(tp::global_q81_bytes(int(entries), int(geometry.n_ff)));
+            batch_gate = Buffer(entries * valid[rank] * sizeof(float));
+            batch_up = Buffer(batch_gate.bytes);
+            batch_gu_hidden = Buffer(batch_gate.bytes);
+            batch_hidden = Buffer(entries * std::size_t(geometry.n_ff) * sizeof(float));
+            batch_hidden_local = Buffer(entries * std::size_t(slots) * sizeof(float));
+            batch_hidden_wire = Buffer(3 * entries * std::size_t(slots) * sizeof(float));
+            const auto max_lane_width = std::size_t(32);
+            batch_lane_group = Buffer(entries * std::size_t(geometry.n_embd) * max_lane_width * sizeof(float));
+            batch_lane_local = Buffer(entries * std::size_t(geometry.n_embd) * max_lane_width * sizeof(float));
+            batch_lane_wire = Buffer(3 * batch_lane_local.bytes);
+            batch_parts = Buffer(entries * std::size_t(geometry.n_embd) * sizeof(float));
+            batch_expert_starts.resize(std::size_t(geometry.n_expert + 1));
+        }
+        readback.initialize(std::size_t(batch_enabled ? 8 : 1) * std::size_t(geometry.n_expert_used));
         input_contract.consumer = "expert_gate_up"; input_contract.gather = "none";
         input_contract.quantizer = "Q8_1"; input_contract.block_size = 32;
         input_contract.reference = "global_reference"; input_contract.backend_policy = "cuda_native_expert_grouped";
@@ -449,6 +500,137 @@ struct NativeRoutedExperts::Impl {
         return true;
     }
 
+    bool forward_batch(int64_t index, int64_t rows, const float* inputs, const int* ids, int64_t k,
+                       float* parts, void* stream, std::string& err) {
+        require(initialized && !readback_failed && !graph_failed &&
+                collective_policy == ExpertCollectivePolicy::Batched &&
+                down_policy == ExpertDownPolicy::ExactLaneReference && compact_operands &&
+                index >= 0 && index < int64_t(layers.size()) && rows >= 2 && rows <= 8 &&
+                k == geometry.n_expert_used && inputs && ids && parts && stream,
+                "TP expert model: invalid or unsupported routed batch arguments");
+        const int64_t entries = rows * k;
+        require(batch_enabled && entries <= 80 && readback.ids,
+                "TP expert model: routed batch exceeds eight rows or was not enabled");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(readback_timeout_ms);
+        readback_failed = true;
+        check(cudaMemcpyAsync(readback.ids, ids, std::size_t(entries) * sizeof(int), cudaMemcpyDeviceToHost,
+                              static_cast<cudaStream_t>(stream)));
+        check(cudaEventRecord(readback.complete, static_cast<cudaStream_t>(stream)));
+        for (;;) {
+            require(std::chrono::steady_clock::now() < deadline,
+                    "TP expert model: routed batch readback deadline expired");
+            const auto status = cudaEventQuery(readback.complete);
+            if (status == cudaSuccess) break;
+            if (status != cudaErrorNotReady) check(status);
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        readback_failed = false;
+        for (int64_t entry = 0; entry < entries; ++entry)
+            require(readback.ids[entry] >= 0 && readback.ids[entry] < geometry.n_expert,
+                    "TP expert model: routed batch id outside original experts");
+
+        auto& layer = layers[std::size_t(index)];
+        const int max_lane_width = tp::compact_down_payload_width(layer.layout.d_type, int(geometry.n_ff), valid);
+        require(std::size_t(entries) * std::size_t(geometry.n_embd) *
+                    std::size_t(max_lane_width) * sizeof(float) <= std::size_t(80) *
+                    std::size_t(geometry.n_embd) * std::size_t(32) * sizeof(float),
+                "TP expert model: routed batch operand buffer limit exceeded");
+        (void)tp::quantize_global(input_contract, inputs, int(rows), int(geometry.n_embd),
+                                  batch_input_q.data, batch_input_q.bytes, stream);
+        const auto slots = std::size_t(*std::max_element(valid.begin(), valid.end()));
+        std::array<int, 8 * 15> grouped_entries{};
+        auto& expert_starts = batch_expert_starts;
+        int grouped_count = 0;
+        for (int expert = 0; expert < geometry.n_expert; ++expert) {
+            expert_starts[size_t(expert)] = grouped_count;
+            for (int64_t entry = 0; entry < entries; ++entry)
+                if (readback.ids[entry] == expert) grouped_entries[size_t(grouped_count++)] = int(entry);
+        }
+        expert_starts[size_t(geometry.n_expert)] = grouped_count;
+        check(cudaMemsetAsync(batch_hidden_local.data, 0, batch_hidden_local.bytes,
+                              static_cast<cudaStream_t>(stream)));
+        const auto q_input_row_bytes = tp::global_q81_bytes(1, int(geometry.n_embd));
+        const auto q_hidden_row_bytes = tp::global_q81_bytes(1, int(geometry.n_ff));
+        for (int expert = 0; expert < geometry.n_expert; ++expert) {
+            const int start = expert_starts[size_t(expert)];
+            const int count = expert_starts[size_t(expert + 1)] - start;
+            if (count == 0) continue;
+            for (int row = 0; row < count; ++row) {
+                const auto entry = std::size_t(grouped_entries[size_t(start + row)]);
+                const auto token = entry / std::size_t(k);
+                check(cudaMemcpyAsync(static_cast<uint8_t*>(batch_packed_input_q.data) +
+                                          std::size_t(start + row) * q_input_row_bytes,
+                                      static_cast<const uint8_t*>(batch_input_q.data) + token * q_input_row_bytes,
+                                      q_input_row_bytes, cudaMemcpyDeviceToDevice,
+                                      static_cast<cudaStream_t>(stream)));
+            }
+            const auto* qrows = static_cast<const uint8_t*>(batch_packed_input_q.data) +
+                                std::size_t(start) * q_input_row_bytes;
+            tp::GlobalQ81 q{qrows, int(geometry.n_embd), count, q_input_row_bytes,
+                            std::size_t(count) * q_input_row_bytes};
+            layer.gate_view.data = layer.gate.byte() + std::size_t(expert) * layer.gu_bytes;
+            layer.up_view.data = layer.up.byte() + std::size_t(expert) * layer.gu_bytes;
+            auto* gate_rows = batch_gate.floats();
+            auto* up_rows = batch_up.floats();
+            auto* hidden_rows = batch_gu_hidden.floats();
+            tp::gate_up(layer.gate_view, layer.up_view, input_contract, q,
+                        gate_rows, up_rows, hidden_rows, stream);
+            for (int row = 0; row < count; ++row)
+                check(cudaMemcpyAsync(batch_hidden_local.floats() + std::size_t(start + row) * slots,
+                                      hidden_rows + std::size_t(row) * valid[rank],
+                                      std::size_t(valid[rank]) * sizeof(float), cudaMemcpyDeviceToDevice,
+                                      static_cast<cudaStream_t>(stream)));
+        }
+        const auto hidden_count = uint64_t(entries) * uint64_t(slots);
+        if (!collective.gather(index, "expert_hidden_rows", batch_hidden_local.floats(),
+                               batch_hidden_wire.floats(), {hidden_count, hidden_count, hidden_count},
+                               stream, err)) return false;
+        tp::unpack_expert_batch(hidden_contract, batch_hidden_wire.floats(), int(entries),
+                                batch_hidden.floats(), stream);
+        for (int packed = 0; packed < grouped_count; ++packed)
+            tp::quantize_global(hidden_contract, batch_hidden.floats() + std::size_t(packed) * geometry.n_ff,
+                                1, int(geometry.n_ff),
+                                static_cast<uint8_t*>(batch_packed_hidden_q.data) + std::size_t(packed) * q_hidden_row_bytes,
+                                q_hidden_row_bytes, stream);
+
+        const auto lane_width = std::size_t(max_lane_width);
+        const auto lane_count = std::size_t(geometry.n_embd) * lane_width;
+        check(cudaMemsetAsync(batch_lane_local.data, 0, batch_lane_local.bytes,
+                              static_cast<cudaStream_t>(stream)));
+        for (int expert = 0; expert < geometry.n_expert; ++expert) {
+            const int start = expert_starts[size_t(expert)];
+            const int count = expert_starts[size_t(expert + 1)] - start;
+            if (count == 0) continue;
+            const auto* qrows = static_cast<const uint8_t*>(batch_packed_hidden_q.data) +
+                                std::size_t(start) * q_hidden_row_bytes;
+            tp::GlobalQ81 hq{qrows, int(geometry.n_ff), count, q_hidden_row_bytes,
+                             std::size_t(count) * q_hidden_row_bytes};
+            layer.down_view.data = layer.down.byte() + std::size_t(expert) * layer.down_bytes;
+            tp::down_lanes_compact(layer.down_view, hidden_contract, hq,
+                                   batch_lane_group.floats(),
+                                   max_lane_width, stream);
+            for (int row = 0; row < count; ++row) {
+                const auto entry = std::size_t(grouped_entries[size_t(start + row)]);
+                check(cudaMemcpyAsync(batch_lane_local.floats() + entry * lane_count,
+                                      batch_lane_group.floats() + std::size_t(row) * lane_count,
+                                      lane_count * sizeof(float), cudaMemcpyDeviceToDevice,
+                                      static_cast<cudaStream_t>(stream)));
+            }
+        }
+        const auto lane_wire_count = uint64_t(entries) * uint64_t(geometry.n_embd) * lane_width;
+        if (!collective.gather(index, "expert_lane_terms_rows", batch_lane_local.floats(),
+                               batch_lane_wire.floats(),
+                               {lane_wire_count, lane_wire_count, lane_wire_count}, stream, err)) return false;
+        tp::finish_down_lanes_compact(batch_lane_wire.floats(), layer.layout.d_type, int(geometry.n_ff),
+                                      int(geometry.n_embd), int(entries), valid, max_lane_width,
+                                      batch_parts.floats(), stream);
+        for (int64_t entry = 0; entry < entries; ++entry)
+            check(cudaMemcpyAsync(parts + entry * geometry.n_embd, batch_parts.floats() + entry * geometry.n_embd,
+                                  std::size_t(geometry.n_embd) * sizeof(float), cudaMemcpyDeviceToDevice,
+                                  static_cast<cudaStream_t>(stream)));
+        return true;
+    }
+
     void poison_graphs() noexcept {
         if (!graph_finish) return;
         graph_failed = true;
@@ -469,14 +651,34 @@ NativeRoutedExperts::~NativeRoutedExperts() {
     // that the GPU may still use. The worker owner must _Exit in this state.
     if (requires_process_exit()) (void)impl_.release();
 }
+bool NativeRoutedExperts::configure_prefill_batch(bool enabled, std::string& err) {
+    if (impl_->initialized || impl_->readback.ids) {
+        err = "TP prefill expert batch must be configured before expert initialization";
+        return false;
+    }
+    impl_->batch_enabled = enabled;
+    return true;
+}
 bool NativeRoutedExperts::initialize(std::string& err) {
     try { impl_->initialize(); return true; }
     catch (const std::exception& e) { impl_->poison_graphs(); err = e.what(); return false; }
+}
+bool NativeRoutedExperts::supports_batch() const noexcept {
+    return impl_->batch_enabled && impl_->collective_policy == ExpertCollectivePolicy::Batched &&
+           impl_->down_policy == ExpertDownPolicy::ExactLaneReference && impl_->compact_operands;
 }
 bool NativeRoutedExperts::forward(int64_t layer, const float* input, const int* ids, int64_t k,
                                   float* parts, void* stream, std::string& err) {
     try {
         const bool success = impl_->forward(layer, input, ids, k, parts, stream, err);
+        if (!success) impl_->poison_graphs();
+        return success;
+    } catch (const std::exception& e) { impl_->poison_graphs(); err = e.what(); return false; }
+}
+bool NativeRoutedExperts::forward_batch(int64_t layer, int64_t rows, const float* inputs, const int* ids,
+                                        int64_t k, float* parts, void* stream, std::string& err) {
+    try {
+        const bool success = impl_->forward_batch(layer, rows, inputs, ids, k, parts, stream, err);
         if (!success) impl_->poison_graphs();
         return success;
     } catch (const std::exception& e) { impl_->poison_graphs(); err = e.what(); return false; }

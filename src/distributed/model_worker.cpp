@@ -57,7 +57,8 @@ Failure canonical_step_command(const StepCommand& command, std::string& out) {
 Failure model_forward_schedule(const StepCommand& command, const core::ModelGeometry& g, uint64_t sequence,
                                std::vector<ScheduledCollective>& out, bool batched_expert_collectives,
                                const ExpertOperandSchedule& expert_operands,
-                               bool layer_major_prefill_batch) {
+                               bool layer_major_prefill_batch,
+                               bool prefill_expert_batch) {
     out.clear();
     if (static_cast<uint32_t>(command.phase) > static_cast<uint32_t>(StepPhase::rollback))
         return bad("unknown model step phase");
@@ -77,8 +78,15 @@ Failure model_forward_schedule(const StepCommand& command, const core::ModelGeom
             }
         }
     }
-    const uint64_t count = uint64_t(command.tokens.size()) * uint64_t(g.n_layers) *
-                           uint64_t(batched_expert_collectives ? 4 : 2 + 2 * g.n_expert_used);
+    const bool expert_rows = prefill_expert_batch && command.phase == StepPhase::prefill &&
+                             command.tokens.size() > 1;
+    if (expert_rows && (!layer_major_prefill_batch || !batched_expert_collectives || !expert_operands.compact))
+        return bad("batched routed prefill requires layer-major mode, batched collectives and compact exact operands");
+    const uint64_t row_count = uint64_t(command.tokens.size());
+    const uint64_t count = expert_rows ?
+        uint64_t(g.n_layers) * (2 * row_count + 2) :
+        row_count * uint64_t(g.n_layers) *
+        uint64_t(batched_expert_collectives ? 4 : 2 + 2 * g.n_expert_used);
     if (sequence == 0 || count > std::numeric_limits<uint64_t>::max() - sequence) return bad("model schedule sequence exhausted");
     auto append = [&](int64_t layer, std::string stage, std::vector<uint64_t> valid) {
         CollectiveDescriptor d;
@@ -92,12 +100,27 @@ Failure model_forward_schedule(const StepCommand& command, const core::ModelGeom
         out.push_back({std::move(d), std::move(stage)});
     };
     Failure append_failure;
-    auto append_layer = [&](int64_t layer) {
+    auto append_layer = [&](int64_t layer, bool batch_experts, bool append_mixer = true) {
         const bool qsa = core::is_qsa_layer(g, layer);
-        append(layer, qsa ? "qsa_gated_reference" : "gdn_values",
-               qsa ? std::vector<uint64_t>{2048, 2048, 2048} : std::vector<uint64_t>{2304, 1920, 1920});
-        append(layer, qsa ? "qsa_output_rank_zero_reference" : "mixer", {});
-        if (batched_expert_collectives) {
+        if (append_mixer) {
+            append(layer, qsa ? "qsa_gated_reference" : "gdn_values",
+                   qsa ? std::vector<uint64_t>{2048, 2048, 2048} : std::vector<uint64_t>{2304, 1920, 1920});
+            append(layer, qsa ? "qsa_output_rank_zero_reference" : "mixer", {});
+        }
+        if (batch_experts) {
+            const uint64_t entries = row_count * uint64_t(g.n_expert_used);
+            const uint64_t hidden = entries * 256;
+            uint64_t lane_width = 128;
+            if (expert_operands.compact) {
+                try {
+                    lane_width = uint64_t(compact_down_payload_width(
+                        expert_operands.down_codecs[size_t(layer)], int(g.n_ff), expert_operands.valid_counts));
+                } catch (...) { append_failure = bad("invalid compact expert schedule"); return; }
+            }
+            const uint64_t lanes = entries * uint64_t(g.n_embd) * lane_width;
+            append(layer, "expert_hidden_rows", {hidden, hidden, hidden});
+            append(layer, "expert_lane_terms_rows", {lanes, lanes, lanes});
+        } else if (batched_expert_collectives) {
             // Transport includes each row's padding; logical valid counts remain 256/192/192.
             const uint64_t hidden = uint64_t(g.n_expert_used) * 256;
             uint64_t lane_width = 128;
@@ -130,13 +153,25 @@ Failure model_forward_schedule(const StepCommand& command, const core::ModelGeom
                              command.tokens.size() > 1;
     if (layer_major) {
         for (int64_t layer = 0; layer < g.n_layers; ++layer) {
-            for (size_t token = 0; token < command.tokens.size(); ++token)
-                { (void)token; append_layer(layer); if (append_failure) return append_failure; }
+            if (expert_rows) {
+                for (size_t token = 0; token < command.tokens.size(); ++token) {
+                    append(layer, core::is_qsa_layer(g, layer) ? "qsa_gated_reference" : "gdn_values",
+                           core::is_qsa_layer(g, layer) ? std::vector<uint64_t>{2048, 2048, 2048} :
+                                                          std::vector<uint64_t>{2304, 1920, 1920});
+                    append(layer, core::is_qsa_layer(g, layer) ? "qsa_output_rank_zero_reference" : "mixer", {});
+                    (void)token;
+                }
+                append_layer(layer, true, false);
+                if (append_failure) return append_failure;
+            } else {
+                for (size_t token = 0; token < command.tokens.size(); ++token)
+                    { (void)token; append_layer(layer, false); if (append_failure) return append_failure; }
+            }
         }
     } else {
         for (size_t token = 0; token < command.tokens.size(); ++token) {
             for (int64_t layer = 0; layer < g.n_layers; ++layer)
-                { (void)token; append_layer(layer); if (append_failure) return append_failure; }
+                { (void)token; append_layer(layer, false); if (append_failure) return append_failure; }
         }
     }
     return {};
@@ -271,7 +306,7 @@ Failure ModelWorkerBackend::plan(const StepCommand& command, std::vector<Schedul
     }
     return model_forward_schedule(command, p.model.geometry(), p.collectives.sequence(), out,
                                   p.config.batched_expert_collectives, p.config.expert_operands,
-                                  p.config.prefill_batch_exactnative);
+                                  p.config.prefill_batch_exactnative, p.config.prefill_expert_batch);
 }
 
 Failure ModelWorkerBackend::agree(const StepCommand& command) {
@@ -313,6 +348,7 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
         if (auto f = cuda_failure(cudaHostAlloc(reinterpret_cast<void**>(&p.host_logits), count, cudaHostAllocDefault))) return f;
         if (auto f = cuda_failure(cudaEventCreateWithFlags(&p.completion, cudaEventDisableTiming))) return f;
         if (!p.model.configure_prefill_batch_exactnative(p.config.prefill_batch_exactnative, err) ||
+            !p.model.configure_prefill_expert_batch(p.config.prefill_expert_batch, err) ||
             !p.model.initialize(err) || !p.model.reset(p.config.stream, err)) return bad(err);
         p.initialized = true;
     } else if (command.phase == StepPhase::prefill || command.phase == StepPhase::decode) {

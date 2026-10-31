@@ -83,8 +83,19 @@ private:
 class RoutedExperts {
 public:
     virtual ~RoutedExperts() = default;
+    virtual bool supports_batch() const noexcept { return false; }
     virtual bool forward(int64_t layer, const float* input, const int* ids,
                          int64_t k, float* parts, void* stream, std::string& err) = 0;
+    // Explicit multi-row routed expert operation. Implementations must preserve
+    // row/slot order and reject unsupported providers instead of looping rows.
+    virtual bool forward_batch(int64_t layer, int64_t rows, const float* inputs,
+                               const int* ids, int64_t k, float* parts, void* stream,
+                               std::string& err) {
+        (void)layer; (void)rows; (void)inputs; (void)ids; (void)k;
+        (void)parts; (void)stream;
+        err = "routed expert provider does not support multi-row prefill";
+        return false;
+    }
 };
 
 // Borrowed immutable weights and per-request core state; local GDN recurrence
@@ -99,6 +110,7 @@ public:
     ModelForward& operator=(const ModelForward&) = delete;
     bool initialize(std::string& err);
     bool configure_prefill_batch_exactnative(bool enabled, std::string& err);
+    bool configure_prefill_expert_batch(bool enabled, std::string& err);
     void native_head(const core::NativeHead* head);
     // Optional uncaptured diagnostics; an empty observer performs no copies.
     void parity_observer(ParityObserver observer);

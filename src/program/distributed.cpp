@@ -410,7 +410,7 @@ int main(int argc, char** argv) {
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
             "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel", "profile-dir",
             "collective-agreement", "service-state-dir", "timing-file", "expert-operands", "request-timing",
-            "prefill-batch-size"};
+            "prefill-batch-size", "prefill-expert-batch"};
 #if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
         allowed.insert("gather-transport");
         allowed.insert("roce-hca-list");
@@ -491,6 +491,11 @@ int main(int argc, char** argv) {
                     (!args.contains("timing-file") && args.contains("logits-positions")),
                 "batched prefill qualification requires explicit --logits-positions and no per-token timing");
         if (prefill_batch_size > 1) kernels::native_mmvq_set_multi_exact(true);
+        const auto prefill_expert_value = args.contains("prefill-expert-batch") ? args.at("prefill-expert-batch") : "0";
+        require(prefill_expert_value == "0" || prefill_expert_value == "1", "invalid prefill expert batch policy");
+        const bool prefill_expert_batch = prefill_expert_value == "1";
+        require(!prefill_expert_batch || (prefill_batch_size > 1 && batched_experts && compact_expert_operands),
+                "--prefill-expert-batch 1 requires multi-token prefill, batched collectives and compact operands");
         const auto request_timing_value = args.contains("request-timing") ? args.at("request-timing") : "0";
         require((request_timing_value == "0" || request_timing_value == "1") &&
                     (request_timing_value == "0" || autoregressive || multislot),
@@ -638,6 +643,7 @@ int main(int argc, char** argv) {
         if (compact_expert_operands) join.config_fingerprint += ":expert-operands-v1:compact";
         if (prefill_batch_size > 1)
             join.config_fingerprint += ":prefill-batch-exactnative-v1:rows=" + std::to_string(prefill_batch_size);
+        if (prefill_expert_batch) join.config_fingerprint += ":prefill-expert-rows-v1";
         join.backend_identity = hybrid_roce ? std::string(kHybridBackendIdentity) : "nccl";
         if (hybrid_roce) join.config_fingerprint += ":gather-transport=hybrid-roce-v1";
         join.nccl_version_expected = version; join.library_provenance = provenance;
@@ -732,6 +738,7 @@ int main(int argc, char** argv) {
                                          graph_finish, compact_expert_operands);
             PendingDmaExitGuard expert_lifetime(experts);
             std::cerr << "LOAD rank=" << rank << " stage=expert-shards" << std::endl;
+            require(experts.configure_prefill_batch(prefill_expert_batch, err), err);
             require(experts.initialize(err), err);
             if (graph_finish) {
                 const auto stats = experts.finish_graph_stats();
@@ -851,6 +858,7 @@ int main(int argc, char** argv) {
             model_worker_config.checkpoint_max_context = uint64_t(state.max_cells);
             model_worker_config.preagreed_collectives = preagreed_collectives;
             model_worker_config.prefill_batch_exactnative = prefill_batch_size > 1;
+            model_worker_config.prefill_expert_batch = prefill_expert_batch;
             ModelWorkerBackend execution(model_worker_config, model, collectives, session, transport);
             Worker worker(worker_config, execution);
             PendingDmaExitGuard checkpoint_lifetime(model);

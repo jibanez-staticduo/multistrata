@@ -93,7 +93,7 @@ void unpack_expert_batch(const distributed::ActivationContract& c, const float* 
                          float* logical, void* stream) {
     detail::contract(c);
     detail::require(c.gather == "all_gather_padded" && c.wire_slots > 0 && !c.valid_counts.empty() &&
-                    experts > 0 && experts <= 15 && wire && logical && wire != logical && stream,
+                    experts > 0 && experts <= 80 && wire && logical && wire != logical && stream,
                     "TP CUDA: invalid expert batch gather");
     int64_t width = 0;
     for (auto n : c.valid_counts) {
