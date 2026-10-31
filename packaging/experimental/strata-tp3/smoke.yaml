@@ -1,0 +1,42 @@
+recipe_version: 2
+model: strata-transport-smoke
+runtime: strata-native
+container: ghcr.io/ursuciprian/spark-vllm-b12x@sha256:1346035488a5c8a0f405ade8e74febf68c66b8df1e026b7e3a6fb83cb9f4ce13
+min_nodes: 3
+max_nodes: 3
+metadata:
+  description: Experimental native Strata transport correctness smoke; no inference server.
+defaults:
+  tensor_parallel: 3
+  pipeline_parallel: 1
+  data_parallel: 1
+  expert_parallel: 1
+  mode: smoke
+  init_port: 30123
+  port: 30124
+  smoke_runner: /experiment/run_transport_smoke.py
+  config_dir: /experiment/smoke-config
+  evidence_dir: /experiment/smoke-evidence
+distribution_config:
+  models:
+    enabled: false
+    entries: []
+  containers:
+    enabled: false
+    entries: []
+readiness:
+  inference: false
+executor_config:
+  entrypoint: ''
+  network: host
+  user: '1000:1000'
+  gpu_access_mode: gpus
+  cap_add:
+    - IPC_LOCK
+  ulimit:
+    - memlock=-1:-1
+  devices:
+    - /dev/infiniband
+  volumes:
+    - /home/staticduo/tmp/strata-tp3-20261031:/experiment
+    - /home/staticduo/recipes/patches/staticduo14-tp3-nccl/libnccl.so.2:/experiment-nccl/libnccl.so.2:ro

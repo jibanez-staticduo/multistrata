@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+experiment_dir=${STRATA_EXPERIMENT_DIR:-/home/staticduo/tmp/strata-tp3-20261031}
+export SPARKRUN_CONFIG_DIR="$experiment_dir/sparkrun-config"
+export SPARKRUN_NO_TELEMETRY=1
+export SPARKRUN_NO_DEFAULT_PLUGINS=1
+exec "$experiment_dir/sparkrun-venv/bin/python" -m sparkrun "$@"

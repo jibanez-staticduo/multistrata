@@ -2797,6 +2797,25 @@ if(STRATA_BUILD_DISTRIBUTED)
   target_link_libraries(strata-tp3-nccl-probe PRIVATE ${CMAKE_DL_LIBS})
   add_test(NAME distributed_nccl_probe COMMAND strata-tp3-nccl-probe)
   set_tests_properties(distributed_nccl_probe PROPERTIES LABELS "distributed;cuda")
+
+  # Standalone three-host probe uses the same session and guarded transport as the model path.
+  add_executable(strata-tp3-transport-smoke tests/distributed/nccl_transport_smoke.cu
+                 src/distributed/session.cpp src/distributed/control_tcp.cpp)
+  target_compile_definitions(strata-tp3-transport-smoke PRIVATE STRATA_DISTRIBUTED_CUDA)
+  target_include_directories(strata-tp3-transport-smoke PRIVATE include src ${STRATA_NCCL_INCLUDE_DIR}
+                            ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  find_package(Threads REQUIRED)
+  target_link_libraries(strata-tp3-transport-smoke PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+
+  # Preserve the original native CUDA arithmetic; these files do not inherit fast-math source flags.
+  add_library(strata_tp_cuda STATIC src/kernels/cuda/tp/linear.cu src/kernels/cuda/tp/moe.cu)
+  target_include_directories(strata_tp_cuda PUBLIC include PRIVATE third_party/ggml)
+  target_link_libraries(strata_tp_cuda PUBLIC strata_kernels CUDA::cudart)
+  add_executable(tp_expert_parity tests/distributed/tp_expert_parity.cu)
+  target_include_directories(tp_expert_parity PRIVATE include third_party/ggml)
+  target_link_libraries(tp_expert_parity PRIVATE strata_tp_cuda)
+  add_test(NAME distributed_tp_expert_parity COMMAND tp_expert_parity --measure-only)
+  set_tests_properties(distributed_tp_expert_parity PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
 endif()
 
 if(STRATA_BUILD_DISTRIBUTED_TESTS)
