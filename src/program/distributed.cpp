@@ -6,6 +6,7 @@
 #include "strata/distributed/expert_model.hpp"
 #include "strata/distributed/model_worker.hpp"
 #include "strata/distributed/autoregressive.hpp"
+#include "strata/distributed/mtp_service.hpp"
 #include "strata/distributed/parity_trace_writer.hpp"
 #include "strata/distributed/process_exit_guard.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -286,7 +287,7 @@ int main(int argc, char** argv) {
             "library-path", "nccl-version", "library-provenance", "model-hash", "config-fingerprint",
             "pack", "native", "ple", "context", "logits-dir", "timeout-ms",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
-            "expert-collectives"};
+            "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) || args.contains(key.substr(2)))
@@ -324,11 +325,40 @@ int main(int argc, char** argv) {
         const auto expert_collectives = args.contains("expert-collectives") ? args.at("expert-collectives") : "sequential";
         require(expert_collectives == "sequential" || expert_collectives == "batched", "invalid expert collective policy");
         const bool batched_experts = expert_collectives == "batched";
+        const auto graph_finish_value = number("graph-finish", 0);
+        require(graph_finish_value <= 1 && (!graph_finish_value || batched_experts),
+                "--graph-finish must be 0 or 1 and requires batched expert collectives");
+        const bool graph_finish = graph_finish_value != 0;
         const auto mode = args.contains("mode") ? args.at("mode") : "teacher-forced";
         require(mode == "teacher-forced" || mode == "autoregressive", "invalid distributed mode");
         const bool autoregressive = mode == "autoregressive";
+        const bool mtp_enabled = args.contains("mtp-path");
+        const auto mtp_drafts = number("mtp-drafts", 4);
+        require((mtp_enabled || (!args.contains("mtp-drafts") && !args.contains("mtp-hash"))) &&
+                (!mtp_enabled || (autoregressive && mtp_drafts >= 1 && mtp_drafts <= 4 &&
+                                  std::filesystem::path(get("mtp-path")).is_absolute())),
+                "MTP requires autoregressive mode, an absolute --mtp-path and --mtp-drafts in [1,4]");
+        if (mtp_enabled) {
+            const auto expected = get("mtp-hash");
+            require(expected.size() == 64 && expected.find_first_not_of("0123456789abcdef") == std::string::npos,
+                    "--mtp-hash must be the approved lowercase SHA256 of the runtime file-hash manifest");
+            if (rank == 0) {
+                require(!std::filesystem::exists(std::filesystem::path(get("mtp-path")) / "draft_vocab.bin"),
+                        "distributed MTP requires the full vocabulary; remove the unapproved draft subset");
+                std::string manifest = "strata-mtp-runtime-v1\n", error;
+                for (const char* file : {"dense.txt", "dense.bin", "experts.bin"}) {
+                    std::string hash;
+                    require(detail::sha256_of_file((std::filesystem::path(get("mtp-path")) / file).string(), hash, error), error);
+                    manifest += std::string(file) + ":" + hash + "\n";
+                }
+                detail::sha256_ns::Sha256 hash;
+                hash.update(reinterpret_cast<const uint8_t*>(manifest.data()), manifest.size());
+                const auto digest = hash.finish();
+                require(detail::sha256_ns::hex(digest.data(), digest.size()) == expected, "MTP runtime content hash mismatch");
+            }
+        }
         if (rank >= 3 || port < 1024 || port > 65535 || timeout < 100 || timeout > 600000 || context < 4 ||
-            context > (autoregressive ? 65536u : 32768u))
+            context > 65536u)
             throw std::runtime_error("invalid rank, port, deadline or context");
         std::unique_ptr<JsonOutput> json;
         if (autoregressive) {
@@ -407,6 +437,16 @@ int main(int argc, char** argv) {
         JoinInfo join;
         join.session_uuid = get("session-uuid"); join.rank = rank; join.world = 3;
         join.model_hash = get("model-hash"); join.config_fingerprint = get("config-fingerprint");
+        if (batched_experts || graph_finish || poll_interval != 1)
+            join.config_fingerprint += ":tp-policy-v1:expert=" + expert_collectives +
+                                       ":poll=" + std::to_string(poll_interval) +
+                                       ":graphfinish=" + std::to_string(graph_finish_value);
+        if (mtp_enabled) {
+            const auto path = get("mtp-path");
+            join.config_fingerprint += ":mtp-v1:path=" + std::to_string(path.size()) + ":" + path +
+                                       ":drafts=" + std::to_string(mtp_drafts) + ":context=" + std::to_string(context) +
+                                       ":sha256=" + get("mtp-hash");
+        }
         join.backend_identity = "nccl"; join.nccl_version_expected = version; join.library_provenance = provenance;
         join.nccl_bootstrap_id = std::string(256, '0');
         if (rank == 0) require(make_nccl_bootstrap_id(nccl_config.library_path, join.nccl_bootstrap_id, err), err);
@@ -432,9 +472,15 @@ int main(int argc, char** argv) {
             SessionCollectives collectives(session, transport, clock, uint32_t(timeout));
             NativeRoutedExperts experts(pack, native, geometry, int(rank), collectives,
                                          {256, 192, 192}, uint32_t(timeout), ExpertDownPolicy::ExactLaneReference,
-                                         batched_experts ? ExpertCollectivePolicy::Batched : ExpertCollectivePolicy::Sequential);
+                                         batched_experts ? ExpertCollectivePolicy::Batched : ExpertCollectivePolicy::Sequential,
+                                         graph_finish);
+            PendingDmaExitGuard expert_lifetime(experts);
             std::cerr << "LOAD rank=" << rank << " stage=expert-shards" << std::endl;
             require(experts.initialize(err), err);
+            if (graph_finish) {
+                const auto stats = experts.finish_graph_stats();
+                std::cerr << "LOAD rank=" << rank << " stage=expert-finish-graphs count=" << stats.graph_count << '\n';
+            }
             std::cerr << "LOAD rank=" << rank << " stage=expert-shards-complete bytes=" << experts.owned_weight_bytes() << std::endl;
             ModelForward model(weights, geometry, state, int(rank), collectives, experts);
             model.native_head(&head);
@@ -461,6 +507,7 @@ int main(int argc, char** argv) {
                                     std::move(tokens), std::move(positions), join.model_hash, {}};
                 require(execution.plan(command, command.expected_collective_schedule));
                 auto result = worker.execute(command);
+                if (model.requires_process_exit() || experts.requires_process_exit()) std::_Exit(2);
                 if (result.status != StepStatus::completed) throw std::runtime_error(result.failure.detail);
                 return result;
             };
@@ -468,10 +515,19 @@ int main(int argc, char** argv) {
             if (autoregressive) {
                 std::unique_ptr<JsonInput> input;
                 std::unique_ptr<ServiceSampler> sampler;
+                std::unique_ptr<MtpService> mtp;
                 if (rank == 0) {
                     input = std::make_unique<JsonInput>();
                     sampler = std::make_unique<ServiceSampler>(size_t(geometry.n_vocab), size_t(context),
                                                                stream.value, session, transport, execution);
+                    if (mtp_enabled) {
+                        mtp = std::make_unique<MtpService>();
+                        std::cerr << "LOAD rank=0 stage=mtp-sync-library-capture external-watchdog-required=1\n";
+                        require(mtp->initialize(get("mtp-path"), uint32_t(mtp_drafts), geometry, state, weights, head,
+                                                stream.value, err), err);
+                        std::cerr << "LOAD rank=0 stage=mtp-complete allocated-vram-bytes=" << mtp->vram_bytes()
+                                  << " drafts=" << mtp_drafts << " resident-window=" << context << '\n';
+                    }
                 }
                 AutoregressiveCallbacks callbacks;
                 callbacks.poll = [&](uint32_t wait, std::string& line, bool& eof) {
@@ -491,6 +547,8 @@ int main(int argc, char** argv) {
                     }
                     if (auto f = execution.plan(command, command.expected_collective_schedule)) return f;
                     const auto result = worker.execute(command);
+                    // Checkpoint DMA can outlive a failed call. Exit before sampler/drafter CUDA destructors.
+                    if (model.requires_process_exit() || experts.requires_process_exit()) std::_Exit(2);
                     if (result.status != StepStatus::completed && result.status != StepStatus::cancelled)
                         return result.failure ? result.failure : Failure::fail(FailureCode::bad_operation, "worker did not complete serve step");
                     return Failure{};
@@ -500,8 +558,23 @@ int main(int argc, char** argv) {
                 callbacks.emit = [&](std::string_view type, std::string_view request, int32_t token, std::string_view status) {
                     json->emit(serve_event(type, request, token, uint32_t(context), status));
                 };
-                require(run_autoregressive(uint32_t(rank), int32_t(geometry.n_vocab), uint32_t(context), callbacks,
-                                          std::min(config.budgets.operation_ms, session.roster().budgets.operation_ms)));
+                callbacks.mtp_enabled = mtp_enabled;
+                if (mtp_enabled && rank == 0) {
+                    callbacks.begin_request = [&](const ServeRequest& request) { return mtp->begin_request(request); };
+                    callbacks.prompt_row = [&](int32_t next, uint64_t position) { return mtp->prompt_row(next, position); };
+                    callbacks.propose = [&](const std::vector<int32_t>& history, int32_t feedback, uint64_t draw,
+                                             std::vector<int32_t>& drafts) { return mtp->propose(history, feedback, draw, drafts); };
+                    callbacks.record_target_row = [&](size_t row, int32_t input_id, int32_t next) {
+                        return mtp->record_target_row(row, input_id, next);
+                    };
+                    callbacks.accepted_window = [&](const SpeculativeWindow& window, const SpeculativeResult& result) {
+                        return mtp->accepted_window(window, result);
+                    };
+                }
+                const auto service_result = run_autoregressive(uint32_t(rank), int32_t(geometry.n_vocab), uint32_t(context), callbacks,
+                                          std::min(config.budgets.operation_ms, session.roster().budgets.operation_ms));
+                if (model.requires_process_exit() || experts.requires_process_exit()) std::_Exit(2);
+                require(service_result);
             } else {
             std::set<uint64_t> dumped_positions;
             auto dump_state = [&](bool reset) {

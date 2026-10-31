@@ -2,6 +2,7 @@
 
 #include "strata/distributed/serve_protocol.hpp"
 #include "strata/distributed/worker.hpp"
+#include "strata/distributed/speculative.hpp"
 
 #include <functional>
 #include <string>
@@ -20,6 +21,14 @@ struct AutoregressiveCallbacks {
     std::function<Failure(StepPhase, std::string_view request, int32_t token, uint64_t position)> execute;
     std::function<Failure(const ServeRequest&, const std::vector<int32_t>& history, uint64_t draw, int32_t&)> sample;
     std::function<void(std::string_view type, std::string_view request, int32_t token, std::string_view state)> emit;
+    bool mtp_enabled = false;
+    // Optional root-only drafter adapter. Followers enable the same policy but supply no hooks.
+    std::function<Failure(const ServeRequest&)> begin_request;
+    std::function<Failure(int32_t next_token, uint64_t position)> prompt_row;
+    std::function<Failure(const std::vector<int32_t>& history, int32_t feedback, uint64_t draw,
+                          std::vector<int32_t>& drafts)> propose;
+    std::function<Failure(size_t row, int32_t input, int32_t next)> record_target_row;
+    std::function<Failure(const SpeculativeWindow&, const SpeculativeResult&)> accepted_window;
 };
 
 Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,

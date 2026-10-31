@@ -2838,7 +2838,9 @@ if(STRATA_BUILD_DISTRIBUTED)
                  src/distributed/session.cpp src/distributed/control_tcp.cpp
                  src/distributed/state_evidence.cpp src/distributed/parity_trace_writer.cpp
                  src/distributed/serve_protocol.cpp src/distributed/autoregressive.cpp
-                 src/distributed/model_checkpoint.cpp src/distributed/model_state.cpp)
+                 src/distributed/model_checkpoint.cpp src/distributed/model_state.cpp
+                 src/distributed/speculative.cpp src/distributed/cuda_segment_graph.cpp
+                 src/distributed/mtp_service.cpp)
   target_compile_definitions(strata-distributed PRIVATE STRATA_BUILD_DISTRIBUTED
                              STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE
                              STRATA_MODEL_CHECKPOINT_WITH_CUDA)
@@ -2865,6 +2867,19 @@ if(STRATA_BUILD_DISTRIBUTED)
   target_include_directories(test_model_state PRIVATE include src ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(test_model_state PRIVATE strata_warnings)
   add_test(NAME distributed_model_state COMMAND test_model_state)
+
+  add_executable(test_cuda_segment_graph tests/distributed/test_cuda_segment_graph.cu
+                 src/distributed/cuda_segment_graph.cpp)
+  target_include_directories(test_cuda_segment_graph PRIVATE include)
+  target_link_libraries(test_cuda_segment_graph PRIVATE strata_tp_cuda)
+  add_test(NAME distributed_cuda_segment_graph COMMAND test_cuda_segment_graph)
+  set_tests_properties(distributed_cuda_segment_graph PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
+
+  add_executable(test_cuda_segment_graph_state tests/distributed/test_cuda_segment_graph_state.cpp
+                 src/distributed/cuda_segment_graph.cpp)
+  target_include_directories(test_cuda_segment_graph_state PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(test_cuda_segment_graph_state PRIVATE strata_warnings)
+  add_test(NAME distributed_cuda_segment_graph_state COMMAND test_cuda_segment_graph_state)
 endif()
 
 if(STRATA_BUILD_DISTRIBUTED_TESTS)
@@ -2911,7 +2926,8 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   add_test(NAME test_serve_protocol COMMAND test_serve_protocol)
 
   add_executable(test_autoregressive tests/distributed/test_autoregressive.cpp
-                 src/distributed/autoregressive.cpp src/distributed/serve_protocol.cpp src/distributed/worker.cpp)
+                 src/distributed/autoregressive.cpp src/distributed/serve_protocol.cpp src/distributed/worker.cpp
+                 src/distributed/speculative.cpp)
   target_include_directories(test_autoregressive PRIVATE include)
   target_link_libraries(test_autoregressive PRIVATE strata_warnings)
   add_test(NAME test_autoregressive COMMAND test_autoregressive)
@@ -2926,6 +2942,11 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_include_directories(test_process_exit_guard PRIVATE include)
   target_link_libraries(test_process_exit_guard PRIVATE strata_warnings)
   add_test(NAME test_process_exit_guard COMMAND test_process_exit_guard)
+
+  add_executable(test_speculative tests/distributed/test_speculative.cpp src/distributed/speculative.cpp)
+  target_include_directories(test_speculative PRIVATE include)
+  target_link_libraries(test_speculative PRIVATE strata_warnings)
+  add_test(NAME test_speculative COMMAND test_speculative)
 
   add_executable(test_model_worker_command tests/distributed/test_model_worker_command.cpp
                                           src/distributed/model_worker.cpp)
