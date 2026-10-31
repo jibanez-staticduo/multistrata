@@ -67,6 +67,18 @@ struct RouteReadback {
         check(cudaEventCreateWithFlags(&complete, cudaEventDisableTiming));
     }
 };
+struct DeviceRouteStatusReadback {
+    int* value = nullptr;
+    cudaEvent_t complete = nullptr;
+    ~DeviceRouteStatusReadback() {
+        if (complete) cudaEventDestroy(complete);
+        if (value) cudaFreeHost(value);
+    }
+    void initialize() {
+        check(cudaMallocHost(reinterpret_cast<void**>(&value), sizeof(int)));
+        check(cudaEventCreateWithFlags(&complete, cudaEventDisableTiming));
+    }
+};
 const char* codec(int type) {
     switch (type) {
         case 16: return "IQ2_XXS"; case 17: return "IQ2_XS"; case 18: return "IQ3_XXS";
@@ -116,6 +128,7 @@ struct NativeRoutedExperts::Impl {
     Buffer batch_packed_hidden_q;
     Buffer batch_hidden_local, batch_hidden_wire, batch_lane_group, batch_lane_local;
     Buffer batch_lane_wire, batch_parts;
+    Buffer device_route_status;
     std::vector<int> batch_expert_starts;
     std::unique_ptr<FinishGraphs> finish_graphs;
     ExpertDownPolicy down_policy;
@@ -125,10 +138,13 @@ struct NativeRoutedExperts::Impl {
     bool graph_failed = false;
     ActivationContract input_contract, hidden_contract;
     RouteReadback readback;
+    DeviceRouteStatusReadback device_route_status_readback;
     uint32_t readback_timeout_ms;
     bool readback_failed = false;
+    bool device_status_readback_failed = false;
     bool initialized = false;
     bool batch_enabled = false;
+    bool device_routing_enabled = false;
 
     Impl(std::string pack_dir, std::string gguf, const core::ModelGeometry& g, int r,
          LayerCollectives& c, std::array<uint64_t, 3> counts, uint32_t timeout_ms, ExpertDownPolicy policy,
@@ -162,6 +178,11 @@ struct NativeRoutedExperts::Impl {
                 geometry.n_expert_used <= 15, "TP expert model: unsupported geometry/rank");
         require(std::accumulate(valid.begin(), valid.end(), uint64_t(0)) == uint64_t(geometry.n_ff),
                 "TP expert model: FF ownership does not cover original model");
+        require(!device_routing_enabled ||
+                (collective_policy == ExpertCollectivePolicy::Batched &&
+                 down_policy == ExpertDownPolicy::ExactLaneReference &&
+                 compact_operands && !graph_finish),
+                "TP device routing requires batched exact compact operands and graph finish disabled");
         for (int r = 0; r < 3; ++r) {
             require(valid[r] > 0 && valid[r] % 64 == 0, "TP expert model: FF cut splits original down block");
             if (r < rank) begin += valid[r];
@@ -339,6 +360,10 @@ struct NativeRoutedExperts::Impl {
             batch_parts = Buffer(entries * std::size_t(geometry.n_embd) * sizeof(float));
             batch_expert_starts.resize(std::size_t(geometry.n_expert + 1));
         }
+        if (device_routing_enabled) {
+            device_route_status = Buffer(sizeof(int));
+            device_route_status_readback.initialize();
+        }
         readback.initialize(std::size_t(batch_enabled ? 8 : 1) * std::size_t(geometry.n_expert_used));
         input_contract.consumer = "expert_gate_up"; input_contract.gather = "none";
         input_contract.quantizer = "Q8_1"; input_contract.block_size = 32;
@@ -500,6 +525,104 @@ struct NativeRoutedExperts::Impl {
         return true;
     }
 
+    bool forward_device_routes(int64_t index, const float* input, const int32_t* ids, int64_t k,
+                               float* parts, void* stream, std::string& err) {
+        require(initialized && device_routing_enabled && !readback_failed && !graph_failed &&
+                collective_policy == ExpertCollectivePolicy::Batched &&
+                down_policy == ExpertDownPolicy::ExactLaneReference && compact_operands && !graph_finish &&
+                index >= 0 && index < int64_t(layers.size()) && k == geometry.n_expert_used &&
+                input && ids && parts && stream && device_route_status.data,
+                "TP expert model: invalid or unsupported device-routed forward arguments");
+        auto& layer = layers[std::size_t(index)];
+        const auto rows = int(k);
+        const auto slots = uint64_t(hidden_contract.wire_slots);
+        const auto lane_width = tp::compact_down_payload_width(layer.layout.d_type, int(geometry.n_ff), valid);
+        const auto lane_count = uint64_t(geometry.n_embd) * uint64_t(lane_width);
+        const auto q_hidden_bytes = tp::global_q81_bytes(1, int(geometry.n_ff));
+        auto gate_view = layer.gate_view;
+        auto up_view = layer.up_view;
+        auto down_view = layer.down_view;
+        gate_view.bytes = layer.gate.bytes;
+        up_view.bytes = layer.up.bytes;
+        down_view.bytes = layer.down.bytes;
+
+        const auto q = tp::quantize_global(input_contract, input, 1, int(geometry.n_embd),
+                                           input_q.data, input_q.bytes, stream);
+        // The routed gate/up kernel emits compact local hidden rows; copy each
+        // row into the padded collective layout before gathering.
+        tp::gate_up_routed(gate_view, up_view, input_contract, q, ids, int(geometry.n_expert),
+                           layer.gu_bytes, layer.gu_bytes, rows, true,
+                           gate.floats(), up.floats(), hidden.floats(),
+                           static_cast<int*>(device_route_status.data), stream);
+        check(cudaMemsetAsync(local_hidden.data, 0, local_hidden.bytes,
+                              static_cast<cudaStream_t>(stream)));
+        for (int row = 0; row < rows; ++row)
+            check(cudaMemcpyAsync(local_hidden.floats() + uint64_t(row) * slots,
+                                  hidden.floats() + uint64_t(row) * valid[rank],
+                                  std::size_t(valid[rank]) * sizeof(float), cudaMemcpyDeviceToDevice,
+                                  static_cast<cudaStream_t>(stream)));
+        const auto hidden_count = uint64_t(rows) * slots;
+        if (!collective.gather(index, "expert_hidden_batch", local_hidden.floats(), wire.floats(),
+                               {hidden_count, hidden_count, hidden_count}, stream, err)) return false;
+        tp::unpack_expert_batch(hidden_contract, wire.floats(), rows, hidden.floats(), stream);
+        const auto packed_hidden_bytes = std::size_t(rows) * q_hidden_bytes;
+        tp::quantize_global(hidden_contract, hidden.floats(), rows, int(geometry.n_ff),
+                            hidden_q.data, packed_hidden_bytes, stream);
+        tp::down_lanes_compact_routed(
+            down_view, hidden_contract,
+            tp::GlobalQ81{static_cast<const uint8_t*>(hidden_q.data), int(geometry.n_ff), rows,
+                          q_hidden_bytes, packed_hidden_bytes},
+            ids, int(geometry.n_expert), layer.down_bytes, lane_terms.floats(),
+            lane_width, static_cast<int*>(device_route_status.data), stream);
+        const auto lane_wire_count = uint64_t(rows) * lane_count;
+        if (!collective.gather(index, "expert_lane_terms_batch", lane_terms.floats(),
+                               lane_wire.floats(),
+                               {lane_wire_count, lane_wire_count, lane_wire_count}, stream, err)) return false;
+        tp::finish_down_lanes_compact(lane_wire.floats(), layer.layout.d_type, int(geometry.n_ff),
+                                      int(geometry.n_embd), rows, valid, lane_width, parts, stream);
+        return true;
+    }
+
+    void clear_device_route_status(void* stream) {
+        require(initialized && device_routing_enabled && !device_status_readback_failed &&
+                device_route_status.data && stream,
+                "TP expert model: device route status is unavailable");
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        check(cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &capture_status));
+        require(capture_status == cudaStreamCaptureStatusNone,
+                "TP expert model: clear device route status outside graph capture");
+        check(cudaMemsetAsync(device_route_status.data, 0, sizeof(int),
+                              static_cast<cudaStream_t>(stream)));
+    }
+
+    bool check_device_route_status(void* stream) {
+        require(initialized && device_routing_enabled && !device_status_readback_failed &&
+                device_route_status.data && stream,
+                "TP expert model: device route status is unavailable");
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        check(cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &capture_status));
+        require(capture_status == cudaStreamCaptureStatusNone,
+                "TP expert model: check device route status outside graph capture");
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(readback_timeout_ms);
+        device_status_readback_failed = true;
+        check(cudaMemcpyAsync(device_route_status_readback.value, device_route_status.data,
+                              sizeof(int), cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(stream)));
+        check(cudaEventRecord(device_route_status_readback.complete, static_cast<cudaStream_t>(stream)));
+        for (;;) {
+            require(std::chrono::steady_clock::now() < deadline,
+                    "TP expert model: device route status readback deadline expired");
+            const auto status = cudaEventQuery(device_route_status_readback.complete);
+            if (status == cudaSuccess) break;
+            if (status != cudaErrorNotReady) check(status);
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        require(std::chrono::steady_clock::now() < deadline,
+                "TP expert model: device route status readback completed after deadline");
+        device_status_readback_failed = false;
+        return *device_route_status_readback.value == 0;
+    }
+
     bool forward_batch(int64_t index, int64_t rows, const float* inputs, const int* ids, int64_t k,
                        float* parts, void* stream, std::string& err) {
         require(initialized && !readback_failed && !graph_failed &&
@@ -659,6 +782,20 @@ bool NativeRoutedExperts::configure_prefill_batch(bool enabled, std::string& err
     impl_->batch_enabled = enabled;
     return true;
 }
+bool NativeRoutedExperts::configure_device_routing(bool enabled, std::string& err) {
+    if (impl_->initialized || impl_->readback.ids) {
+        err = "TP device routing must be configured before expert initialization";
+        return false;
+    }
+    if (enabled && (impl_->collective_policy != ExpertCollectivePolicy::Batched ||
+                    impl_->down_policy != ExpertDownPolicy::ExactLaneReference ||
+                    !impl_->compact_operands || impl_->graph_finish)) {
+        err = "TP device routing requires batched exact compact operands and graph finish disabled";
+        return false;
+    }
+    impl_->device_routing_enabled = enabled;
+    return true;
+}
 bool NativeRoutedExperts::initialize(std::string& err) {
     try { impl_->initialize(); return true; }
     catch (const std::exception& e) { impl_->poison_graphs(); err = e.what(); return false; }
@@ -670,10 +807,37 @@ bool NativeRoutedExperts::supports_batch() const noexcept {
 bool NativeRoutedExperts::forward(int64_t layer, const float* input, const int* ids, int64_t k,
                                   float* parts, void* stream, std::string& err) {
     try {
+        if (impl_->device_routing_enabled)
+            return forward_device_routes(layer, input, ids, k, parts, stream, err);
         const bool success = impl_->forward(layer, input, ids, k, parts, stream, err);
         if (!success) impl_->poison_graphs();
         return success;
     } catch (const std::exception& e) { impl_->poison_graphs(); err = e.what(); return false; }
+}
+bool NativeRoutedExperts::forward_device_routes(int64_t layer, const float* input, const int32_t* ids,
+                                                int64_t k, float* parts, void* stream, std::string& err) {
+    try {
+        return impl_->forward_device_routes(layer, input, ids, k, parts, stream, err);
+    } catch (const std::exception& e) { err = e.what(); return false; }
+}
+bool NativeRoutedExperts::clear_device_route_status(void* stream, std::string& err) {
+    try { impl_->clear_device_route_status(stream); return true; }
+    catch (const std::exception& e) { err = e.what(); return false; }
+}
+bool NativeRoutedExperts::check_device_route_status(void* stream, std::string& err) {
+    try {
+        if (impl_->check_device_route_status(stream)) return true;
+        err = "TP expert model: device kernel reported an invalid routed expert ID";
+        return false;
+    } catch (const std::exception& e) { err = e.what(); return false; }
+}
+bool NativeRoutedExperts::clear_execution_status(void* stream, std::string& err) {
+    if (!impl_->device_routing_enabled) return true;
+    return clear_device_route_status(stream, err);
+}
+bool NativeRoutedExperts::validate_execution_status(void* stream, std::string& err) {
+    if (!impl_->device_routing_enabled) return true;
+    return check_device_route_status(stream, err);
 }
 bool NativeRoutedExperts::forward_batch(int64_t layer, int64_t rows, const float* inputs, const int* ids,
                                         int64_t k, float* parts, void* stream, std::string& err) {
@@ -703,6 +867,7 @@ ExpertFinishGraphStats NativeRoutedExperts::finish_graph_stats() const {
     return stats;
 }
 bool NativeRoutedExperts::requires_process_exit() const noexcept {
+    if (impl_->device_status_readback_failed) return true;
     if (impl_->finish_graphs)
         for (const auto& graph : impl_->finish_graphs->codecs)
             if (graph.requires_process_exit()) return true;

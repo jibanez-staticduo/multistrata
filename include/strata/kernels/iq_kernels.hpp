@@ -25,6 +25,16 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
 
+/// Gate/up projections for one expert ID per routed row. Expert planes and
+/// input rows are selected on device. Clear the sticky device `status` flag
+/// before each call; any invalid ID sets it and leaves that route's outputs zero.
+void native_expert_gate_up_routed(int ggml_type, const void* gate_base, const void* up_base,
+                                  size_t gate_bytes_per_expert, size_t up_bytes_per_expert,
+                                  const int32_t* expert_ids, int expert_count,
+                                  const void* x_q8_1, size_t activation_stride, int routed_rows,
+                                  bool broadcast_input, int n_in, int n_out,
+                                  float* gate, float* up, int* status, void* stream);
+
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32; fp16 times `*scale` when given (device:
 /// an NVFP4 expert's s_down, read by the kernel itself so the source may be released right after it).
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale = nullptr);

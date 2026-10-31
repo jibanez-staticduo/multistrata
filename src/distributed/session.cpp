@@ -37,6 +37,17 @@ void put_u32(std::string& out, uint32_t v) {
     out.push_back(static_cast<char>(v & 0xff));
 }
 
+std::string batch_identity_payload(const PreagreedBatch& batch) {
+    std::string out;
+    put_u32(out, static_cast<uint32_t>(batch.generation >> 32));
+    put_u32(out, static_cast<uint32_t>(batch.generation));
+    put_u32(out, static_cast<uint32_t>(batch.cursor >> 32));
+    put_u32(out, static_cast<uint32_t>(batch.cursor));
+    put_u32(out, static_cast<uint32_t>(batch.count >> 32));
+    put_u32(out, static_cast<uint32_t>(batch.count));
+    return out;
+}
+
 uint32_t get_u32(const char* p) {
     const auto b = reinterpret_cast<const unsigned char*>(p);
     return (static_cast<uint32_t>(b[0]) << 24) | (static_cast<uint32_t>(b[1]) << 16) |
@@ -838,6 +849,10 @@ Failure Session::start_follower() {
 
 Failure Session::fail(Failure f, bool notify) {
     schedule_active_ = false;
+    batch_active_ = false;
+    batch_control_active_ = false;
+    batch_cursor_ = 0;
+    batch_count_ = 0;
     schedule_signatures_.clear();
     schedule_cursor_ = 0;
     failure_ = f;
@@ -895,7 +910,8 @@ Failure Session::expect_operation(const Operation& operation) {
     if (state_ != SessionState::ready) {
         return Failure::fail(FailureCode::not_ready, "no collective order before READY");
     }
-    if (schedule_active_) return fail(Failure::fail(FailureCode::bad_operation, "legacy operation inside agreed schedule"), true);
+    if (batch_active_ || schedule_active_)
+        return fail(Failure::fail(FailureCode::bad_operation, "legacy operation inside agreed schedule"), true);
     if (operation.sequence != next_sequence_) {
         return Failure::fail(FailureCode::bad_operation,
                             "the step issued collective " + std::to_string(operation.sequence) +
@@ -1029,6 +1045,8 @@ Failure Session::agree_operation_schedule(std::span<const CollectiveScheduleEntr
 Failure Session::agree_preagreed_operation(const CollectiveDescriptor& descriptor, std::string_view stage,
                                           Deadline at) {
     if (state_ != SessionState::ready) return Failure::fail(FailureCode::not_ready, "no collective admission before READY");
+    if (batch_active_)
+        return fail(Failure::fail(FailureCode::bad_operation, "per-operation admission inside a preagreed batch"), true);
     if (operation_in_flight_)
         return fail(Failure::fail(FailureCode::in_flight, "a collective is already in flight"), true);
     if (!schedule_active_ || schedule_cursor_ >= schedule_signatures_.size() ||
@@ -1047,9 +1065,87 @@ Failure Session::agree_preagreed_operation(const CollectiveDescriptor& descripto
     return ok_failure();
 }
 
+Failure Session::begin_preagreed_batch(std::span<const CollectiveScheduleEntry> entries, Deadline at,
+                                       PreagreedBatch& out) {
+    out = {};
+    if (state_ != SessionState::ready)
+        return Failure::fail(FailureCode::not_ready, "no batch admission before READY");
+    if (!schedule_active_ || operation_in_flight_ || batch_active_)
+        return fail(Failure::fail(FailureCode::in_flight, "no idle agreed schedule for batch admission"), true);
+    if (deadline_passed(clock_, at))
+        return fail(Failure::fail(FailureCode::deadline_expired, "preagreed batch admission deadline passed"), true);
+    if (entries.empty() || schedule_cursor_ >= schedule_signatures_.size() ||
+        entries.size() != schedule_signatures_.size() - schedule_cursor_) {
+        return fail(Failure::fail(FailureCode::bad_operation,
+                                  "preagreed batch must cover the complete remaining schedule"), true);
+    }
+    if (entries.size() > UINT64_MAX - next_sequence_)
+        return fail(Failure::fail(FailureCode::overflow, "preagreed batch sequence range overflows"), true);
+
+    uint64_t sequence = next_sequence_;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (deadline_passed(clock_, at))
+            return fail(Failure::fail(FailureCode::deadline_expired, "preagreed batch admission deadline passed"), true);
+        const auto& entry = entries[i];
+        if (entry.descriptor.operation.sequence != sequence++ || entry.stage.empty())
+            return fail(Failure::fail(FailureCode::bad_operation, "preagreed batch sequence or stage is invalid"), true);
+        std::string signature, encoded;
+        if (auto f = canonical_collective(entry.descriptor, signature)) return fail(f, true);
+        if (auto f = put_field(encoded, "signature", signature)) return fail(f, true);
+        if (auto f = put_field(encoded, "stage", entry.stage)) return fail(f, true);
+        if (encoded != schedule_signatures_[schedule_cursor_ + i])
+            return fail(Failure::fail(FailureCode::bad_operation,
+                                      "preagreed batch differs from the agreed schedule"), true);
+    }
+
+    const PreagreedBatch candidate{schedule_generation_, schedule_cursor_, entries.size()};
+    const std::string payload = batch_identity_payload(candidate);
+    batch_control_active_ = true;
+    const Failure agreement = agree_control_payload("preagreed-batch-admit-v1", payload, at);
+    batch_control_active_ = false;
+    if (agreement) return agreement;
+    batch_active_ = true;
+    batch_cursor_ = candidate.cursor;
+    batch_count_ = candidate.count;
+    out = candidate;
+    return ok_failure();
+}
+
+Failure Session::complete_preagreed_batch(const PreagreedBatch& batch, bool replay_succeeded, Deadline at) {
+    if (state_ != SessionState::ready)
+        return Failure::fail(FailureCode::not_ready, "no batch completion before READY");
+    if (!batch_active_ || batch.generation != schedule_generation_ || batch.cursor != batch_cursor_ ||
+        batch.count != batch_count_ || batch.cursor != schedule_cursor_ || batch.count == 0) {
+        return fail(Failure::fail(FailureCode::bad_operation, "preagreed batch identity is stale or incomplete"), true);
+    }
+    if (!replay_succeeded)
+        return fail(Failure::fail(FailureCode::async_error, "preagreed batch replay or local validation failed"), true);
+    if (deadline_passed(clock_, at))
+        return fail(Failure::fail(FailureCode::deadline_expired, "preagreed batch completion deadline passed"), true);
+
+    // This control agreement is the all-rank post-replay checkpoint. The
+    // schedule cursor and operation sequence remain unchanged until every rank
+    // acknowledges the same batch identity.
+    const std::string payload = batch_identity_payload(batch);
+    batch_control_active_ = true;
+    const Failure agreement = agree_control_payload("preagreed-batch-complete-v1", payload, at);
+    batch_control_active_ = false;
+    if (agreement) return agreement;
+
+    if (batch_count_ > UINT64_MAX - next_sequence_)
+        return fail(Failure::fail(FailureCode::overflow, "preagreed batch completion sequence overflows"), true);
+    next_sequence_ += batch_count_;
+    schedule_cursor_ += batch_count_;
+    batch_active_ = false;
+    batch_cursor_ = 0;
+    batch_count_ = 0;
+    return ok_failure();
+}
+
 Failure Session::finish_operation_schedule() {
     if (state_ != SessionState::ready) return Failure::fail(FailureCode::not_ready, "no schedule completion before READY");
-    if (!schedule_active_ || operation_in_flight_ || schedule_cursor_ != schedule_signatures_.size())
+    if (!schedule_active_ || operation_in_flight_ || batch_active_ ||
+        schedule_cursor_ != schedule_signatures_.size())
         return fail(Failure::fail(FailureCode::bad_operation, "collective schedule did not fully complete"), true);
     schedule_active_ = false;
     schedule_cursor_ = 0;
@@ -1059,6 +1155,8 @@ Failure Session::finish_operation_schedule() {
 
 Failure Session::complete_operation(const Operation& operation) {
     if (state_ != SessionState::ready) return Failure::fail(FailureCode::not_ready, "the session is not ready");
+    if (batch_active_)
+        return fail(Failure::fail(FailureCode::bad_operation, "per-operation completion inside a preagreed batch"), true);
     if (!operation_in_flight_ || operation.sequence != last_operation_.sequence ||
         operation.layer != last_operation_.layer || operation.step != last_operation_.step) {
         return fail(Failure::fail(FailureCode::bad_operation, "completion does not name the agreed collective"), true);
@@ -1073,7 +1171,7 @@ Failure Session::agree_control_payload(std::string_view label, std::string_view 
     if (state_ != SessionState::ready) {
         return Failure::fail(FailureCode::not_ready, "no control agreement before READY");
     }
-    if (operation_in_flight_) {
+    if (operation_in_flight_ || (batch_active_ && !batch_control_active_)) {
         return fail(Failure::fail(FailureCode::in_flight, "a collective is already in flight"), true);
     }
     // Subtractions keep hostile string_view lengths from overflowing before the allocation check.
@@ -1156,7 +1254,7 @@ Failure Session::broadcast_control_payload(std::string_view label, std::string& 
     if (state_ != SessionState::ready) {
         return Failure::fail(FailureCode::not_ready, "no control broadcast before READY");
     }
-    if (operation_in_flight_) {
+    if (operation_in_flight_ || batch_active_) {
         return fail(Failure::fail(FailureCode::in_flight, "a collective is already in flight"), true);
     }
     if (config_.rank != 0 && !output.empty()) {
@@ -1268,6 +1366,10 @@ Failure Session::broadcast_control_payload(std::string_view label, std::string& 
 
 void Session::abort(std::string_view reason) {
     schedule_active_ = false;
+    batch_active_ = false;
+    batch_control_active_ = false;
+    batch_cursor_ = 0;
+    batch_count_ = 0;
     schedule_signatures_.clear();
     schedule_cursor_ = 0;
     if (state_ == SessionState::closed) return;
@@ -1285,6 +1387,10 @@ void Session::abort(std::string_view reason) {
 
 Failure Session::close() {
     schedule_active_ = false;
+    batch_active_ = false;
+    batch_control_active_ = false;
+    batch_cursor_ = 0;
+    batch_count_ = 0;
     schedule_signatures_.clear();
     schedule_cursor_ = 0;
     channel_.close();

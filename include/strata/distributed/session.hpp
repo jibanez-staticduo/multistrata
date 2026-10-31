@@ -274,6 +274,14 @@ struct CollectiveScheduleEntry {
     std::string stage;
 };
 
+// Identity for one host-admitted batch from an agreed schedule. The token is
+// valid only until its matching successful completion.
+struct PreagreedBatch {
+    uint64_t generation = 0;
+    size_t cursor = 0;
+    size_t count = 0;
+};
+
 // The rank coordinator.  Single-threaded: one rank, one thread, one conversation at a time.
 class Session {
  public:
@@ -309,6 +317,11 @@ class Session {
     // schedule may be active. Local admission still checks every field and sequence before enqueue.
     Failure agree_operation_schedule(std::span<const CollectiveScheduleEntry>, std::string_view label, Deadline at);
     Failure agree_preagreed_operation(const CollectiveDescriptor&, std::string_view stage, Deadline at);
+    // Opt-in host-only admission for graph capture/replay. Entries must exactly
+    // cover the remaining agreed schedule. Admission does not consume sequence
+    // numbers; completion commits them only after a bounded all-rank ACK.
+    Failure begin_preagreed_batch(std::span<const CollectiveScheduleEntry>, Deadline at, PreagreedBatch& out);
+    Failure complete_preagreed_batch(const PreagreedBatch&, bool replay_succeeded, Deadline at);
     // Retire only after every entry completed. Does not rewind the collective sequence.
     Failure finish_operation_schedule();
 
@@ -372,8 +385,12 @@ class Session {
     Operation last_operation_{};
     bool operation_in_flight_ = false;
     bool schedule_active_ = false;
+    bool batch_active_ = false;
+    bool batch_control_active_ = false;
     uint64_t schedule_generation_ = 0;
     size_t schedule_cursor_ = 0;
+    size_t batch_cursor_ = 0;
+    size_t batch_count_ = 0;
     std::vector<std::string> schedule_signatures_;
     bool notified_ = false;
 };

@@ -19,8 +19,8 @@ is a preexisting JSONL file. No output text is saved unless --save-text is given
 
 Times use monotonic seconds and include client/server queueing. TTFT means first
 nonempty content delta; reasoning is timed separately. Output window is measured
-from first content to stream end; it is not engine decode time. Engine decode
-time is present only when the request itself supplies timings.predicted_ms.
+from first content to stream end; it is not engine decode time. Engine phase times are present only when supplied by the request itself;
+missing prefill, queue, sampling or decode times remain null.
 Round throughput is successful completion tokens / whole concurrent round wall;
 failed rounds have no throughput. p50/p95 use nearest-rank ceil(p*n)-1.
 """
@@ -215,7 +215,8 @@ def post_stream(endpoint: dict, prompt: dict, frozen: dict, *, timeout: float, s
     start = time.monotonic()
     row = {"start_monotonic_s": start, "first_reasoning_monotonic_s": None,
            "first_content_monotonic_s": None, "end_monotonic_s": None, "usage": None,
-           "status": "FAILED", "finish_reason": None, "server_decode_s": None}
+           "status": "FAILED", "finish_reason": None, "server_decode_s": None,
+           "server_prefill_s": None, "server_queue_s": None, "server_sampling_s": None}
     conn, response, timer = None, None, None
     try:
         parsed = urlsplit(endpoint["url"])
@@ -276,11 +277,17 @@ def post_stream(endpoint: dict, prompt: dict, frozen: dict, *, timeout: float, s
                 if event.get("usage") is not None:
                     row["usage"] = event["usage"]
                 timings = event.get("timings")
-                if isinstance(timings, dict) and isinstance(timings.get("predicted_ms"), (int, float)):
-                    ms = timings["predicted_ms"]
-                    if isinstance(ms, bool) or not math.isfinite(ms) or ms < 0:
-                        raise InvalidBenchmark("invalid provided decode timing")
-                    row["server_decode_s"] = ms / 1000
+                if isinstance(timings, dict):
+                    for source, target in (("predicted_ms", "server_decode_s"),
+                                           ("prompt_ms", "server_prefill_s"),
+                                           ("queue_ms", "server_queue_s"),
+                                           ("sampling_ms", "server_sampling_s")):
+                        if timings.get(source) is None:
+                            continue
+                        ms = timings[source]
+                        if type(ms) not in (int, float) or not math.isfinite(ms) or ms < 0:
+                            raise InvalidBenchmark("invalid provided phase timing")
+                        row[target] = ms / 1000
                 choices = event.get("choices", [])
                 if not isinstance(choices, list) or len(choices) > 1:
                     raise InvalidBenchmark("expected a single completion")

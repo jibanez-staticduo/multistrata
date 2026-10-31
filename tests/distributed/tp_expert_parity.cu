@@ -489,6 +489,164 @@ void tiny_scalar_probe() {
     std::puts("tiny-scalar-independent-bytes passed");
 }
 
+void routed_indirection_probe() {
+    constexpr int width = 256, ff = 192, experts = 512, routes = 10;
+    constexpr int begin = 64, end = 128, owned = end - begin;
+    constexpr int gu_type = 16, down_type = 20;
+    std::mt19937 rng(0x7ad1);
+    const auto layout = k::native_expert_layout(gu_type, down_type, width, ff);
+    const std::size_t gu_row = layout.gu_row, gu_stride = std::size_t(owned) * gu_row;
+    const std::size_t down_row = k::iq_row_bytes(down_type, owned);
+    const std::size_t down_stride = std::size_t(width) * down_row;
+    std::vector<uint8_t> gu(std::size_t(experts) * gu_stride), up(gu.size());
+    std::vector<uint8_t> down(std::size_t(experts) * down_stride);
+    for (int expert = 0; expert < experts; ++expert) {
+        auto g = random_plane(gu_type, ff, width, rng), u = random_plane(gu_type, ff, width, rng);
+        for (int row = begin; row < end; ++row) {
+            std::memcpy(gu.data() + std::size_t(expert) * gu_stride + std::size_t(row - begin) * gu_row,
+                        g.data() + std::size_t(row) * gu_row, gu_row);
+            std::memcpy(up.data() + std::size_t(expert) * gu_stride + std::size_t(row - begin) * gu_row,
+                        u.data() + std::size_t(row) * gu_row, gu_row);
+        }
+        auto d = random_plane(down_type, width, owned, rng);
+        std::memcpy(down.data() + std::size_t(expert) * down_stride, d.data(), down_stride);
+    }
+    Device<uint8_t> dgu(gu.size()), dup(up.size()), ddown(down.size());
+    dgu.upload(gu); dup.upload(up); ddown.upload(down);
+    Device<int32_t> ids(routes);
+    Device<int> status(1);
+    Device<float> input_f(std::size_t(routes) * width);
+    std::vector<float> x(input_f.size);
+    for (auto& value : x) value = float(int(rng() % 2001) - 1000) / 503.f;
+    input_f.upload(x);
+    Device<uint8_t> input_q(tp::global_q81_bytes(routes, width));
+    Stream stream;
+    auto input_contract = contract(ff); input_contract.gather = "none"; input_contract.consumer = "expert_gate_up";
+    const auto input = tp::quantize_global(input_contract, input_f.p, routes, width,
+                                            input_q.p, input_q.size, stream.s);
+    Device<uint8_t> broadcast_q(tp::global_q81_bytes(1, width));
+    tp::quantize_global(input_contract, input_f.p, 1, width, broadcast_q.p, broadcast_q.size, stream.s);
+    Device<float> gate(std::size_t(routes) * owned), up_out(gate.size), hidden(gate.size);
+    Device<float> reference_gate(gate.size), reference_up(gate.size), reference_hidden(gate.size);
+    const std::array<uint64_t, 3> valid{64, 64, 64};
+    const int compact_width = tp::compact_down_payload_width(down_type, ff, valid);
+    Device<uint8_t> hidden_q(tp::global_q81_bytes(routes, ff));
+    Device<float> hidden_input(std::size_t(routes) * ff);
+    std::vector<float> hidden_values(hidden_input.size);
+    for (auto& value : hidden_values) value = float(int(rng() % 2001) - 1000) / 509.f;
+    hidden_input.upload(hidden_values);
+    tp::quantize_global(contract(ff), hidden_input.p, routes, ff, hidden_q.p, hidden_q.size, stream.s);
+    Device<float> routed_terms(std::size_t(routes) * width * compact_width);
+    Device<float> sequential_terms(routed_terms.size);
+    const auto dw = view(down_type, ff, width, 0, begin, end, ddown.p, down_row, ddown.size);
+    const auto gv = view(gu_type, width, ff, 1, begin, end, dgu.p, gu_row, dgu.size);
+    const auto uv = view(gu_type, width, ff, 1, begin, end, dup.p, gu_row, dup.size);
+    const std::vector<std::vector<int32_t>> selections{
+        {0, 511, 17, 3, 511, 0, 17, 3, 0, 511},
+        {511, 3, 0, 17, 0, 511, 3, 17, 511, 0}};
+    for (int replay = 0; replay < 100; ++replay) {
+        const auto& selected = selections[std::size_t(replay) % selections.size()];
+        ids.upload(selected);
+        ck(cudaMemsetAsync(status.p, 0, sizeof(int), stream.s));
+        tp::gate_up_routed(gv, uv, input_contract, input, ids.p, experts, gu_stride, gu_stride,
+                           routes, false, gate.p, up_out.p, hidden.p, status.p, stream.s);
+        ck(cudaStreamSynchronize(stream.s));
+        require(status.read()[0] == 0, "routed gate/up flagged valid expert IDs");
+        for (int route = 0; route < routes; ++route) {
+            const auto expert = std::size_t(selected[std::size_t(route)]);
+            const auto gate_base = dgu.p + expert * gu_stride;
+            const auto up_base = dup.p + expert * gu_stride;
+            tp::gate_up(view(gu_type, width, ff, 1, begin, end, gate_base, gu_row, gu_stride),
+                        view(gu_type, width, ff, 1, begin, end, up_base, gu_row, gu_stride),
+                        input_contract,
+                        {static_cast<const uint8_t*>(input.data) + std::size_t(route) * input.row_stride,
+                         width, 1, input.row_stride, input.row_stride},
+                        reference_gate.p + std::size_t(route) * owned,
+                        reference_up.p + std::size_t(route) * owned,
+                        reference_hidden.p + std::size_t(route) * owned, stream.s);
+        }
+        ck(cudaStreamSynchronize(stream.s));
+        require(gate.read() == reference_gate.read(), "routed gate differs from exact per-expert calls");
+        require(up_out.read() == reference_up.read(), "routed up differs from exact per-expert calls");
+        require(hidden.read() == reference_hidden.read(), "routed SwiGLU differs from exact per-expert calls");
+
+        ck(cudaMemsetAsync(status.p, 0, sizeof(int), stream.s));
+        tp::down_lanes_compact_routed(dw, contract(ff),
+            {hidden_q.p, ff, routes, tp::global_q81_bytes(1, ff), hidden_q.size}, ids.p, experts,
+            down_stride, routed_terms.p, compact_width, status.p, stream.s);
+        for (int route = 0; route < routes; ++route) {
+            const auto expert = std::size_t(selected[std::size_t(route)]);
+            tp::down_lanes_compact(view(down_type, ff, width, 0, begin, end,
+                                        ddown.p + expert * down_stride, down_row, down_stride),
+                contract(ff),
+                {static_cast<const uint8_t*>(hidden_q.p) + std::size_t(route) *
+                     tp::global_q81_bytes(1, ff), ff, 1, tp::global_q81_bytes(1, ff),
+                 tp::global_q81_bytes(1, ff)},
+                sequential_terms.p + std::size_t(route) * width * compact_width,
+                compact_width, stream.s);
+        }
+        ck(cudaStreamSynchronize(stream.s));
+        require(status.read()[0] == 0, "routed down flagged valid expert IDs");
+        require(routed_terms.read() == sequential_terms.read(),
+                "routed compact down operands differ from exact per-expert calls");
+    }
+
+    const tp::GlobalQ81 broadcast{broadcast_q.p, width, 1, tp::global_q81_bytes(1, width),
+                                  tp::global_q81_bytes(1, width)};
+    ids.upload(selections.front());
+    ck(cudaMemsetAsync(status.p, 0, sizeof(int), stream.s));
+    tp::gate_up_routed(gv, uv, input_contract, broadcast, ids.p, experts, gu_stride, gu_stride,
+                       routes, true, gate.p, up_out.p, hidden.p, status.p, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    require(status.read()[0] == 0, "broadcast routed gate/up flagged valid expert IDs");
+
+    std::vector<int32_t> invalid = selections[0];
+    invalid[0] = -1; invalid[1] = experts;
+    ids.upload(invalid);
+    ck(cudaMemsetAsync(status.p, 0, sizeof(int), stream.s));
+    tp::gate_up_routed(gv, uv, input_contract, input, ids.p, experts, gu_stride, gu_stride,
+                       routes, false, gate.p, up_out.p, hidden.p, status.p, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    require(status.read()[0] == 1, "routed gate/up did not flag invalid expert IDs");
+    const auto invalid_gate = gate.read(), invalid_up = up_out.read();
+    require(std::all_of(invalid_gate.begin(), invalid_gate.begin() + owned, [](float v) { return v == 0.f; }) &&
+            std::all_of(invalid_up.begin(), invalid_up.begin() + owned, [](float v) { return v == 0.f; }),
+            "routed gate/up did not zero invalid expert rows");
+    Device<float> invalid_terms(std::size_t(routes) * width * compact_width);
+    ck(cudaMemsetAsync(status.p, 0, sizeof(int), stream.s));
+    tp::down_lanes_compact_routed(dw, contract(ff),
+        {hidden_q.p, ff, routes, tp::global_q81_bytes(1, ff), hidden_q.size},
+        ids.p, experts, down_stride, invalid_terms.p, compact_width, status.p, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    require(status.read()[0] == 1, "routed down did not flag invalid expert IDs");
+    const auto invalid_down = invalid_terms.read();
+    require(std::all_of(invalid_down.begin(), invalid_down.begin() +
+                        std::size_t(2) * width * compact_width,
+                        [](float value) { return value == 0.f; }),
+            "routed down did not zero invalid expert operands");
+
+    auto gather = contract(ff); gather.wire_slots = 64;
+    Device<float> wire(std::size_t(3) * 80 * 64), unpacked(std::size_t(80) * ff);
+    std::vector<float> wire_values(wire.size);
+    for (std::size_t i = 0; i < wire_values.size(); ++i) wire_values[i] = float(i % 97);
+    wire.upload(wire_values);
+    tp::unpack_expert_batch(gather, wire.p, 80, unpacked.p, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    const auto unpacked_values = unpacked.read();
+    for (int expert = 0; expert < 80; ++expert)
+        for (int col = 0; col < ff; ++col) {
+            const int rank = col / 64, local = col % 64;
+            const auto source = std::size_t(rank) * 80 * 64 + std::size_t(expert) * 64 + local;
+            require(unpacked_values[std::size_t(expert) * ff + col] == wire_values[source],
+                    "80-row expert unpack changed rank-major data order");
+        }
+    bool rejected = false;
+    try { tp::unpack_expert_batch(gather, wire.p, 81, unpacked.p, stream.s); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "expert batch unpack accepted 81 routed rows");
+    std::puts("routed-device-indirection and 80-row unpack bounds passed");
+}
+
 void run_expert_batch(const Sample& sample, int seed, Metrics& metrics) {
     constexpr int experts = 10;
     const int width = sample.input, ff = sample.ff;
@@ -810,6 +968,7 @@ int main(int argc, char** argv) {
         if (o.roundoff_selftest) { roundoff_selftest(); return 0; }
         if (o.exact_lane_selftest) { exact_lane_selftest(); return 0; }
         if (o.compact_lane_selftest) { compact_lane_selftest(); return 0; }
+        if (o.exact_lane || o.compact_lane_selftest) { /* existing lane-focused modes continue below */ }
         // These environment-only experiments bypass the selected ordinary
         // grouped control before its public setters take effect.
         for (const char* name : {"STRATA_EXPERT_V2", "STRATA_EXPERT_V2K", "STRATA_DOWN_WS"}) {
@@ -835,6 +994,7 @@ int main(int argc, char** argv) {
         k::native_expert_set_mode(0, 0);
         k::native_moe_combine_set_enabled(true);
         tiny_scalar_probe();
+        routed_indirection_probe();
         std::mt19937 rng(0x7a531);
         for (int gu : {16, 17, 18, 21, 22, 23}) for (int down : {20, 42}) {
             for (const auto dims : {std::pair{256, 192}, std::pair{2560, 640}}) {

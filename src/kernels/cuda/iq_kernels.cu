@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <tuple>
 #include <type_traits>
 
@@ -1905,6 +1906,41 @@ __global__ void __launch_bounds__(128) mmvq_multi_kernel(const uint8_t* __restri
             for (int c = 0; c < NC; ++c)
                 if (c < n && lane == c) y[(size_t) (c0 + c) * n_out + row] = s[c];
         }
+    }
+}
+
+template<int TY>
+__global__ void routed_mmvq_kernel(const uint8_t* gate_base, const uint8_t* up_base,
+                                   size_t gate_expert_stride, size_t up_expert_stride,
+                                   const int32_t* expert_ids, int expert_count, const block_q8_1* x,
+                                   size_t activation_stride, size_t row_bytes, int routed_rows, bool broadcast_input,
+                                   int n_in, int n_out, float* gate, float* up, int* status) {
+    const int row = blockIdx.x * 4 + threadIdx.y;
+    const int routed_row = int(blockIdx.y);
+    if (row >= n_out || routed_row >= routed_rows) return;
+    const int lane = threadIdx.x;
+    const int expert = expert_ids[routed_row];
+    if (expert < 0 || expert >= expert_count) {
+        if (lane == 0) {
+            atomicExch(status, 1);
+            gate[std::size_t(routed_row) * n_out + row] = 0.f;
+            up[std::size_t(routed_row) * n_out + row] = 0.f;
+        }
+        return;
+    }
+    const int input_row = broadcast_input ? 0 : routed_row;
+    const auto* xb = reinterpret_cast<const block_q8_1*>(
+        reinterpret_cast<const uint8_t*>(x) + std::size_t(input_row) * activation_stride);
+    const int nb = n_in / Fmt<TY>::qk;
+    const uint8_t* gate_row = gate_base + std::size_t(expert) * gate_expert_stride +
+                              std::size_t(row) * row_bytes;
+    const uint8_t* up_row = up_base + std::size_t(expert) * up_expert_stride +
+                            std::size_t(row) * row_bytes;
+    const float gv = row_dot<TY>(gate_row, xb, nb, lane);
+    const float uv = row_dot<TY>(up_row, xb, nb, lane);
+    if (lane == 0) {
+        gate[std::size_t(routed_row) * n_out + row] = gv;
+        up[std::size_t(routed_row) * n_out + row] = uv;
     }
 }
 
@@ -5356,6 +5392,46 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
         default: std::fprintf(stderr, "iq_mmvq: type %d is not supported\n", t); std::exit(1);
     }
     check("iq_mmvq");
+}
+
+void native_expert_gate_up_routed(int t, const void* gate_base, const void* up_base,
+                                  size_t gate_bytes_per_expert, size_t up_bytes_per_expert,
+                                  const int32_t* expert_ids, int expert_count, const void* x_q8_1,
+                                  size_t activation_stride, int routed_rows, bool broadcast_input, int n_in, int n_out,
+                                  float* gate, float* up, int* status, void* stream) {
+    const size_t row_bytes = iq_row_bytes(t, n_in);
+    if (!(t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 23) ||
+        !gate_base || !up_base || !expert_ids || expert_count <= 0 || !x_q8_1 ||
+        routed_rows <= 0 || routed_rows > 65535 ||
+        n_in <= 0 || n_out <= 0 || !row_bytes ||
+        gate_bytes_per_expert < row_bytes * std::size_t(n_out) ||
+        up_bytes_per_expert < row_bytes * std::size_t(n_out) ||
+        !gate || !up || !status || !stream || gate == up ||
+        (reinterpret_cast<std::uintptr_t>(gate_base) & 1) || (reinterpret_cast<std::uintptr_t>(up_base) & 1) ||
+        (reinterpret_cast<std::uintptr_t>(x_q8_1) & 3) || (activation_stride < std::size_t(n_in / 32) * sizeof(block_q8_1)) ||
+        (activation_stride & 3) || (reinterpret_cast<std::uintptr_t>(gate) & 3) ||
+        (reinterpret_cast<std::uintptr_t>(up) & 3) || (reinterpret_cast<std::uintptr_t>(expert_ids) & 3) ||
+        (reinterpret_cast<std::uintptr_t>(status) & 3) || n_in % 32 != 0 ||
+        (t == 16 && n_in % Fmt<16>::qk != 0) ||
+        (t == 17 && n_in % Fmt<17>::qk != 0) || (t == 18 && n_in % Fmt<18>::qk != 0) ||
+        (t == 21 && n_in % Fmt<21>::qk != 0) || (t == 22 && n_in % Fmt<22>::qk != 0) ||
+        (t == 23 && n_in % Fmt<23>::qk != 0)) {
+        throw std::invalid_argument("routed native gate/up: invalid dimensions or buffers");
+    }
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const dim3 grid((unsigned(n_out) + 3) / 4, unsigned(routed_rows));
+#define STRATA_ROUTED_GU(TY) case TY: routed_mmvq_kernel<TY><<<grid, dim3(32, 4), 0, s>>>( \
+        static_cast<const uint8_t*>(gate_base), static_cast<const uint8_t*>(up_base), \
+        gate_bytes_per_expert, up_bytes_per_expert, expert_ids, expert_count, \
+        static_cast<const block_q8_1*>(x_q8_1), activation_stride, row_bytes, routed_rows, \
+        broadcast_input, n_in, n_out, gate, up, status); break
+    switch (t) {
+        STRATA_ROUTED_GU(16); STRATA_ROUTED_GU(17); STRATA_ROUTED_GU(18);
+        STRATA_ROUTED_GU(21); STRATA_ROUTED_GU(22); STRATA_ROUTED_GU(23);
+        default: throw std::invalid_argument("routed native gate/up: unsupported format");
+    }
+#undef STRATA_ROUTED_GU
+    check("routed native gate/up");
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {

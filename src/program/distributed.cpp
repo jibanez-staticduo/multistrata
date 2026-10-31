@@ -11,6 +11,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/distributed/expert_model.hpp"
 #include "strata/distributed/model_worker.hpp"
+#include "strata/distributed/memory_phase.hpp"
 #include "strata/distributed/autoregressive.hpp"
 #include "strata/distributed/capture_positions.hpp"
 #include "strata/distributed/mtp_service.hpp"
@@ -38,6 +39,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <ctime>
 #include <stdexcept>
 #include <cerrno>
 #include <csignal>
@@ -410,7 +412,7 @@ int main(int argc, char** argv) {
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
             "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel", "profile-dir",
             "collective-agreement", "service-state-dir", "timing-file", "expert-operands", "request-timing",
-            "prefill-batch-size", "prefill-expert-batch"};
+            "prefill-batch-size", "prefill-expert-batch", "device-expert-routing", "model-graph", "memory-phase-file"};
 #if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
         allowed.insert("gather-transport");
         allowed.insert("roce-hca-list");
@@ -479,6 +481,12 @@ int main(int argc, char** argv) {
         require(graph_finish_value <= 1 && (!graph_finish_value || batched_experts),
                 "--graph-finish must be 0 or 1 and requires batched expert collectives");
         const bool graph_finish = graph_finish_value != 0;
+        const auto device_routing_value = number("device-expert-routing", 0);
+        require(device_routing_value <= 1, "--device-expert-routing must be 0 or 1");
+        const bool device_expert_routing = device_routing_value != 0;
+        const auto model_graph_value = number("model-graph", 0);
+        require(model_graph_value <= 1, "--model-graph must be 0 or 1");
+        const bool model_graph = model_graph_value != 0;
         const auto mode = args.contains("mode") ? args.at("mode") : "teacher-forced";
         require(mode == "teacher-forced" || mode == "autoregressive" || mode == "multislot", "invalid distributed mode");
         const bool autoregressive = mode == "autoregressive";
@@ -496,6 +504,9 @@ int main(int argc, char** argv) {
         const bool prefill_expert_batch = prefill_expert_value == "1";
         require(!prefill_expert_batch || (prefill_batch_size > 1 && batched_experts && compact_expert_operands),
                 "--prefill-expert-batch 1 requires multi-token prefill, batched collectives and compact operands");
+        require(!device_expert_routing ||
+                    (batched_experts && compact_expert_operands && !graph_finish && !prefill_expert_batch),
+                "--device-expert-routing 1 requires batched compact experts, graph finish 0 and prefill expert batch 0");
         const auto request_timing_value = args.contains("request-timing") ? args.at("request-timing") : "0";
         require((request_timing_value == "0" || request_timing_value == "1") &&
                     (request_timing_value == "0" || autoregressive || multislot),
@@ -513,6 +524,10 @@ int main(int argc, char** argv) {
         require((parallel == 1 || parallel == 4 || parallel == 8) && (multislot || !args.contains("parallel")),
                 "--parallel 1,4,8 requires --mode multislot");
         const bool mtp_enabled = args.contains("mtp-path");
+        require(!model_graph || (device_expert_routing && preagreed_collectives && !hybrid_roce &&
+                    !multislot && !mtp_enabled && prefill_batch_size == 1 &&
+                    !args.contains("trace-dir") && !args.contains("profile-dir")),
+                "--model-graph 1 requires NCCL C1 singleton preagreed device routing without MTP or observers");
         require(prefill_batch_size == 1 || !mtp_enabled,
                 "batched prompt processing does not yet supply every target residual row required by MTP");
         const auto mtp_drafts = number("mtp-drafts", 4);
@@ -621,6 +636,7 @@ int main(int argc, char** argv) {
         NcclConfig nccl_config{uint32_t(rank), 3, {}, get("library-path")};
         auto api = make_production_nccl_api(nccl_config, err);
         require(bool(api), err);
+        auto* graph_api = model_graph ? api.get() : nullptr;
         std::string version, provenance;
         require(api->identity(version, provenance));
         require(version == get("nccl-version") && provenance == get("library-provenance"), "NCCL approval mismatch");
@@ -644,6 +660,8 @@ int main(int argc, char** argv) {
         if (prefill_batch_size > 1)
             join.config_fingerprint += ":prefill-batch-exactnative-v1:rows=" + std::to_string(prefill_batch_size);
         if (prefill_expert_batch) join.config_fingerprint += ":prefill-expert-rows-v1";
+        if (device_expert_routing) join.config_fingerprint += ":device-expert-routing-v1:1";
+        if (model_graph) join.config_fingerprint += ":full-model-graph-v1:1";
         join.backend_identity = hybrid_roce ? std::string(kHybridBackendIdentity) : "nccl";
         if (hybrid_roce) join.config_fingerprint += ":gather-transport=hybrid-roce-v1";
         join.nccl_version_expected = version; join.library_provenance = provenance;
@@ -732,12 +750,49 @@ int main(int argc, char** argv) {
         try {
             SessionCollectives collectives(session, transport, clock, uint32_t(timeout));
             collectives.profile(args.contains("profile-dir"));
+            MemoryPhaseWriter memory_writer;
+            std::set<std::pair<std::string, MemoryPhase>> memory_seen;
+            std::function<Failure(const StepCommand&, uint64_t, bool)> memory_phase;
+            if (args.contains("memory-phase-file")) {
+                require(memory_writer.open_new(args.at("memory-phase-file"), err), err);
+                memory_phase = [&](const StepCommand& command, uint64_t position, bool before) -> Failure {
+                    MemoryPhase phase;
+                    if (command.phase == StepPhase::init && !before) phase = MemoryPhase::allocation;
+                    else if (command.phase == StepPhase::prefill)
+                        phase = before ? MemoryPhase::prefill_start : MemoryPhase::warmup;
+                    else if (command.phase == StepPhase::decode)
+                        phase = before ? MemoryPhase::prefill_complete : MemoryPhase::first_decode;
+                    else if ((command.phase == StepPhase::cancel || command.phase == StepPhase::reset) && before)
+                        phase = MemoryPhase::decode;
+                    else if ((command.phase == StepPhase::cancel || command.phase == StepPhase::reset) && !before)
+                        phase = MemoryPhase::reset;
+                    else return {};
+                    const auto request = std::to_string(command.slot) + ":" +
+                        (command.request.empty() ? std::string("init") : command.request);
+                    if (!memory_seen.emplace(request, phase).second) return {};
+                    size_t free_bytes = 0, total_bytes = 0;
+                    const auto status = cudaMemGetInfo(&free_bytes, &total_bytes);
+                    if (status != cudaSuccess) return Failure::fail(FailureCode::async_error, cudaGetErrorString(status));
+                    const auto now = std::chrono::system_clock::now();
+                    const auto seconds = std::chrono::system_clock::to_time_t(now);
+                    std::tm utc{};
+                    gmtime_r(&seconds, &utc);
+                    char timestamp[32];
+                    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &utc);
+                    std::string error;
+                    if (!memory_writer.append({timestamp, uint32_t(rank), request, command.step, phase,
+                                               position, free_bytes, total_bytes}, error))
+                        return Failure::fail(FailureCode::bad_operation, error);
+                    return {};
+                };
+            }
             NativeRoutedExperts experts(pack, native, geometry, int(rank), collectives,
                                          {256, 192, 192}, uint32_t(timeout), ExpertDownPolicy::ExactLaneReference,
                                          batched_experts ? ExpertCollectivePolicy::Batched : ExpertCollectivePolicy::Sequential,
                                          graph_finish, compact_expert_operands);
             PendingDmaExitGuard expert_lifetime(experts);
             std::cerr << "LOAD rank=" << rank << " stage=expert-shards" << std::endl;
+            require(experts.configure_device_routing(device_expert_routing, err), err);
             require(experts.configure_prefill_batch(prefill_expert_batch, err), err);
             require(experts.initialize(err), err);
             if (graph_finish) {
@@ -777,6 +832,7 @@ int main(int argc, char** argv) {
                                             join.session_uuid, join.model_hash, uint32_t(rank), batched_experts, 0,
                                             preagreed_collectives};
                 pool_config.expert_operands = {compact_expert_operands, experts.valid_counts(), experts.down_codecs()};
+                pool_config.memory_phase = memory_phase;
                 SlotPool pool(pool_config, {weights, geometry, head, table, collectives, experts, session, transport,
                                             stream.value, [&] { return experts.requires_process_exit(); }});
                 PendingDmaExitGuard pool_lifetime(pool);
@@ -859,7 +915,10 @@ int main(int argc, char** argv) {
             model_worker_config.preagreed_collectives = preagreed_collectives;
             model_worker_config.prefill_batch_exactnative = prefill_batch_size > 1;
             model_worker_config.prefill_expert_batch = prefill_expert_batch;
+            model_worker_config.decode_graph_api = graph_api;
+            model_worker_config.memory_phase = memory_phase;
             ModelWorkerBackend execution(model_worker_config, model, collectives, session, transport);
+            PendingDmaExitGuard graph_lifetime(execution);
             Worker worker(worker_config, execution);
             PendingDmaExitGuard checkpoint_lifetime(model);
             uint64_t step = 1;
@@ -871,7 +930,9 @@ int main(int argc, char** argv) {
                                     std::move(tokens), std::move(positions), join.model_hash, {}};
                 require(execution.plan(command, command.expected_collective_schedule));
                 auto result = worker.execute(command);
-                if (model.requires_process_exit() || experts.requires_process_exit()) std::_Exit(2);
+                if (result.failure) std::cerr << "WORKER_FAIL rank=" << rank << " step=" << command.step
+                                              << " reason=" << result.failure.detail << std::endl;
+                if (model.requires_process_exit() || experts.requires_process_exit() || execution.requires_process_exit()) std::_Exit(2);
                 if (result.status != StepStatus::completed) throw std::runtime_error(result.failure.detail);
                 return result;
             };
@@ -916,7 +977,7 @@ int main(int argc, char** argv) {
                     if (auto f = execution.plan(command, command.expected_collective_schedule)) return f;
                     const auto result = worker.execute(command);
                     // Checkpoint DMA can outlive a failed call. Exit before sampler/drafter CUDA destructors.
-                    if (model.requires_process_exit() || experts.requires_process_exit()) std::_Exit(2);
+                    if (model.requires_process_exit() || experts.requires_process_exit() || execution.requires_process_exit()) std::_Exit(2);
                     if (result.status != StepStatus::completed && result.status != StepStatus::cancelled)
                         return result.failure ? result.failure : Failure::fail(FailureCode::bad_operation, "worker did not complete serve step");
                     if (service_evidence) require(transcript.record_success(phase, request, token, position,
@@ -931,7 +992,7 @@ int main(int argc, char** argv) {
                         for (size_t row = 0; row < tokens.size(); ++row) command.positions.push_back(position + row);
                         if (auto f = execution.plan(command, command.expected_collective_schedule)) return f;
                         const auto result = worker.execute(command);
-                        if (model.requires_process_exit() || experts.requires_process_exit()) std::_Exit(2);
+                        if (model.requires_process_exit() || experts.requires_process_exit() || execution.requires_process_exit()) std::_Exit(2);
                         if (result.status != StepStatus::completed)
                             return result.failure ? result.failure : Failure::fail(FailureCode::comm_failed, "prefill chunk failed");
                         if (service_evidence)
@@ -967,7 +1028,7 @@ int main(int argc, char** argv) {
                 }
                 const auto service_result = run_autoregressive(uint32_t(rank), int32_t(geometry.n_vocab), uint32_t(context), callbacks,
                                           std::min(config.budgets.operation_ms, session.roster().budgets.operation_ms));
-                if (model.requires_process_exit() || experts.requires_process_exit()) std::_Exit(2);
+                if (model.requires_process_exit() || experts.requires_process_exit() || execution.requires_process_exit()) std::_Exit(2);
                 require(service_result);
             } else {
             std::unique_ptr<TokenTimingWriter> timing;

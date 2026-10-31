@@ -21,6 +21,7 @@ struct SlotPoolConfig {
     uint64_t checkpoint_max_bytes = 0;
     bool preagreed_collectives = false;
     ExpertOperandSchedule expert_operands;
+    std::function<Failure(const StepCommand&, uint64_t, bool)> memory_phase;
 };
 struct SlotPoolResources {
     const core::WeightTable& weights;

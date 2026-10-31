@@ -211,6 +211,58 @@ ranks exit 0, with eight exact logit rows, 2070 state comparisons, 1728 traces
 and 1964 reset comparisons. [The hybrid receipt][hybridmodel] qualifies this
 short case only; long prompts and performance remain pending.
 
+## Full-model graph progress
+
+The experimental `--model-graph 1` captures the complete single-token GPU
+forward, including 48 layers, the output head and NCCL collectives. Token
+embedding and PLE rows are prepared before replay; QSA reads persistent position
+buffers. The graph fixes the stream, context and position base. This first mode
+requires C1, compact device-routed experts and NCCL, and excludes MTP,
+multi-row prefill, trace observers and profiling. Defaults remain graph-off.
+
+The first candidate fails before replay because the NCCL capture session was
+not transitioned into capture before its first enqueue. That failed attempt is
+retained. After the explicit capture-start check, all three hosts exit zero:
+4703 graph nodes, 240 NCCL collectives and seven replays including RESET.
+Eight full-vocabulary rows, 2070 state comparisons and 1964 reset comparisons
+match TP1 bitwise under the unchanged numerical policy. Evidence:
+`/home/staticduo/tmp/strata-tp3-20261031/full-model-graph-retry/independent-qualification.json`.
+A subsequent pair of 128-token sequences performs 255 replays across RESET.
+All ranks exit zero; fourteen vocabulary rows and 5760 state comparisons are
+bitwise equal to TP1. Evidence is in
+`/home/staticduo/tmp/strata-tp3-20261031/full-model-graph-repeat2/independent-qualification.json`.
+The readback-lifetime review fix also passes the same 255-replay test with
+fourteen logits and 5760 state comparisons bitwise equal. The first model
+peer-loss injection exposes a real hang in ncclCommAbort, confirmed by GDB;
+the external 300-second watchdog kills the survivors. An independent host
+deadline and immediate process exit before failed-graph cleanup address that
+blocking call. The repeated fault test exits the surviving ranks with code 86
+approximately 15 seconds after the injected SIGKILL, using the agreed
+15000 ms operation deadline. Its receipt is
+`/home/staticduo/tmp/strata-tp3-20261031/full-model-graph-peerloss2/summary.json`.
+The watchdog candidate also passes 255 normal replays with RESET, fourteen
+logit rows and 5760 state comparisons bitwise equal to TP1:
+`/home/staticduo/tmp/strata-tp3-20261031/full-model-graph-watchdog-normal/independent-qualification.json`.
+No performance claim is made.
+
+## Device-side expert routing
+
+The opt-in `--device-expert-routing 1` keeps expert IDs on the GPU inside the
+expert provider. It requires batched collectives and compact exact operands.
+The eager layer protocol still reads IDs for all-rank agreement. This mode
+preserves the original weight codes and accumulation order.
+
+On DG3 GB10, the component fixture passes changing expert IDs at stable
+addresses, invalid-ID rejection, 100 alternating repetitions and the 80-row
+unpack limit. The original scalar component limits remain 1e-5 absolute and
+relative; compact operands are compared bitwise.
+
+A three-host short full-model run exits zero on every rank and matches the
+independent TP1 reference bitwise: eight full-vocabulary rows, 2070 state
+comparisons, 1728 trace comparisons and 1964 reset comparisons. Evidence is in
+`/home/staticduo/tmp/strata-tp3-20261031/device-routing-short/independent-qualification.json`.
+This validates the eager provider, not full-model CUDA Graph replay.
+
 ## NCCL graph sessions
 
 The explicit NCCL graph-session API passes a three-host CUDA smoke with the
@@ -249,6 +301,36 @@ requests. Each captured canonical input matches on all ranks. The
 [C8 combined receipt][c8allstate] compares 2736 logical state arrays and sixteen
 final logit rows with zero error. These checks concern short requests and state
 isolation; their overlapping run times are not benchmark results.
+
+## Explicit memory phase records
+
+`--memory-phase-file` writes a fresh, bounded per-rank JSONL record. It samples
+`cudaMemGetInfo` after allocation, after the first prefill chunk, at the first
+decode boundary and before/after reset. The UTC labels describe those exact
+points; they do not claim a process allocation total or a high-water mark.
+C4/C8 slots can use the same optional callback, with separate request/slot IDs.
+
+A C1 HTTP request with context 8192 and expert-row prefill chunks of eight
+records all seven configured phases on all three ranks and returns the group
+to ready. Evidence:
+`/home/staticduo/tmp/strata-tp3-20261031/memory-phase-service/memory-summary.json`.
+This run overlaps long-context correctness work. Its allocator availability
+cannot establish isolated capacity or performance. The offline telemetry report
+keeps host RSS/PSS separate and retains UNKNOWN for missing historical phases:
+`/home/staticduo/tmp/strata-tp3-20261031/capacity-accounting/phase-report.md`.
+
+## Sampled verifier control
+
+The distributed MTP correctness path samples the target directly and admits
+proposals only when those target draws match. It does not use the upstream
+p/q rejection-sampling algorithm or claim batched verification acceleration.
+A CPU qualification uses 10000 seeds, 12 outputs per seed and history-dependent
+categorical probabilities. Every output and mock rollback state matches ordinary
+seeded sampling. It exercises 35739 accepted drafts and 74091 rejected windows;
+the first-token counts are 2060/3003/4937 against the frozen 0.2/0.3/0.5 law
+and a fixed 0.025 frequency band. All 95355 checks pass. This checks the verifier,
+not real-model sampling frequencies. Evidence:
+`/home/staticduo/tmp/strata-tp3-20261031/mtp-categorical-summary.json`.
 
 ## Failed attempts retained
 

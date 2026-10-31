@@ -2887,6 +2887,7 @@ if(STRATA_BUILD_DISTRIBUTED)
   # The opt-in core seam must have the same declaration in the engine and its consumers.
   target_compile_definitions(strata_engine PUBLIC STRATA_BUILD_DISTRIBUTED STRATA_DISTRIBUTED_CUDA)
   add_executable(strata-distributed src/program/distributed.cpp src/distributed/model.cpp
+                 src/distributed/graph_routes.cu
                  src/distributed/expert_model.cpp src/distributed/qsa_model.cpp
                  src/distributed/model_worker.cpp src/distributed/worker.cpp
                  src/distributed/session.cpp src/distributed/control_tcp.cpp
@@ -2983,6 +2984,11 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_include_directories(test_session PRIVATE include)
   target_link_libraries(test_session PRIVATE strata_warnings Threads::Threads)
   add_test(NAME test_session COMMAND test_session)
+
+  add_executable(test_memory_phase tests/distributed/test_memory_phase.cpp)
+  target_include_directories(test_memory_phase PRIVATE include)
+  target_link_libraries(test_memory_phase PRIVATE strata_warnings)
+  add_test(NAME test_memory_phase COMMAND test_memory_phase)
 
   # the shard-aware projection primitives in their CPU scalar form: gate/up with the monolithic SwiGLU, a down
   # partial at full width, the one reduction, a replicated term applied once, the padded gather, and the

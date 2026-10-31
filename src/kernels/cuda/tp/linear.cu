@@ -132,6 +132,38 @@ __global__ void down_lanes_compact_kernel(const uint8_t* weights, std::size_t st
         payload[(std::size_t(blockIdx.y) * nout + out) * slots + local_call] = op;
     }
 }
+template<int T>
+__global__ void down_lanes_compact_routed_kernel(const uint8_t* weights, std::size_t expert_stride,
+                                                 std::size_t row_stride, const int32_t* expert_ids,
+                                                 int expert_count, const uint8_t* q81,
+                                                 std::size_t activation_stride, float2* payload, int nout,
+                                                 int begin, int owned_calls, int slots, int* status) {
+    constexpr int qk = T == 20 ? 32 : 64;
+    const int out = int(blockIdx.x) * 4 + int(threadIdx.y), lane = int(threadIdx.x);
+    const int route = int(blockIdx.y);
+    if (out >= nout) return;
+    const int expert = expert_ids[route];
+    const std::size_t payload_offset = (std::size_t(route) * nout + out) * slots;
+    if (expert < 0 || expert >= expert_count) {
+        if (lane == 0) atomicExch(status, 1);
+        for (int call = lane; call < slots; call += 32) payload[payload_offset + call] = make_float2(0.f, 0.f);
+        return;
+    }
+    const auto* a = reinterpret_cast<const block_q8_1*>(q81 + std::size_t(route) * activation_stride);
+    const auto* row = weights + std::size_t(expert) * expert_stride + std::size_t(out) * row_stride;
+    for (int local_call = lane; local_call < slots; local_call += 32) {
+        float2 op = make_float2(0.f, 0.f);
+        if (local_call < owned_calls) {
+            const int call = begin / qk * 2 + local_call, global_block = call / 2;
+            op = operands<T>(row, a + global_block * (qk / 32), local_call / 2, call % 2);
+        }
+        payload[payload_offset + local_call] = op;
+    }
+}
+__global__ void routed_swiglu_kernel(const float* gate, const float* up, float* h, int64_t n) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) h[i] = (gate[i] / (1.0f + __expf(-gate[i]))) * up[i];
+}
 __global__ void finish_lanes_compact_kernel(const float2* payload, float* output, int calls,
                                             int nout, int rows, int end0, int end1, int slots) {
     const int out = int(blockIdx.x) * 4 + int(threadIdx.y), lane = int(threadIdx.x);
@@ -196,6 +228,46 @@ void down(const MatrixShard& w, const distributed::ActivationContract& c, const 
         down_kernel<42><<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
             p, w.row_stride, q, a.row_stride, partial, nout, a.width,
             int(w.slice.range_start), int(w.slice.range_end));
+    detail::check(cudaGetLastError());
+}
+
+void gate_up_routed(const MatrixShard& g, const MatrixShard& u, const distributed::ActivationContract& c,
+                    const GlobalQ81& a, const int32_t* ids, int expert_count,
+                    std::size_t gate_bytes_per_expert, std::size_t up_bytes_per_expert,
+                    int routed_rows, bool broadcast_input, float* gate_out, float* up_out, float* h,
+                    int* status, void* stream) {
+    detail::contract(c);
+    detail::matrix(g, 1); detail::matrix(u, 1);
+    detail::require(g.ggml_type != 20 && g.ggml_type != 42 && g.ggml_type == u.ggml_type &&
+                    (g.ggml_type == 16 || g.ggml_type == 17 || g.ggml_type == 18 ||
+                     g.ggml_type == 21 || g.ggml_type == 22 || g.ggml_type == 23) &&
+                    g.slice.global_shape == u.slice.global_shape &&
+                    g.slice.range_start == u.slice.range_start && g.slice.range_end == u.slice.range_end,
+                    "TP routed gate/up: ownership or codec mismatch");
+    detail::image(a, int(g.slice.global_shape[0]));
+    const int nout = int(g.slice.range_end - g.slice.range_start);
+    const auto rb = iq_row_bytes(g.ggml_type, a.width);
+    detail::require(ids && expert_count > 0 && routed_rows > 0 &&
+                    (broadcast_input ? a.rows == 1 : a.rows == routed_rows) &&
+                    gate_out && up_out && h && status && stream &&
+                    gate_out != up_out && h != gate_out && h != up_out &&
+                    nout <= std::numeric_limits<int>::max() / routed_rows &&
+                    gate_bytes_per_expert >= std::size_t(nout) * rb &&
+                    up_bytes_per_expert >= std::size_t(nout) * rb &&
+                    gate_bytes_per_expert <= std::numeric_limits<std::size_t>::max() / std::size_t(expert_count) &&
+                    up_bytes_per_expert <= std::numeric_limits<std::size_t>::max() / std::size_t(expert_count) &&
+                    g.bytes >= gate_bytes_per_expert * std::size_t(expert_count) &&
+                    u.bytes >= up_bytes_per_expert * std::size_t(expert_count) &&
+                    g.row_stride == rb && u.row_stride == rb &&
+                    reinterpret_cast<std::uintptr_t>(ids) % alignof(int32_t) == 0 &&
+                    reinterpret_cast<std::uintptr_t>(status) % alignof(int) == 0,
+                    "TP routed gate/up: invalid expert planes or buffers");
+    native_expert_gate_up_routed(g.ggml_type, g.data, u.data, gate_bytes_per_expert, up_bytes_per_expert,
+                                 ids, expert_count, a.data, a.row_stride, routed_rows, broadcast_input,
+                                 a.width, nout, gate_out, up_out, status, stream);
+    const int64_t count = int64_t(routed_rows) * nout;
+    routed_swiglu_kernel<<<unsigned((count + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        gate_out, up_out, h, count);
     detail::check(cudaGetLastError());
 }
 
@@ -285,6 +357,52 @@ void down_lanes_compact(const MatrixShard& w, const distributed::ActivationContr
         down_lanes_compact_kernel<42><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
             static_cast<const uint8_t*>(w.data), w.row_stride, static_cast<const uint8_t*>(a.data),
             a.row_stride, reinterpret_cast<float2*>(payload), nout, int(w.slice.range_start), calls, slot_width / 2);
+    detail::check(cudaGetLastError());
+}
+
+void down_lanes_compact_routed(const MatrixShard& w, const distributed::ActivationContract& c,
+                               const GlobalQ81& a, const int32_t* ids, int expert_count,
+                               std::size_t bytes_per_expert, float* payload, int slot_width,
+                               int* status, void* stream) {
+    detail::contract(c); detail::matrix(w, 0); detail::image(a, int(w.slice.global_shape[0]));
+    detail::require(c.valid_counts.size() == 3, "TP compact routed: three ownership counts required");
+    std::array<uint64_t, 3> valid{};
+    bool owned_cut = false;
+    int64_t begin = 0;
+    for (int rank = 0; rank < 3; ++rank) {
+        detail::require(c.valid_counts[rank] > 0 && c.valid_counts[rank] <= a.width - begin,
+                        "TP compact routed: invalid activation ownership");
+        valid[rank] = uint64_t(c.valid_counts[rank]);
+        owned_cut |= w.slice.range_start == begin && w.slice.range_end == begin + c.valid_counts[rank];
+        begin += c.valid_counts[rank];
+    }
+    const int qk = detail::block(w.ggml_type);
+    const int nout = int(w.slice.global_shape[1]);
+    detail::require(nout <= std::numeric_limits<int>::max() / a.rows,
+                    "TP compact routed: routed row geometry overflows");
+    const auto row_bytes = iq_row_bytes(w.ggml_type, int(w.slice.local_shape[0]));
+    const auto owned_calls = int(w.slice.range_end - w.slice.range_start) / qk * 2;
+    detail::require((w.ggml_type == 20 || w.ggml_type == 42) &&
+                    slot_width == compact_down_payload_width(w.ggml_type, a.width, valid) &&
+                    owned_cut && ids && expert_count > 0 && bytes_per_expert >= std::size_t(nout) * row_bytes &&
+                    bytes_per_expert <= std::numeric_limits<std::size_t>::max() / std::size_t(expert_count) &&
+                    w.bytes >= bytes_per_expert * std::size_t(expert_count) &&
+                    payload && status && stream &&
+                    reinterpret_cast<std::uintptr_t>(ids) % alignof(int32_t) == 0 &&
+                    reinterpret_cast<std::uintptr_t>(payload) % alignof(float2) == 0 &&
+                    reinterpret_cast<std::uintptr_t>(status) % alignof(int) == 0,
+                    "TP compact routed: invalid payload, expert planes, or ownership");
+    const dim3 grid((nout + 3) / 4, a.rows), threads(32, 4);
+    if (w.ggml_type == 20)
+        down_lanes_compact_routed_kernel<20><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const uint8_t*>(w.data), bytes_per_expert, w.row_stride, ids, expert_count,
+            static_cast<const uint8_t*>(a.data), a.row_stride, reinterpret_cast<float2*>(payload), nout,
+            int(w.slice.range_start), owned_calls, slot_width / 2, status);
+    else
+        down_lanes_compact_routed_kernel<42><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const uint8_t*>(w.data), bytes_per_expert, w.row_stride, ids, expert_count,
+            static_cast<const uint8_t*>(a.data), a.row_stride, reinterpret_cast<float2*>(payload), nout,
+            int(w.slice.range_start), owned_calls, slot_width / 2, status);
     detail::check(cudaGetLastError());
 }
 

@@ -4,6 +4,7 @@
 #include "strata/core/geometry.hpp"
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@ namespace strata::distributed {
 
 class ModelForward;
 class SessionCollectives;
+namespace nccl { class NcclApi; }
 
 struct ExpertOperandSchedule {
     bool compact = false;
@@ -41,9 +43,12 @@ struct ModelWorkerConfig {
     ExpertOperandSchedule expert_operands;
     bool prefill_batch_exactnative = false;
     bool prefill_expert_batch = false;
+    // Borrowed approved NCCL API. Non-null enables experimental C1 decode capture.
+    nccl::NcclApi* decode_graph_api = nullptr;
+    std::function<Failure(const StepCommand&, uint64_t position, bool before)> memory_phase;
 };
 
-// CUDA single-slot uncaptured bridge. Every slot owns a model; serialized slots may share collectives.
+// CUDA single-slot bridge with opt-in fixed-buffer graph replay. Serialized slots may share collectives.
 // Borrowed model, collectives, session, transport and stream outlive this
 // object. Init initializes the model and zeros request state. Candidate forward mutates private model
 // state, but no logits escape until explicit group commit. Failure permanently invalidates the model.
@@ -66,6 +71,7 @@ class ModelWorkerBackend final : public ExecutionBackend {
     // commit, after rollback/cancellation/reset/failure, or on followers. The coordinator alone samples/writes.
     const float* committed_logits() const;
     size_t logits_size() const;
+    bool requires_process_exit() const noexcept;
 
  private:
     struct Impl;

@@ -31,8 +31,9 @@ DISTRIBUTED_MAX_CONTEXT = 65792
 FLAGS = frozenset("rank rank0-address port session-uuid library-path nccl-version library-provenance model-hash config-fingerprint pack native ple context timeout-ms logits-dir".split())
 STATE_FLAGS = frozenset({"state-dir", "state-positions", "state-max-bytes"})
 TRACE_FLAGS = frozenset({"trace-dir"})
-POLICY_FLAGS = frozenset({"expert-collectives", "poll-interval-ms", "graph-finish", "expert-operands"})
-CAPTURE_FLAGS = frozenset({"collective-agreement", "profile-dir"})
+POLICY_FLAGS = frozenset({"expert-collectives", "poll-interval-ms", "graph-finish", "expert-operands",
+                          "device-expert-routing", "prefill-expert-batch", "model-graph"})
+CAPTURE_FLAGS = frozenset({"collective-agreement", "profile-dir", "memory-phase-file"})
 NETWORK_ENV = frozenset("NCCL_IB_HCA NCCL_SOCKET_IFNAME NCCL_IB_GID_INDEX NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE NCCL_IB_ROCE_VERSION_NUM NCCL_CROSS_NIC NCCL_IB_QPS_PER_CONNECTION NCCL_IB_TC NCCL_IB_SL NCCL_IB_TIMEOUT NCCL_IB_RETRY_CNT NCCL_NET_GDR_LEVEL NCCL_CUMEM_ENABLE NCCL_IB_MERGE_NICS NCCL_IB_SUBNET_AWARE_ROUTING NCCL_NET_MERGE_LEVEL NCCL_NVLS_ENABLE NCCL_IGNORE_CPU_AFFINITY".split())
 SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
@@ -66,11 +67,36 @@ def validated(config):
     graph_finish = options.get("graph-finish", "0")
     if graph_finish not in ("0", "1") or (graph_finish == "1" and options.get("expert-collectives") != "batched"):
         raise RunnerError("graph-finish must be 0 or 1 and requires batched expert collectives")
+    device_routing = options.get("device-expert-routing", "0")
+    if device_routing not in ("0", "1"):
+        raise RunnerError("device-expert-routing must be 0 or 1")
+    prefill_expert_batch = options.get("prefill-expert-batch", "0")
+    if prefill_expert_batch not in ("0", "1"):
+        raise RunnerError("prefill-expert-batch must be 0 or 1")
+    if device_routing == "1" and (
+        options.get("expert-collectives") != "batched" or
+        options.get("expert-operands") != "compact" or
+        graph_finish != "0" or prefill_expert_batch != "0"
+    ):
+        raise RunnerError(
+            "device-expert-routing requires batched compact experts, graph-finish 0, "
+            "and prefill-expert-batch 0"
+        )
+    model_graph = options.get("model-graph", "0")
+    if model_graph not in ("0", "1"):
+        raise RunnerError("model-graph must be 0 or 1")
+    if model_graph == "1" and (
+        device_routing != "1" or options.get("collective-agreement") != "step" or
+        "trace-dir" in options or "profile-dir" in options
+    ):
+        raise RunnerError("model-graph requires preagreed device routing without trace or profile observers")
     poll = options.get("poll-interval-ms", "1")
     if not poll.isdigit() or not 0 <= int(poll) <= 1000:
         raise RunnerError("poll interval must be in 0..1000 ms")
     if "trace-dir" in options and not Path(options["trace-dir"]).is_absolute():
         raise RunnerError("trace-dir must be absolute")
+    if "memory-phase-file" in options and not Path(options["memory-phase-file"]).is_absolute():
+        raise RunnerError("memory-phase-file must be absolute")
     if "profile-dir" in options:
         profile = Path(options["profile-dir"])
         if not profile.is_absolute():

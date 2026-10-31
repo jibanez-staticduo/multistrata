@@ -366,6 +366,27 @@ void sequence_and_one_in_flight() {
     check(backend.enqueues == 1, "and none of them reached the wire");
 }
 
+void completed_external_batch_advances_transport_cursor() {
+    std::printf("completed NCCL graph batches synchronize the eager transport cursor\n");
+    FakeClock clock;
+    FakeBackend backend(kTpWorld, 0, clock);
+    GuardedTransport transport(backend, clock);
+    const std::array<Operation, 3> completed{{op(1, 0, 1), op(2, 1, 1), op(3, 2, 1)}};
+    check(!transport.adopt_completed_batch(completed),
+          "a contiguous externally completed batch advances local sequence bookkeeping");
+    check(!transport.all_reduce_sum(buf_a(4, ScalarType::fp32), buf_b(4, ScalarType::fp32),
+                                    op(4, 3, 2), nullptr),
+          "the next eager operation continues after a graph batch");
+
+    FakeClock bad_clock;
+    FakeBackend bad_backend(kTpWorld, 0, bad_clock);
+    GuardedTransport bad_transport(bad_backend, bad_clock);
+    const std::array<Operation, 2> skipped{{op(1), op(3)}};
+    const auto bad = bad_transport.adopt_completed_batch(skipped);
+    check(bad.code == FailureCode::bad_operation && bad_backend.enqueues == 0,
+          "a non-contiguous batch cannot advance the transport cursor");
+}
+
 // ---------------------------------------------------------------- failures are terminal
 
 void enqueue_failure_is_final() {
@@ -664,6 +685,7 @@ int main() {
     rejects_before_enqueue();
     gather_contract();
     sequence_and_one_in_flight();
+    completed_external_batch_advances_transport_cursor();
     enqueue_failure_is_final();
     pending_async_error_is_reported();
     deadline_expiry_names_the_operation();

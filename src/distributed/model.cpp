@@ -1,4 +1,6 @@
 #include "strata/distributed/model.hpp"
+#include "strata/distributed/graph_routes.hpp"
+#include "nccl_api.hpp"
 #include "strata/distributed/qsa_model.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
@@ -87,9 +89,255 @@ struct CheckpointIo {
 SessionCollectives::SessionCollectives(Session& s, GuardedTransport& t, const Clock& c, uint32_t ms)
     : session_(s), transport_(t), clock_(c), timeout_ms_(ms) {}
 
+bool SessionCollectives::enter_capture(nccl::NcclApi* api, void* stream, std::string& err) {
+    if (capture_api_ || graph_capture_active_ || graph_captured_ || graph_quarantined_ ||
+        !api || !stream || !preagreed_ || profiling_ || expected_.empty()) {
+        err = "invalid NCCL graph capture state or unsupported capture mode";
+        return false;
+    }
+    GraphRouteWorkspace workspace{route_gathered_device_, route_status_device_};
+    if (workspace.gathered_ids == nullptr && !allocate_graph_route_workspace(workspace)) {
+        route_gathered_device_ = workspace.gathered_ids;
+        route_status_device_ = workspace.sticky_status;
+        err = "could not allocate persistent graph route buffers";
+        return false;
+    }
+    route_gathered_device_ = workspace.gathered_ids;
+    route_status_device_ = workspace.sticky_status;
+
+    captured_schedule_.clear();
+    captured_schedule_.reserve(expected_.size());
+    captured_schedule_.insert(captured_schedule_.end(), expected_.begin(), expected_.end());
+    capture_descriptor_.valid_counts.reserve(3);
+    observed_.clear();
+    observed_.reserve(expected_.size());
+    replay_schedule_.clear();
+    replay_schedule_.reserve(expected_.size());
+    replay_schedule_.insert(replay_schedule_.end(), expected_.begin(), expected_.end());
+    capture_cursor_ = 0;
+    capture_route_calls_ = 0;
+    capture_sequence_base_ = sequence_;
+    capture_api_ = api;
+    capture_stream_ = stream;
+    const auto prepared = api->prepare_graph_session(static_cast<cudaStream_t>(stream),
+                                                     expected_capture_collectives());
+    if (prepared) {
+        err = prepared.detail;
+        capture_api_ = nullptr;
+        capture_stream_ = nullptr;
+        return false;
+    }
+    graph_capture_active_ = true;
+    return true;
+}
+
+bool SessionCollectives::check_capture(std::string& err) {
+    if (!graph_capture_active_ || !capture_api_ || capture_cursor_ != expected_.size() ||
+        capture_route_calls_ != kFullC1GraphRouteCollectives) {
+        err = "captured NCCL graph did not consume the complete model and route schedule";
+        abort_capture(err);
+        return false;
+    }
+    const auto checked = capture_api_->check_graph_capture();
+    if (checked) {
+        err = checked.detail;
+        abort_capture(err);
+        return false;
+    }
+    return true;
+}
+
+bool SessionCollectives::finish_capture(std::string& err) {
+    if (!graph_capture_active_ || !capture_api_ || capture_cursor_ != expected_.size() ||
+        capture_route_calls_ != kFullC1GraphRouteCollectives ||
+        captured_schedule_.size() != expected_.size()) {
+        err = "captured NCCL graph did not consume the complete model and route schedule";
+        abort_capture(err);
+        return false;
+    }
+    const auto finished = capture_api_->finish_graph_capture();
+    if (finished) {
+        err = finished.detail;
+        abort_capture(err);
+        return false;
+    }
+    graph_capture_active_ = false;
+    graph_captured_ = true;
+    sequence_ = capture_sequence_base_;
+    return true;
+}
+
+bool SessionCollectives::prepare_replay(std::span<const ScheduledCollective> actual,
+                                        uint64_t step, Deadline deadline, std::string& err) {
+    if (!graph_captured_ || graph_capture_active_ || replay_prepared_ || graph_quarantined_ ||
+        actual.size() != expected_.size() || expected_.size() != captured_schedule_.size()) {
+        err = "NCCL graph replay was not prepared from a complete captured schedule";
+        return false;
+    }
+    if (profiling_) {
+        err = "profiling is disabled during NCCL graph replay";
+        return false;
+    }
+    replay_schedule_.clear();
+    for (size_t i = 0; i < actual.size(); ++i) {
+        auto item = actual[i];
+        const auto& captured = captured_schedule_[i];
+        const auto& actual_descriptor = item.descriptor;
+        const auto& captured_descriptor = captured.descriptor;
+        if (actual_descriptor.operation.sequence != sequence_ + i ||
+            actual_descriptor.operation.step != step ||
+            actual_descriptor.operation.layer != captured_descriptor.operation.layer ||
+            actual_descriptor.kind != captured_descriptor.kind ||
+            actual_descriptor.type != captured_descriptor.type ||
+            actual_descriptor.elements != captured_descriptor.elements ||
+            actual_descriptor.valid_counts != captured_descriptor.valid_counts ||
+            item.route != expected_[i].route || item.route != captured_schedule_[i].route) {
+            err = "replay shape or stage differs from captured NCCL schedule";
+            return false;
+        }
+        replay_schedule_.push_back(item);
+    }
+    std::vector<CollectiveScheduleEntry> remaining;
+    remaining.reserve(actual.size());
+    for (const auto& item : replay_schedule_) remaining.push_back({item.descriptor, item.route});
+    if (const auto f = session_.begin_preagreed_batch(remaining, deadline, replay_batch_)) {
+        err = f.detail;
+        return false;
+    }
+    if (!clear_graph_route_status(route_status_device_, capture_stream_)) {
+        err = "could not clear sticky graph route status before replay";
+        const auto failed = session_.complete_preagreed_batch(replay_batch_, false, deadline);
+        if (failed) err = failed.detail;
+        graph_quarantined_ = true;
+        capture_api_->comm_abort();
+        transport_.abort(err);
+        return false;
+    }
+    const auto begun = capture_api_->begin_captured_replay();
+    if (begun) {
+        err = begun.detail;
+        const auto failed = session_.complete_preagreed_batch(replay_batch_, false, deadline);
+        if (failed) err = failed.detail;
+        graph_quarantined_ = true;
+        capture_api_->comm_abort();
+        transport_.abort(err);
+        return false;
+    }
+    step_ = step;
+    observed_.clear();
+    replay_prepared_ = true;
+    replay_waited_ = false;
+    return true;
+}
+
+bool SessionCollectives::wait_replay(Deadline deadline, std::string& err) {
+    if (!replay_prepared_ || replay_waited_ || !capture_api_) {
+        err = "NCCL graph replay was not active";
+        return false;
+    }
+    const auto waited = capture_api_->wait_captured_replay(deadline);
+    if (waited) {
+        err = waited.detail;
+        graph_quarantined_ = true;
+        capture_api_->comm_abort();
+        transport_.abort(err);
+        return false;
+    }
+    replay_waited_ = true;
+    return true;
+}
+
+bool SessionCollectives::complete_replay(bool replay_succeeded, Deadline deadline,
+                                         std::string& err) {
+    if (!replay_prepared_ || !capture_api_ ||
+        (replay_succeeded && !replay_waited_)) {
+        err = "NCCL graph replay manifest is incomplete";
+        replay_succeeded = false;
+    }
+    const auto completed = session_.complete_preagreed_batch(replay_batch_, replay_succeeded, deadline);
+    replay_prepared_ = false;
+    replay_waited_ = false;
+    if (completed) {
+        err = completed.detail;
+        graph_quarantined_ = true;
+        capture_api_->comm_abort();
+        transport_.abort(err);
+        return false;
+    }
+    if (!replay_succeeded) {
+        if (err.empty()) err = "NCCL graph replay failed";
+        graph_quarantined_ = true;
+        capture_api_->comm_abort();
+        transport_.abort(err);
+        return false;
+    }
+    std::vector<Operation> operations;
+    operations.reserve(replay_schedule_.size());
+    for (const auto& item : replay_schedule_) operations.push_back(item.descriptor.operation);
+    if (const auto adopted = transport_.adopt_completed_batch(operations)) {
+        err = adopted.detail;
+        session_.abort(err);
+        capture_api_->comm_abort();
+        graph_quarantined_ = true;
+        return false;
+    }
+    sequence_ += replay_schedule_.size();
+    observed_.insert(observed_.end(), replay_schedule_.begin(), replay_schedule_.end());
+    return true;
+}
+
+bool SessionCollectives::leave_capture(std::string& err) {
+    if (!capture_api_ || graph_capture_active_ || replay_prepared_) {
+        err = "cannot end an active or unprepared NCCL graph session";
+        return false;
+    }
+    if (graph_quarantined_ || capture_api_->requires_process_exit()) return false;
+    const auto ended = capture_api_->end_graph_session();
+    if (ended) {
+        err = ended.detail;
+        return false;
+    }
+    capture_api_ = nullptr;
+    capture_stream_ = nullptr;
+    graph_captured_ = false;
+    GraphRouteWorkspace workspace{route_gathered_device_, route_status_device_};
+    free_graph_route_workspace(workspace);
+    route_gathered_device_ = nullptr;
+    route_status_device_ = nullptr;
+    return true;
+}
+
+void SessionCollectives::abort_capture(std::string_view reason) noexcept {
+    graph_quarantined_ = true;
+    if (capture_api_) capture_api_->comm_abort();
+    transport_.abort(reason);
+}
+
+bool SessionCollectives::requires_process_exit() const noexcept {
+    return graph_quarantined_ || (capture_api_ && capture_api_->requires_process_exit());
+}
+
+
 bool SessionCollectives::agree_routes(int64_t layer, const int* ids, int64_t k,
                                      void* stream, std::string& err) {
     if (!ids || k != 10 || !stream) { err = "invalid TP route agreement"; return false; }
+    if (graph_capture_active_ || replay_prepared_) {
+        if (!capture_api_ || stream != capture_stream_ ||
+            capture_route_calls_ >= kFullC1GraphRouteCollectives ||
+            layer != static_cast<int64_t>(capture_route_calls_)) {
+            err = "invalid captured TP route agreement";
+            return false;
+        }
+        const auto gathered = capture_api_->enqueue_all_gather(
+            ids, route_gathered_device_, 10, ScalarType::fp32, static_cast<cudaStream_t>(stream));
+        if (gathered) { err = gathered.detail; return false; }
+        if (!enqueue_graph_route_comparison(route_gathered_device_, route_status_device_, stream)) {
+            err = "could not enqueue captured TP route validation";
+            return false;
+        }
+        ++capture_route_calls_;
+        return true;
+    }
     std::array<int, 10> host{};
     Deadline deadline;
     if (const auto f = session_.operation_deadline(deadline)) { err = f.detail; return false; }
@@ -121,8 +369,10 @@ bool SessionCollectives::agree_routes(int64_t layer, const int* ids, int64_t k,
     return true;
 }
 
-bool SessionCollectives::execute(CollectiveDescriptor d, const char* stage, const float* in, float* out,
+bool SessionCollectives::execute(const CollectiveDescriptor& d, const char* stage, const float* in, float* out,
                                  void* stream, std::string& err) {
+    if (graph_capture_active_ || replay_prepared_)
+        return execute_captured(d, stage, in, out, stream, err);
     std::string actual, planned;
     if (observed_.size() >= expected_.size() ||
         canonical_collective(d, actual) ||
@@ -177,25 +427,82 @@ bool SessionCollectives::execute(CollectiveDescriptor d, const char* stage, cons
     return true;
 }
 
+bool SessionCollectives::execute_captured(const CollectiveDescriptor& d, const char* stage,
+                                          const float* in, float* out, void* stream,
+                                          std::string& err) {
+    const size_t cursor = capture_cursor_;
+    if (!capture_api_ || !stage || !in || !out || stream != capture_stream_ ||
+        !graph_capture_active_ || cursor >= expected_.size() ||
+        cursor >= captured_schedule_.capacity()) {
+        err = "invalid captured TP collective state";
+        return false;
+    }
+    const auto& planned = expected_[cursor];
+    if (d.operation.sequence != sequence_ ||
+        d.operation.layer != planned.descriptor.operation.layer ||
+        d.operation.step != step_ || d.kind != planned.descriptor.kind ||
+        d.type != planned.descriptor.type || d.elements != planned.descriptor.elements ||
+        d.valid_counts != planned.descriptor.valid_counts ||
+        std::char_traits<char>::compare(stage, planned.route.c_str(),
+                                        planned.route.size() + 1) != 0) {
+        err = "actual TP operation differs from captured command schedule";
+        return false;
+    }
+    Failure result;
+    if (d.kind == CollectiveKind::all_reduce_sum) {
+        result = capture_api_->enqueue_all_reduce_sum(
+            in, out, d.elements, d.type, static_cast<cudaStream_t>(stream));
+    } else if (d.kind == CollectiveKind::all_gather_padded) {
+        result = capture_api_->enqueue_all_gather(
+            in, out, d.elements, d.type, static_cast<cudaStream_t>(stream));
+    } else {
+        err = "unsupported collective kind during NCCL graph capture";
+        return false;
+    }
+    if (result) {
+        err = result.detail;
+        return false;
+    }
+    ++capture_cursor_;
+    ++sequence_;
+    return true;
+}
+
 bool SessionCollectives::reduce(int64_t layer, const char* stage, const float* in, float* out,
                                 size_t n, void* stream, std::string& err) {
+    if (graph_capture_active_) {
+        capture_descriptor_.operation = {sequence_, static_cast<uint32_t>(layer), step_};
+        capture_descriptor_.kind = CollectiveKind::all_reduce_sum;
+        capture_descriptor_.type = ScalarType::fp32;
+        capture_descriptor_.elements = n;
+        capture_descriptor_.valid_counts.clear();
+        return execute(capture_descriptor_, stage, in, out, stream, err);
+    }
     CollectiveDescriptor d;
     d.operation = {sequence_, static_cast<uint32_t>(layer), step_};
     d.elements = n;
     if (!execute(d, stage, in, out, stream, err)) return false;
-    observed_.push_back({d, stage});
+    if (!graph_capture_active_) observed_.push_back({d, stage});
     return true;
 }
 
 bool SessionCollectives::gather(int64_t layer, const char* stage, const float* in, float* out,
                                 std::array<uint64_t, 3> valid, void* stream, std::string& err) {
+    if (graph_capture_active_) {
+        capture_descriptor_.operation = {sequence_, static_cast<uint32_t>(layer), step_};
+        capture_descriptor_.kind = CollectiveKind::all_gather_padded;
+        capture_descriptor_.type = ScalarType::fp32;
+        capture_descriptor_.elements = *std::max_element(valid.begin(), valid.end());
+        capture_descriptor_.valid_counts.assign(valid.begin(), valid.end());
+        return execute(capture_descriptor_, stage, in, out, stream, err);
+    }
     CollectiveDescriptor d;
     d.operation = {sequence_, static_cast<uint32_t>(layer), step_};
     d.kind = CollectiveKind::all_gather_padded;
     d.elements = *std::max_element(valid.begin(), valid.end());
     d.valid_counts.assign(valid.begin(), valid.end());
     if (!execute(d, stage, in, out, stream, err)) return false;
-    observed_.push_back({d, stage});
+    if (!graph_capture_active_) observed_.push_back({d, stage});
     return true;
 }
 
@@ -233,6 +540,15 @@ struct ModelForward::Impl {
     ParityObserver observer;
     bool ready = false;
     bool failed = false;
+    bool prepared_graph_captured = false;
+    bool prepared_token_pending = false;
+    bool prepared_token_enqueued = false;
+    int32_t prepared_graph_base = 0;
+    void* prepared_graph_stream = nullptr;
+    void* prepared_token_stream = nullptr;
+    int32_t prepared_token = -1;
+    int32_t prepared_base = 0;
+    int64_t prepared_position = -1;
     int64_t next_position = 0;
     int32_t checkpoint_position_base = 0;
     bool checkpoint_exit = false;
@@ -386,6 +702,18 @@ ModelForward::ModelForward(const core::WeightTable& w, const core::ModelGeometry
 ModelForward::~ModelForward() = default;
 const core::ModelGeometry& ModelForward::geometry() const { return impl_->geometry; }
 int64_t ModelForward::next_position() const { return impl_->next_position; }
+bool ModelForward::validate_execution_status(void* stream, std::string& err) {
+    auto& p = *impl_;
+    if (!p.ready || p.failed || !stream) {
+        err = "TP execution status requires a ready model and stream";
+        return false;
+    }
+    if (!p.experts.validate_execution_status(stream, err)) {
+        p.failed = true;
+        return false;
+    }
+    return true;
+}
 std::vector<GdnStateSource> ModelForward::state_sources() const {
     const auto& p = *impl_;
     if (!p.ready || p.failed) throw std::runtime_error("GDN evidence requires a live initialized model");
@@ -419,7 +747,7 @@ bool ModelForward::capture_checkpoint(ModelCheckpoint& checkpoint, ModelCheckpoi
                                       std::string& err) {
     checkpoint.clear();
     auto& p = *impl_;
-    if (!p.ready || p.failed || !stream || id.rank != uint32_t(p.rank) ||
+    if (!p.ready || p.failed || p.prepared_token_pending || !stream || id.rank != uint32_t(p.rank) ||
         id.max_context != uint64_t(p.state.max_cells) ||
         (p.next_position && id.position_base != p.checkpoint_position_base) ||
         std::chrono::steady_clock::now() >= deadline) {
@@ -450,7 +778,7 @@ bool ModelForward::capture_checkpoint(ModelCheckpoint& checkpoint, ModelCheckpoi
 bool ModelForward::restore_checkpoint(const ModelCheckpoint& checkpoint, ModelCheckpointIdentity id,
                                       void* stream, CheckpointDeadline deadline, std::string& err) {
     auto& p = *impl_;
-    if (!p.ready || p.failed || !stream || id.rank != uint32_t(p.rank) ||
+    if (!p.ready || p.failed || p.prepared_token_pending || !stream || id.rank != uint32_t(p.rank) ||
         id.max_context != uint64_t(p.state.max_cells) || std::chrono::steady_clock::now() >= deadline) {
         p.failed = true; err = "checkpoint restore requires live model, matching rank/capacity and deadline"; return false;
     }
@@ -611,7 +939,10 @@ bool ModelForward::configure_prefill_expert_batch(bool enabled, std::string& err
 
 bool ModelForward::reset(void* stream, std::string& err) {
     auto& p = *impl_;
-    if (!p.ready || p.failed || !stream) { err = "TP model is not ready for reset"; return false; }
+    if (!p.ready || p.failed || p.prepared_token_pending || !stream) {
+        err = "TP model is not ready for reset";
+        return false;
+    }
     try {
         const auto& m = p.maps[p.rank];
         checked(cudaMemsetAsync(p.states, 0, 36 * (m.state_elements() + m.history_elements()) * sizeof(float),
@@ -663,12 +994,15 @@ bool ModelForward::mixer(int64_t layer, int64_t pos, int32_t base, const float* 
 bool ModelForward::token(int32_t token, int64_t pos, int32_t base,
                          float* logits, void* stream, std::string& err) {
     auto& p = *impl_;
-    if (!p.ready || p.failed || !stream || !logits || pos != p.next_position ||
+    if (!p.ready || p.failed || p.prepared_token_pending || !stream || !logits || pos != p.next_position ||
         token < 0 || token >= p.geometry.n_vocab || pos >= p.state.max_cells) {
         err = "TP token requires ready C1 state, consecutive position and valid token/output/stream";
         return false;
     }
     try {
+        if (!p.experts.clear_execution_status(stream, err)) {
+            p.failed = true; return false;
+        }
         for (int64_t j = 0; j < p.geometry.n_qsa_layers(); ++j) {
             auto& q = p.state.qsa_states[j];
             kernels::qsa_step_fill(q.host_step, pos, core::qsa_shapes(p.geometry));
@@ -719,10 +1053,122 @@ bool ModelForward::token(int32_t token, int64_t pos, int32_t base,
     } catch (const std::exception& e) { p.failed = true; err = e.what(); return false; }
 }
 
+bool ModelForward::prepare_token(int32_t token, int64_t pos, int32_t base,
+                                 void* stream, std::string& err) {
+    auto& p = *impl_;
+    if (!p.ready || p.failed || p.prepared_token_pending || !stream ||
+        (p.prepared_graph_captured && stream != p.prepared_graph_stream) ||
+        pos != p.next_position || token < 0 || token >= p.geometry.n_vocab ||
+        pos < 0 || pos >= p.state.max_cells || base < 0 || base % 4 ||
+        (pos > 0 && base != p.checkpoint_position_base) ||
+        (p.prepared_graph_captured && base != p.prepared_graph_base) ||
+        int64_t(base) + pos >= p.state.max_cells ||
+        int64_t(base) + p.state.max_cells > INT32_MAX || p.observer) {
+        err = "TP prepared token requires ready observer-free C1 state and a valid fixed-base consecutive token";
+        return false;
+    }
+    try {
+        if (!p.experts.clear_execution_status(stream, err)) {
+            p.failed = true;
+            return false;
+        }
+        for (int64_t j = 0; j < p.geometry.n_qsa_layers(); ++j) {
+            auto& q = p.state.qsa_states[j];
+            kernels::qsa_step_fill(q.host_step, pos, core::qsa_shapes(p.geometry));
+            for (int64_t h = 0; h < p.geometry.n_head; ++h)
+                q.host_pos[h] = static_cast<int32_t>(base + pos);
+        }
+        p.state.ple_token = token;
+        if (!core::ple_stage_token(p.state.ple, stream, err) ||
+            !core::embed_row(p.weights, p.geometry, token, p.embedding, stream, err)) {
+            p.failed = true;
+            return false;
+        }
+        p.prepared_token = token;
+        p.prepared_base = base;
+        p.prepared_position = pos;
+        p.prepared_token_stream = stream;
+        p.prepared_token_pending = true;
+        p.prepared_token_enqueued = false;
+        return true;
+    } catch (const std::exception& e) {
+        p.failed = true;
+        err = e.what();
+        return false;
+    }
+}
+
+bool ModelForward::enqueue_prepared_token(float* logits, void* stream, std::string& err) {
+    auto& p = *impl_;
+    if (!p.ready || p.failed || !p.prepared_token_pending || p.prepared_graph_captured ||
+        p.prepared_token_enqueued ||
+        !stream || !logits ||
+        p.prepared_position != p.next_position || p.prepared_token_stream != stream || p.observer) {
+        err = "TP prepared enqueue requires a staged consecutive token and output/stream";
+        return false;
+    }
+    try {
+        for (int64_t c = 0; c < p.geometry.hc; ++c)
+            checked(cudaMemcpyAsync(p.state.R + c * p.geometry.n_embd, p.embedding,
+                                   size_t(p.geometry.n_embd) * sizeof(float), cudaMemcpyDeviceToDevice,
+                                   static_cast<cudaStream_t>(stream)));
+        for (int64_t layer = 0; layer < p.geometry.n_layers; ++layer) {
+            const auto& qs = p.state.qsa_states[layer / p.geometry.qsa_interval];
+            if (!core::block_layer_pre(p.weights, p.geometry, layer, p.prepared_position, p.prepared_base,
+                                       p.state.gdn, qs, p.state.qsa_bufs, p.state.moe, p.state.k,
+                                       p.state.block, stream, err, nullptr, &p.state.ple, 0, 0, this) ||
+                !p.collectives.agree_routes(layer, p.state.moe.ids, p.state.k, stream, err) ||
+                !p.experts.forward(layer, p.state.block.mixed, p.state.moe.ids,
+                                   p.state.k, p.parts, stream, err) ||
+                !core::block_layer_post(p.weights, p.geometry, layer, p.state.k, p.state.moe,
+                                        p.state.block, p.parts, stream, err, this)) {
+                p.failed = true;
+                err = "prepared layer " + std::to_string(layer) + ": " + err;
+                return false;
+            }
+        }
+        if (p.head ? (!core::lm_head_mix(p.weights, p.geometry, p.state.block, stream, err) ||
+                       !p.head->run(p.state.block.mixed, logits, stream, err))
+                   : !core::lm_head(p.weights, p.geometry, p.state.block, logits, stream, err)) {
+            p.failed = true;
+            return false;
+        }
+        p.prepared_token_enqueued = true;
+        p.prepared_graph_captured = true;
+        p.prepared_graph_base = p.prepared_base;
+        p.prepared_graph_stream = stream;
+        return true;
+    } catch (const std::exception& e) {
+        p.failed = true;
+        err = e.what();
+        return false;
+    }
+}
+
+bool ModelForward::complete_prepared_token(std::string& err) {
+    auto& p = *impl_;
+    if (!p.ready || p.failed || !p.prepared_token_pending ||
+        (!p.prepared_token_enqueued && !p.prepared_graph_captured) ||
+        p.prepared_position != p.next_position) {
+        err = "TP prepared completion requires one staged, not-yet-committed token";
+        return false;
+    }
+    p.state.ple_prev[0] = p.state.ple_prev[1];
+    p.state.ple_prev[1] = p.prepared_token;
+    ++p.next_position;
+    p.checkpoint_position_base = p.prepared_base;
+    p.prepared_token_pending = false;
+    p.prepared_token_enqueued = false;
+    p.prepared_token = -1;
+    p.prepared_position = -1;
+    p.prepared_token_stream = nullptr;
+    return true;
+}
+
 bool ModelForward::tokens(const std::vector<int32_t>& tokens, int64_t pos, int32_t base,
                           float* logits, void* stream, std::string& err) {
     auto& p = *impl_;
-    if (!p.ready || p.failed || !p.batch_enabled || !stream || !logits ||
+    if (!p.ready || p.failed || p.prepared_token_pending || !p.batch_enabled || !stream || !logits ||
         !kernels::native_mmvq_multi_exact() || tokens.size() < 2 || tokens.size() > 8 ||
         pos != p.next_position || pos < 0 || pos + int64_t(tokens.size()) > p.state.max_cells ||
         base < 0 || base % 4 || int64_t(base) + pos + int64_t(tokens.size()) > p.state.max_cells) {
@@ -740,6 +1186,9 @@ bool ModelForward::tokens(const std::vector<int32_t>& tokens, int64_t pos, int32
         }
     }
     try {
+        if (!p.experts.clear_execution_status(stream, err)) {
+            p.failed = true; return false;
+        }
         const size_t rows = tokens.size();
         const size_t residual_floats = size_t(p.geometry.hc * p.geometry.n_embd);
         for (size_t row = 0; row < rows; ++row) {

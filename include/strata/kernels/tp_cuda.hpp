@@ -46,6 +46,14 @@ void gate_up(const MatrixShard& gate, const MatrixShard& up,
              float* gate_out, float* up_out, float* h, void* stream,
              const float* gate_scale = nullptr, const float* up_scale = nullptr);
 
+// Routed rows select one expert ID each on device. The bases point at expert
+// zero, with byte strides between expert planes; input rows can be shared.
+void gate_up_routed(const MatrixShard& gate, const MatrixShard& up,
+                    const distributed::ActivationContract& contract, const GlobalQ81& input,
+                    const int32_t* device_ids, int expert_count, std::size_t gate_bytes_per_expert,
+                    std::size_t up_bytes_per_expert, int routed_rows, bool broadcast_input,
+                    float* gate_out, float* up_out, float* h, int* device_status, void* stream);
+
 // Input-sharded IQ4_NL / Q2_0. Reads owned blocks from a GLOBAL activation image
 // and writes rows * global_output floats. Sum rank partials before any bias,
 // expert scale or router weighting. Prefill uses the same MMVQ arithmetic per
@@ -77,6 +85,10 @@ int compact_down_payload_width(int ggml_type, int input_width,
                                std::array<uint64_t, 3> valid_input);
 void down_lanes_compact(const MatrixShard&, const distributed::ActivationContract&,
                         const GlobalQ81&, float* operands, int slot_width, void* stream);
+void down_lanes_compact_routed(const MatrixShard&, const distributed::ActivationContract&,
+                               const GlobalQ81&, const int32_t* device_ids, int expert_count,
+                               std::size_t bytes_per_expert, float* operands, int slot_width,
+                               int* device_status, void* stream);
 void finish_down_lanes_compact(const float* rank_major_operands, int ggml_type,
                                int input_width, int output_width, int rows,
                                std::array<uint64_t, 3> valid_input, int slot_width,

@@ -99,6 +99,73 @@ def test_explicit_expert_operand_policy(config, value):
     assert runner.validated(config)["options"]["expert-operands"] == value
 
 
+def test_device_expert_routing_requires_exact_batched_compact_policy(config):
+    default = runner.validated(config)
+    assert default["options"].get("device-expert-routing", "0") == "0"
+
+    valid = list(config["args"]) + [
+        "--expert-collectives", "batched",
+        "--expert-operands", "compact",
+        "--device-expert-routing", "1",
+    ]
+    assert runner.validated(dict(config, args=valid))["options"]["device-expert-routing"] == "1"
+
+    for extra in (
+        ["--expert-collectives", "sequential", "--expert-operands", "compact"],
+        ["--expert-collectives", "batched", "--expert-operands", "full"],
+        ["--expert-collectives", "batched", "--expert-operands", "compact", "--graph-finish", "1"],
+        ["--expert-collectives", "batched", "--expert-operands", "compact", "--prefill-expert-batch", "1"],
+    ):
+        with pytest.raises(runner.RunnerError):
+            runner.validated(dict(config, args=list(config["args"]) + extra + [
+                "--device-expert-routing", "1",
+            ]))
+
+
+@pytest.mark.parametrize("value", ["", "2", "01", "true"])
+def test_device_expert_routing_rejects_invalid_values(config, value):
+    config["args"] += ["--device-expert-routing", value or " "]
+    with pytest.raises(runner.RunnerError):
+        runner.validated(config)
+
+
+def test_device_expert_routing_flag_is_forwarded(config):
+    config["args"] += ["--expert-collectives", "batched", "--expert-operands", "compact",
+                       "--device-expert-routing", "1"]
+    assert runner.run(config)["command"][-2:] == ["--device-expert-routing", "1"]
+
+
+def test_model_graph_requires_preagreed_device_routing_and_no_observers(config):
+    base = list(config["args"]) + ["--expert-collectives", "batched", "--expert-operands", "compact",
+                                   "--device-expert-routing", "1", "--collective-agreement", "step"]
+    valid = base + ["--model-graph", "1"]
+    assert runner.validated(dict(config, args=valid))["options"]["model-graph"] == "1"
+    assert runner.run(dict(config, args=valid))["command"][-2:] == ["--model-graph", "1"]
+    for key, value in [("device-expert-routing", "0"), ("collective-agreement", "per-op")]:
+        changed = valid.copy()
+        changed[changed.index("--" + key) + 1] = value
+        with pytest.raises(runner.RunnerError):
+            runner.validated(dict(config, args=changed))
+    for extra in [["--trace-dir", "/tmp/trace"], ["--profile-dir", "/tmp/profile"]]:
+        with pytest.raises(runner.RunnerError):
+            runner.validated(dict(config, args=valid + extra))
+
+
+@pytest.mark.parametrize("value", ["2", "01", "true", "-1"])
+def test_model_graph_rejects_invalid_values(config, value):
+    config["args"] += ["--model-graph", value]
+    with pytest.raises(runner.RunnerError):
+        runner.validated(config)
+
+
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_prefill_expert_batch_is_forwarded_and_validated(config, value):
+    config["args"] += ["--prefill-expert-batch", value]
+    options = runner.validated(config)["options"]
+    assert options["prefill-expert-batch"] == value
+    assert runner.run(config)["command"][-2:] == ["--prefill-expert-batch", value]
+
+
 @pytest.mark.parametrize("value", ["compressed", "", "COMPACT"])
 def test_expert_operand_policy_rejects_unknown(config, value):
     config["args"] += ["--expert-operands", value]
@@ -267,3 +334,11 @@ def test_context_capacity_matches_native_header(config):
     args = list(config["args"])
     args[args.index("--context") + 1] = str(runner.DISTRIBUTED_MAX_CONTEXT)
     assert runner.validated(dict(config, args=args))["options"]["context"] == "65792"
+
+
+def test_memory_phase_file_is_opt_in_and_absolute(config, tmp_path):
+    config["args"] += ["--memory-phase-file", str(tmp_path / "memory.jsonl")]
+    assert runner.validated(config)["options"]["memory-phase-file"].endswith("memory.jsonl")
+    config["args"][-1] = "relative.jsonl"
+    with pytest.raises(runner.RunnerError):
+        runner.validated(config)

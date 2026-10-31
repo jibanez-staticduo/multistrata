@@ -296,9 +296,77 @@ void consecutive_windows() {
               "multiple windows preserve ordinary seeded output history and full state across rejected draw attempts");
     }
 }
+
+void categorical_sampling_qualification() {
+    // Freeze the target law and acceptance bands before observing the samples.
+    constexpr size_t seeds = 10000, output_count = 12;
+    std::array<size_t, 3> histogram{};
+    size_t rejected = 0, accepted = 0;
+    auto draw = [](uint64_t seed, uint64_t index, const std::vector<int32_t>& history) {
+        uint64_t value = seed * 0x9e3779b97f4a7c15ULL + index;
+        value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+        value ^= value >> 31;
+        const double u = double(value >> 11) * 0x1.0p-53;
+        const int shift = history.empty() ? 0 : history.back() % 3;
+        return int32_t(((u < .2) ? 0 : (u < .5 ? 1 : 2)) + shift) % 3;
+    };
+    for (uint64_t seed = 0; seed < seeds; ++seed) {
+        Fake f;
+        auto callbacks = f.callbacks();
+        callbacks.sample = [&](const auto& history, uint64_t index, int32_t& token) {
+            token = draw(seed, index, history);
+            return Failure{};
+        };
+        SpeculativeVerifier verifier(0, 97, 64);
+        SpeculativeWindow w{"categorical", 0, 3, 0, {4}, {1, 2, 3}, output_count};
+        auto reference_history = w.history;
+        State reference_state = f.state;
+        std::vector<int32_t> expected, actual;
+        int32_t feedback = 4;
+        for (size_t row = 0; row < output_count; ++row) {
+            reference_history.push_back(feedback);
+            advance(reference_state, feedback);
+            feedback = draw(seed, row, reference_history);
+            expected.push_back(feedback);
+        }
+        while (actual.size() < output_count) {
+            ++w.window_id;
+            // Deliberately biased proposals independent of the target draws.
+            while (w.inputs.size() < 5) w.inputs.push_back(int32_t((seed + w.window_id) % 3));
+            f.records = 0;
+            f.recorded_states.clear();
+            SpeculativeResult result;
+            check(!verifier.verify(w, callbacks, result), "categorical MTP window completes");
+            if (result.tokens.empty()) return;
+            accepted += result.accepted_drafts;
+            rejected += result.accepted_rows < std::min(w.inputs.size(), size_t(w.output_budget));
+            actual.insert(actual.end(), result.tokens.begin(), result.tokens.end());
+            w.history.insert(w.history.end(), result.consumed_inputs.begin(), result.consumed_inputs.end());
+            w.inputs = {result.next_feedback};
+            w.position = result.next_position;
+            w.draw_base += result.tokens.size();
+            w.output_budget = output_count - actual.size();
+        }
+        check(actual == expected && f.state == reference_state && w.history == reference_history,
+              "categorical MTP preserves every seeded ordinary draw and rollback state");
+        // First input is 4, so undo its history-dependent rotation.
+        ++histogram[size_t((actual.front() + 2) % 3)];
+    }
+    check(accepted > 0 && rejected > 0, "categorical qualification exercises acceptance and rejection");
+    for (size_t token = 0; token < 3; ++token) {
+        const double expected = std::array{.2, .3, .5}[token];
+        const double observed = double(histogram[token]) / seeds;
+        check(observed > expected - .025 && observed < expected + .025,
+              "categorical output law remains within frozen 2.5 percentage point band");
+    }
+    std::printf("categorical sampling seeds=%zu law_counts=%zu,%zu,%zu accepted_drafts=%zu rejected_windows=%zu\n",
+                seeds, histogram[0], histogram[1], histogram[2], accepted, rejected);
+}
 }
 int main() {
     oracle_cases(); invalid_windows(); failures_withhold(); consecutive_windows();
+    categorical_sampling_qualification();
     std::printf("speculative CPU oracle: %d checks, %d failures (no model/GPU execution)\n", checks, failures);
     return failures ? 1 : 0;
 }

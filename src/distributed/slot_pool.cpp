@@ -94,7 +94,10 @@ struct SlotPool::Impl {
         try {
             if (resources.external_requires_process_exit && resources.external_requires_process_exit()) return true;
         } catch (...) { return true; }
-        for (const auto& slot : slots) if (slot->model && slot->model->requires_process_exit()) return true;
+        for (const auto& slot : slots) {
+            if (slot->model && slot->model->requires_process_exit()) return true;
+            if (slot->backend && slot->backend->requires_process_exit()) return true;
+        }
         return false;
     }
     void abort() noexcept {
@@ -169,6 +172,7 @@ Failure SlotPool::initialize() {
             ModelWorkerConfig backend{worker, p.resources.stream, 0, c.batched_expert_collectives,
                                        c.checkpoint_max_bytes, c.context, c.preagreed_collectives,
                                        c.expert_operands};
+            backend.memory_phase = c.memory_phase;
             slot.backend = std::make_unique<ModelWorkerBackend>(backend, *slot.model, p.resources.collectives,
                               p.resources.session, p.resources.transport);
             slot.worker = std::make_unique<Worker>(worker, *slot.backend);

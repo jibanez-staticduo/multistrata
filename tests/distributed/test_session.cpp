@@ -1400,6 +1400,51 @@ std::vector<CollectiveScheduleEntry> schedule_entries(uint64_t first, size_t cou
     return entries;
 }
 
+std::string schedule_payload_for_test(const std::vector<CollectiveScheduleEntry>& entries,
+                                      std::string_view label, uint64_t generation = 1) {
+    std::string out;
+    auto u32 = [&](uint32_t n) { for (int shift : {24,16,8,0}) out.push_back(char((n >> shift) & 255)); };
+    auto field = [&](std::string_view value) { u32(uint32_t(value.size())); out.append(value); };
+    field(label);
+    u32(uint32_t(generation >> 32)); u32(uint32_t(generation));
+    u32(uint32_t(entries.size()));
+    for (const auto& entry : entries) {
+        std::string signature;
+        canonical_collective(entry.descriptor, signature);
+        field(signature);
+        field(entry.stage);
+    }
+    return out;
+}
+
+void queue_control_agreement(Harness& h, uint64_t sequence, std::string_view label,
+                             std::string_view payload) {
+    const auto exact = control_payload(sequence, label, payload);
+    for (uint32_t rank : {1u, 2u}) h.channel.recv_frames.push_back(from(rank, FrameKind::control, exact));
+    for (uint32_t rank : {1u, 2u}) h.channel.recv_frames.push_back(from(rank, FrameKind::control_ack, exact));
+}
+
+std::string batch_identity_for_test(const PreagreedBatch& batch) {
+    std::string payload;
+    auto u32 = [&](uint32_t n) { for (int shift : {24,16,8,0}) payload.push_back(char((n >> shift) & 255)); };
+    u32(uint32_t(batch.generation >> 32)); u32(uint32_t(batch.generation));
+    u32(uint32_t(batch.cursor >> 32)); u32(uint32_t(batch.cursor));
+    u32(uint32_t(batch.count >> 32)); u32(uint32_t(batch.count));
+    return payload;
+}
+
+void queue_batch_schedule(Harness& h, const std::vector<CollectiveScheduleEntry>& entries,
+                          std::string_view label, uint64_t control_sequence = 1,
+                          uint64_t generation = 1) {
+    const std::string payload = schedule_payload_for_test(entries, label, generation);
+    const std::string tag = "collective-schedule-v1:bytes=" + std::to_string(payload.size()) + ":part=0/1";
+    queue_control_agreement(h, control_sequence, tag, payload);
+}
+
+void queue_batch_admission(Harness& h, const PreagreedBatch& batch) {
+    queue_control_agreement(h, 2, "preagreed-batch-admit-v1", batch_identity_for_test(batch));
+}
+
 void preagreed_schedule_over_tcp() {
     // A full old 1056-op step crosses the chunk boundary; no per-op TCP is needed after install.
     for (int mismatch = -1; mismatch < 4; ++mismatch) {
@@ -1526,6 +1571,155 @@ void preagreed_local_gates() {
         check(bool(session.agree_operation_schedule(entries, "limits", {h.clock.now() + std::chrono::seconds(1)})) &&
               !session.ready(), "empty/excess-entry/one-MiB/excess-stage plans fail terminally before install");
         check(h.channel.sent.size() <= before + 2, "invalid plan sends only terminal aborts, no schedule prefix");
+    }
+}
+
+void preagreed_batch_gates() {
+    std::printf("preagreed batch admission and replay completion (CPU)\n");
+    const Deadline future = [] {
+        return Deadline{std::chrono::steady_clock::now() + std::chrono::seconds(2)};
+    }();
+    {
+        Harness h; queue_coordinator_ready(h);
+        auto session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "batch success fixture reaches READY");
+        auto entries = schedule_entries(1, 3);
+        queue_batch_schedule(h, entries, "batch-success");
+        check(!session.agree_operation_schedule(entries, "batch-success", future),
+              "batch success fixture installs an exact agreed schedule");
+        const PreagreedBatch expected{1, 0, entries.size()};
+        queue_batch_admission(h, expected);
+        const size_t sends_before_admission = h.channel.sent.size();
+        PreagreedBatch batch;
+        check(!session.begin_preagreed_batch(entries, future, batch) && batch.generation == 1 &&
+                  batch.cursor == 0 && batch.count == entries.size(),
+              "batch admission validates the full remaining schedule and returns its identity");
+        check(h.channel.sent.size() > sends_before_admission,
+              "batch admission is an all-rank host checkpoint before capture");
+
+        // The graph caller performs no per-operation Session calls. A successful
+        // all-rank post-replay control checkpoint commits the whole sequence.
+        queue_control_agreement(h, 3, "preagreed-batch-complete-v1", batch_identity_for_test(batch));
+        check(!session.complete_preagreed_batch(batch, true, future),
+              "successful bounded all-rank completion accepts the batch");
+        check(!session.finish_operation_schedule(), "batch completion retires the whole schedule");
+
+        auto next = schedule_entries(4, 1);
+        queue_batch_schedule(h, next, "eager-after-batch", 4, 2);
+        check(!session.agree_operation_schedule(next, "eager-after-batch", future) &&
+                  !session.agree_preagreed_operation(next[0].descriptor, next[0].stage, future) &&
+                  !session.complete_operation(next[0].descriptor.operation) &&
+                  !session.finish_operation_schedule(),
+              "the existing eager one-operation path resumes at the committed next sequence");
+
+        const auto legacy = schedule_entries(5, 1)[0].descriptor;
+        h.channel.recv_frames.push_back(from(1, FrameKind::operation, operation_payload(legacy)));
+        h.channel.recv_frames.push_back(from(2, FrameKind::operation, operation_payload(legacy)));
+        check(!session.agree_operation(legacy, future) && !session.complete_operation(legacy.operation),
+              "the existing per-operation eager agreement also resumes after batch completion");
+    }
+
+    // An initially mismatched batch is terminal before capture begins.
+    for (int mismatch = 0; mismatch < 3; ++mismatch) {
+        Harness h; queue_coordinator_ready(h);
+        auto session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "batch mismatch fixture reaches READY");
+        auto entries = schedule_entries(1, 2);
+        queue_batch_schedule(h, entries, "batch-mismatch");
+        check(!session.agree_operation_schedule(entries, "batch-mismatch", future),
+              "batch mismatch fixture installs an exact schedule");
+        if (mismatch == 1) entries[1].stage += "-different";
+        if (mismatch == 2) ++entries[0].descriptor.operation.layer;
+        PreagreedBatch batch;
+        if (mismatch == 0) {
+            auto partial = std::span<const CollectiveScheduleEntry>(entries.data(), 1);
+            check(bool(session.begin_preagreed_batch(partial, future, batch)) && !session.ready(),
+                  "incomplete batch admission is refused before replay");
+        } else {
+            check(bool(session.begin_preagreed_batch(entries, future, batch)) && !session.ready(),
+                  "batch descriptor or stage disagreement is refused before replay");
+        }
+    }
+
+    // Every failure after admission is terminal, so no rank can reuse a partially replayed plan.
+    for (int misuse = 0; misuse < 11; ++misuse) {
+        Harness h; queue_coordinator_ready(h);
+        auto session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "batch misuse fixture reaches READY");
+        auto entries = schedule_entries(1, 2);
+        queue_batch_schedule(h, entries, "batch-misuse");
+        check(!session.agree_operation_schedule(entries, "batch-misuse", future),
+              "batch misuse fixture installs an exact schedule");
+        PreagreedBatch batch;
+        queue_batch_admission(h, PreagreedBatch{1, 0, entries.size()});
+        check(!session.begin_preagreed_batch(entries, future, batch), "batch misuse fixture is admitted");
+        Failure f;
+        if (misuse == 0) {
+            auto stale = batch; ++stale.generation;
+            f = session.complete_preagreed_batch(stale, true, future);
+        } else if (misuse == 1) {
+            auto stale = batch; ++stale.cursor;
+            f = session.complete_preagreed_batch(stale, true, future);
+        } else if (misuse == 2) {
+            auto stale = batch; ++stale.count;
+            f = session.complete_preagreed_batch(stale, true, future);
+        } else if (misuse == 3) {
+            f = session.finish_operation_schedule();
+        } else if (misuse == 4) {
+            f = session.complete_preagreed_batch(batch, false, future);
+        } else if (misuse == 5) {
+            f = session.complete_preagreed_batch(batch, true, {h.clock.now()});
+        } else if (misuse == 6) {
+            session.abort("injected graph replay abort");
+            f = session.complete_preagreed_batch(batch, true, future);
+        } else if (misuse == 7) {
+            f = session.agree_control_payload("interfering-control", "x", future);
+        } else if (misuse == 8) {
+            std::string output;
+            f = session.broadcast_control_payload("interfering-broadcast", output, future);
+        } else if (misuse == 9) {
+            f = session.agree_preagreed_operation(entries[0].descriptor, entries[0].stage, future);
+        } else {
+            f = session.complete_operation(entries[0].descriptor.operation);
+        }
+        check(bool(f) && !session.ready(), "batch mismatch, omission, timeout, abort or interference poisons the session");
+    }
+
+    {
+        Harness h; queue_coordinator_ready(h);
+        auto session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "batch timeout fixture reaches READY");
+        auto entries = schedule_entries(1, 1);
+        queue_batch_schedule(h, entries, "batch-extra");
+        check(!session.agree_operation_schedule(entries, "batch-extra", future),
+              "batch timeout fixture installs schedule");
+        PreagreedBatch batch;
+        queue_batch_admission(h, PreagreedBatch{1, 0, entries.size()});
+        check(!session.begin_preagreed_batch(entries, future, batch), "batch timeout fixture is admitted");
+        // A failed post-replay checkpoint must not commit the sequence. With no
+        // peers queued, the bounded wait expires and the session is poisoned.
+        const Failure timeout = session.complete_preagreed_batch(
+            batch, true, {h.clock.now() + std::chrono::milliseconds(3)});
+        check(timeout.code == FailureCode::deadline_expired && !session.ready(),
+              "missing all-rank replay completion ACK times out without publication");
+    }
+
+    {
+        Harness h; queue_coordinator_ready(h);
+        auto session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "batch extra-completion fixture reaches READY");
+        auto entries = schedule_entries(1, 1);
+        queue_batch_schedule(h, entries, "batch-extra");
+        check(!session.agree_operation_schedule(entries, "batch-extra", future),
+              "batch extra-completion fixture installs schedule");
+        PreagreedBatch batch;
+        queue_batch_admission(h, PreagreedBatch{1, 0, entries.size()});
+        check(!session.begin_preagreed_batch(entries, future, batch), "batch extra-completion fixture is admitted");
+        queue_control_agreement(h, 3, "preagreed-batch-complete-v1", batch_identity_for_test(batch));
+        check(!session.complete_preagreed_batch(batch, true, future), "first completion commits once");
+        const Failure extra = session.complete_preagreed_batch(batch, true, future);
+        check(extra.code == FailureCode::bad_operation && !session.ready(),
+              "extra completion with a stale token is rejected terminally");
     }
 }
 
@@ -2049,6 +2243,7 @@ int main() {
     collective_agreement_over_tcp();
     preagreed_schedule_over_tcp();
     preagreed_local_gates();
+    preagreed_batch_gates();
     control_payload_agreement_over_tcp();
     control_payload_broadcast_over_tcp();
     queued_abort_survives_tcp_reset();

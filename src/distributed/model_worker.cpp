@@ -5,6 +5,8 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <cstdio>
+#include <cstdlib>
 
 namespace strata::distributed {
 namespace {
@@ -181,6 +183,9 @@ Failure model_forward_schedule(const StepCommand& command, const core::ModelGeom
 
 #if defined(STRATA_DISTRIBUTED_CUDA)
 #include "strata/distributed/model.hpp"
+#include "nccl_api.hpp"
+#include "strata/distributed/process_exit_guard.hpp"
+#include "strata/distributed/graph_watchdog.hpp"
 
 #include <cuda_runtime.h>
 #include <thread>
@@ -207,6 +212,14 @@ struct ModelWorkerBackend::Impl {
     float* device_logits = nullptr;
     float* host_logits = nullptr;
     cudaEvent_t completion = nullptr;
+    cudaGraph_t decode_graph = nullptr;
+    cudaGraphExec_t decode_exec = nullptr;
+    int* host_route_status = nullptr;
+    bool graph_warmed = false;
+    bool graph_pending = false;
+    bool logits_readback_pending = false;
+    bool graph_unsafe = false;
+    uint64_t graph_replays = 0;
     bool initialized = false;
     bool dead = false;
     bool candidate = false;
@@ -220,7 +233,23 @@ struct ModelWorkerBackend::Impl {
 
     Impl(ModelWorkerConfig c, ModelForward& m, SessionCollectives& l, Session& s, GuardedTransport& t)
         : config(std::move(c)), model(m), collectives(l), session(s), transport(t) {}
+    bool release_graph() {
+        if (!decode_graph && !decode_exec) return true;
+        if (graph_unsafe || graph_pending || logits_readback_pending || collectives.requires_process_exit()) return false;
+        if (decode_exec && cudaGraphExecDestroy(decode_exec) != cudaSuccess) return false;
+        decode_exec = nullptr;
+        if (decode_graph && cudaGraphDestroy(decode_graph) != cudaSuccess) return false;
+        decode_graph = nullptr;
+        std::string err;
+        if (!collectives.leave_capture(err)) return false;
+        std::fprintf(stderr, "MODEL_GRAPH completed replays=%llu\n", static_cast<unsigned long long>(graph_replays));
+        return true;
+    }
     ~Impl() {
+        // Unknown DMA completion must retain every borrowed model allocation.
+        if (graph_unsafe || graph_pending || logits_readback_pending || collectives.requires_process_exit()) std::_Exit(2);
+        if (!release_graph()) std::_Exit(2);
+        if (host_route_status) cudaFreeHost(host_route_status);
         if (completion) cudaEventDestroy(completion);
         if (device_logits) cudaFree(device_logits);
         if (host_logits) cudaFreeHost(host_logits);
@@ -254,11 +283,68 @@ struct ModelWorkerBackend::Impl {
     }
     Failure finite_logits() {
         const size_t bytes = size_t(model.geometry().n_vocab) * sizeof(float);
-        if (auto f = cuda_failure(cudaMemcpyAsync(host_logits, device_logits, bytes, cudaMemcpyDeviceToHost,
-                                                  static_cast<cudaStream_t>(config.stream)))) return f;
-        if (auto f = wait()) return f;
+        if (auto f = bounded_readback(logits_readback_pending,
+                [&] { return cuda_failure(cudaMemcpyAsync(host_logits, device_logits, bytes, cudaMemcpyDeviceToHost,
+                                                          static_cast<cudaStream_t>(config.stream))); },
+                [&] { return wait(); })) return f;
+        std::string err;
+        if (!model.validate_execution_status(config.stream, err)) return bad(err);
         if (!std::all_of(host_logits, host_logits + model.geometry().n_vocab,
                          [](float value) { return std::isfinite(value); })) return bad("nonfinite CUDA logits");
+        return {};
+    }
+    Failure graph_token(int32_t token, int64_t position, uint64_t step,
+                        const std::vector<ScheduledCollective>& schedule) {
+        Deadline deadline;
+        if (auto f = session.operation_deadline(deadline)) return f;
+        GraphDeadlineWatchdog watchdog(deadline.end);
+        std::string err;
+        if (!model.prepare_token(token, position, config.position_base, config.stream, err)) return bad(err);
+        const auto stream = static_cast<cudaStream_t>(config.stream);
+        if (!decode_exec) {
+            // Input staging must finish before NCCL enters its capture session.
+            if (auto f = wait()) return f;
+            if (!collectives.enter_capture(config.decode_graph_api, config.stream, err)) return bad(err);
+            if (auto f = cuda_failure(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal))) return f;
+            const auto ready = config.decode_graph_api->check_graph_capture();
+            if (ready) err = ready.detail;
+            const bool captured = !ready && model.enqueue_prepared_token(device_logits, config.stream, err);
+            const bool checked = captured && collectives.check_capture(err);
+            const auto ended = cudaStreamEndCapture(stream, &decode_graph);
+            if (!checked || ended != cudaSuccess || !decode_graph) {
+                collectives.abort_capture("full model stream capture failed");
+                return !checked ? bad(err) : cuda_failure(ended);
+            }
+            if (!collectives.finish_capture(err)) return bad(err);
+            if (auto f = cuda_failure(cudaGraphInstantiate(&decode_exec, decode_graph, 0))) return f;
+            size_t nodes = 0;
+            if (auto f = cuda_failure(cudaGraphGetNodes(decode_graph, nullptr, &nodes))) return f;
+            std::fprintf(stderr, "MODEL_GRAPH captured nodes=%zu collectives=%llu\n", nodes,
+                         static_cast<unsigned long long>(collectives.expected_capture_collectives()));
+        }
+        if (!collectives.prepare_replay(schedule, step, deadline, err)) return bad(err);
+        graph_pending = true;
+        const auto launch = cudaGraphLaunch(decode_exec, stream);
+        if (launch != cudaSuccess) {
+            graph_unsafe = true;
+            collectives.abort_capture("full model graph launch failed");
+            return cuda_failure(launch);
+        }
+        if (!collectives.wait_replay(deadline, err)) {
+            graph_unsafe = true;
+            return bad(err);
+        }
+        if (auto f = cuda_failure(cudaMemcpyAsync(host_route_status, collectives.route_status_device(), sizeof(int),
+                                                  cudaMemcpyDeviceToHost, stream))) return f;
+        if (auto f = wait()) return f;
+        graph_pending = false;
+        const bool valid = *host_route_status == 0 && model.validate_execution_status(config.stream, err);
+        if (!collectives.complete_replay(valid, deadline, err)) return bad(err);
+        if (!valid) return bad(err.empty() ? "full model graph route agreement failed" : err);
+        if (!model.complete_prepared_token(err)) return bad(err);
+        ++graph_replays;
+        if (auto failure = finite_logits()) return failure;
+        watchdog.complete();
         return {};
     }
     void clear_checkpoint() {
@@ -324,6 +410,8 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
     if (auto f = canonical_step_command(command, bytes)) return f;
     if (p.dead || bytes != p.agreed_command) return bad("begin requires exact complete command agreement");
     p.published = false;
+    if (p.config.memory_phase)
+        if (auto f = p.config.memory_phase(command, uint64_t(p.model.next_position()), true)) return f;
     p.collectives.step(command.step);
     p.collectives.reset_observations();
     p.collectives.expect_schedule(command.expected_collective_schedule);
@@ -347,6 +435,13 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
         if (auto f = cuda_failure(cudaMalloc(reinterpret_cast<void**>(&p.device_logits), count))) return f;
         if (auto f = cuda_failure(cudaHostAlloc(reinterpret_cast<void**>(&p.host_logits), count, cudaHostAllocDefault))) return f;
         if (auto f = cuda_failure(cudaEventCreateWithFlags(&p.completion, cudaEventDisableTiming))) return f;
+        if (p.config.decode_graph_api) {
+            if (!p.config.preagreed_collectives || !p.config.batched_expert_collectives ||
+                !p.config.expert_operands.compact || p.config.prefill_batch_exactnative || p.config.prefill_expert_batch)
+                return bad("full model graph requires singleton preagreed compact batched execution");
+            if (auto f = cuda_failure(cudaHostAlloc(reinterpret_cast<void**>(&p.host_route_status), sizeof(int),
+                                                      cudaHostAllocDefault))) return f;
+        }
         if (!p.model.configure_prefill_batch_exactnative(p.config.prefill_batch_exactnative, err) ||
             !p.model.configure_prefill_expert_batch(p.config.prefill_expert_batch, err) ||
             !p.model.initialize(err) || !p.model.reset(p.config.stream, err)) return bad(err);
@@ -357,7 +452,11 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
             p.clear_checkpoint();
             p.request = command.request;
         }
-        if (p.config.prefill_batch_exactnative && command.phase == StepPhase::prefill &&
+        if (p.config.decode_graph_api && p.graph_warmed) {
+            if (command.tokens.size() != 1) return bad("full model graph requires one token per command");
+            if (auto f = p.graph_token(command.tokens.front(), int64_t(command.positions.front()), command.step,
+                                       command.expected_collective_schedule)) return f;
+        } else if (p.config.prefill_batch_exactnative && command.phase == StepPhase::prefill &&
             command.tokens.size() > 1) {
             if (!p.model.tokens(command.tokens, int64_t(command.positions.front()), p.config.position_base,
                                 p.device_logits, p.config.stream, err)) return bad(err);
@@ -368,6 +467,7 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
                                    p.device_logits, p.config.stream, err)) return bad(err);
                 if (auto f = p.finite_logits()) return f;
             }
+            if (p.config.decode_graph_api) p.graph_warmed = true;
         }
         p.candidate = true;
     } else if (command.phase == StepPhase::reset || command.phase == StepPhase::cancel) {
@@ -414,6 +514,8 @@ Failure ModelWorkerBackend::finish(const StepCommand& command, BackendCompletion
         !std::equal(observed.begin(), observed.end(), command.expected_collective_schedule.begin(), identical))
         return bad("actual model execution did not complete the declared schedule");
     if (auto f = p.wait()) return f;
+    if (p.config.memory_phase)
+        if (auto f = p.config.memory_phase(command, uint64_t(p.model.next_position()), false)) return f;
     if (p.config.preagreed_collectives &&
         (command.phase == StepPhase::prefill || command.phase == StepPhase::decode)) {
         if (auto f = p.session.finish_operation_schedule()) return f;
@@ -441,6 +543,11 @@ void ModelWorkerBackend::abort() noexcept {
     p.candidate = false;
     p.clear_checkpoint();
     p.model.invalidate();
+    if (p.config.decode_graph_api) {
+        p.graph_unsafe = p.graph_unsafe || p.graph_pending || p.logits_readback_pending || p.collectives.requires_process_exit();
+        if (!p.graph_unsafe && !p.release_graph()) p.graph_unsafe = true;
+        if (p.graph_unsafe) p.collectives.abort_capture("model worker aborted with pending graph work");
+    }
     p.transport.abort("model worker aborted");
     p.session.abort("model worker aborted");
 }
@@ -457,6 +564,10 @@ const float* ModelWorkerBackend::committed_logits() const {
     return impl_->published && !impl_->dead ? impl_->host_logits : nullptr;
 }
 size_t ModelWorkerBackend::logits_size() const { return size_t(impl_->model.geometry().n_vocab); }
+bool ModelWorkerBackend::requires_process_exit() const noexcept {
+    return impl_->graph_unsafe || impl_->graph_pending || impl_->logits_readback_pending ||
+           impl_->collectives.requires_process_exit();
+}
 
 }  // namespace strata::distributed
 #endif

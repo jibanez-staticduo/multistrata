@@ -3,6 +3,7 @@
 #include "strata/distributed/model.hpp"
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -36,10 +37,20 @@ public:
     NativeRoutedExperts(const NativeRoutedExperts&) = delete;
     NativeRoutedExperts& operator=(const NativeRoutedExperts&) = delete;
     bool configure_prefill_batch(bool enabled, std::string& err);
+    // Device routing is opt-in and must be configured before initialize().
+    bool configure_device_routing(bool enabled, std::string& err);
     bool initialize(std::string& err);
+    // Clear before each routed execution and check after it has completed.
+    // The routed forward itself does not read back IDs or status.
+    bool clear_device_route_status(void* stream, std::string& err);
+    bool check_device_route_status(void* stream, std::string& err);
+    bool clear_execution_status(void* stream, std::string& err) override;
+    bool validate_execution_status(void* stream, std::string& err) override;
     bool supports_batch() const noexcept override;
     bool forward(int64_t layer, const float* input, const int* ids,
                  int64_t k, float* parts, void* stream, std::string& err) override;
+    bool forward_device_routes(int64_t layer, const float* input, const int32_t* device_ids,
+                               int64_t k, float* parts, void* stream, std::string& err);
     bool forward_batch(int64_t layer, int64_t rows, const float* inputs,
                        const int* ids, int64_t k, float* parts, void* stream,
                        std::string& err) override;

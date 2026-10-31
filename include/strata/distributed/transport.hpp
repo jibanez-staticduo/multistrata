@@ -415,6 +415,26 @@ class OperationTracker {
         last_ = current_;
     }
 
+    Failure adopt_completed_batch(std::span<const Operation> operations) {
+        if (in_flight_) {
+            return Failure::fail(FailureCode::in_flight,
+                                 "cannot adopt an external batch while an operation is in flight");
+        }
+        if (operations.empty() || operations.size() > UINT64_MAX - next_) {
+            return Failure::fail(FailureCode::bad_operation, "external batch has invalid sequence bounds");
+        }
+        uint64_t expected = next_;
+        for (const auto& operation : operations) {
+            if (operation.sequence != expected++) {
+                return Failure::fail(FailureCode::bad_operation,
+                                     "completed external batch is not contiguous with transport sequence");
+            }
+        }
+        last_ = operations.back();
+        next_ = expected;
+        return ok_failure();
+    }
+
     bool in_flight() const { return in_flight_; }
     uint64_t next_sequence() const { return next_; }
     Operation current() const { return current_; }
@@ -499,6 +519,9 @@ class GuardedTransport final : public Transport {
     Failure wait(Deadline at) override;
     Failure check_health() const override;
     void abort(std::string_view reason) noexcept override;
+    // Sync sequence bookkeeping after another owner independently confirms
+    // completion of NCCL graph collectives outside this wrapper.
+    Failure adopt_completed_batch(std::span<const Operation> operations);
 
     // How long a poll waits before looking again, and how long `wait` may poll at all.  The poll interval is
     // a real sleep between looks at the library, so it is only used when the backend reports "not yet".
@@ -602,6 +625,11 @@ inline Failure GuardedTransport::wait(Deadline at) {
 }
 
 inline Failure GuardedTransport::check_health() const { return health_unlocked(); }
+
+inline Failure GuardedTransport::adopt_completed_batch(std::span<const Operation> operations) {
+    if (auto f = health_unlocked()) return f;
+    return tracker_.adopt_completed_batch(operations);
+}
 
 inline Failure GuardedTransport::health_unlocked() const {
     if (failure_) return failure_;
