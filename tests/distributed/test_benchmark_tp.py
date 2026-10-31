@@ -283,3 +283,72 @@ def test_quantile_definition():
     assert bench.quantile([4, 1, 2, 3], .5) == 2
     assert bench.quantile([4, 1, 2, 3], .95) == 4
     assert bench.quantile([], .95) is None
+
+
+def test_execute_plan_checkpoints_every_terminal_job_including_not_run(inputs, monkeypatch):
+    plan = bench.load_plan(inputs)
+    plan["jobs"] = [
+        dict(plan["jobs"][0], status="NOT_RUN", reason="unsupported"),
+        dict(plan["jobs"][1], status="PLANNED"),
+    ]
+    plan["endpoints"][0].update(url="http://127.0.0.1:1/v1/chat/completions")
+    monkeypatch.setattr(bench, "post_stream", lambda *a, **kw: {
+        "status": "PASSED", "usage": {"completion_tokens": 256}, "ttft_s": .01, "wall_s": .1,
+    })
+    snapshots = []
+
+    records = bench.execute_plan(plan, timeout=1, on_job_complete=lambda rows: snapshots.append([dict(r) for r in rows]))
+
+    assert [row["status"] for row in records] == ["NOT_RUN", "PASSED"]
+    assert [[row["status"] for row in rows] for rows in snapshots] == [["NOT_RUN"], ["NOT_RUN", "PASSED"]]
+
+
+def test_checkpoint_survives_interruption_without_saving_stream_error(inputs, tmp_path, monkeypatch):
+    calls = 0
+
+    def post_stream(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("private response secret")
+        return {
+            "status": "PASSED", "usage": {"completion_tokens": 256}, "ttft_s": .01, "wall_s": .1,
+        }
+
+    monkeypatch.setattr(bench, "post_stream", post_stream)
+    checkpoint, out = tmp_path / "checkpoint.json", tmp_path / "report.json"
+    with pytest.raises(RuntimeError, match="private response secret"):
+        bench.main(["--config", str(inputs), "--out", str(out), "--execute", "--checkpoint", str(checkpoint)])
+
+    saved = json.loads(checkpoint.read_text())
+    plan = bench.load_plan(inputs)
+    assert saved["status"] == "incomplete"
+    assert len(saved["records"]) == 1 and saved["records"][0]["status"] == "PASSED"
+    assert saved["frozen"] == plan["frozen"]
+    assert saved["files_sha256"] == plan["files_sha256"]
+    assert "private response secret" not in checkpoint.read_text()
+    assert not out.exists()
+
+
+def test_existing_checkpoint_is_refused_before_execution(inputs, tmp_path, monkeypatch):
+    checkpoint, out = tmp_path / "checkpoint.json", tmp_path / "report.json"
+    checkpoint.write_text("keep this file")
+    monkeypatch.setattr(bench, "post_stream", lambda *a, **kw: pytest.fail("must refuse before sending"))
+
+    assert bench.main(["--config", str(inputs), "--out", str(out), "--execute", "--checkpoint", str(checkpoint)]) == 2
+    assert checkpoint.read_text() == "keep this file"
+
+
+def test_checkpoint_is_completed_after_all_jobs_and_default_run_has_no_checkpoint(inputs, tmp_path, monkeypatch):
+    def post_stream(*args, **kwargs):
+        return {"status": "PASSED", "usage": {"completion_tokens": 256}, "ttft_s": .01, "wall_s": .1}
+
+    monkeypatch.setattr(bench, "post_stream", post_stream)
+    checkpoint, out = tmp_path / "checkpoint.json", tmp_path / "report.json"
+    assert bench.main(["--config", str(inputs), "--out", str(out), "--execute", "--checkpoint", str(checkpoint)]) == 0
+    saved = json.loads(checkpoint.read_text())
+    assert saved["status"] == "completed" and len(saved["records"]) == 81
+
+    ordinary = tmp_path / "ordinary.json"
+    assert bench.main(["--config", str(inputs), "--out", str(ordinary)]) == 0
+    assert ordinary.exists() and not (tmp_path / "ordinary.checkpoint.json").exists()

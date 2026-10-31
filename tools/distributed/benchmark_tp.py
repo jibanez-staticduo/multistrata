@@ -38,6 +38,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import tempfile
 import threading
 import time
 from urllib.parse import urlsplit
@@ -335,7 +336,7 @@ def quantile(values: list[float], fraction: float) -> float | None:
     return sorted(values)[max(0, math.ceil(fraction * len(values)) - 1)] if values else None
 
 
-def execute_plan(plan: dict, *, timeout: float, save_text: bool = False) -> list[dict]:
+def execute_plan(plan: dict, *, timeout: float, save_text: bool = False, on_job_complete=None) -> list[dict]:
     positive_seconds(timeout)
     mapping = {e["name"]: e for e in plan["endpoints"]}
     records = []
@@ -343,6 +344,8 @@ def execute_plan(plan: dict, *, timeout: float, save_text: bool = False) -> list
         record = dict(job)
         if job["status"] == "NOT_RUN":
             records.append(record)
+            if on_job_complete is not None:
+                on_job_complete(records)
             continue
         if type(job["concurrency"]) is not int or job["concurrency"] not in CONCURRENCY:
             raise InvalidBenchmark("concurrency must be 1, 4 or 8")
@@ -363,12 +366,35 @@ def execute_plan(plan: dict, *, timeout: float, save_text: bool = False) -> list
                       request_wall_p50_s=quantile([r["wall_s"] for r in rows if r["status"] == "PASSED"], .5),
                       request_wall_p95_s=quantile([r["wall_s"] for r in rows if r["status"] == "PASSED"], .95))
         records.append(record)
+        if on_job_complete is not None:
+            on_job_complete(records)
     return records
 
 
 def public_plan(plan: dict) -> dict:
     """Store identities/hashes and matrix, without prompt bodies, tokens or authentication details."""
     return {key: copy.deepcopy(plan[key]) for key in ("schema_version", "frozen", "files_sha256", "jobs")}
+
+
+def write_checkpoint(path: Path, report: dict, *, initial: bool = False) -> None:
+    """Atomically replace an owned checkpoint, or create the first one without clobbering."""
+    payload = (json.dumps(report, indent=2, allow_nan=False) + "\n").encode()
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if initial:
+            # Linking publishes the complete file and fails if another file appeared meanwhile.
+            os.link(temporary, path)
+        else:
+            os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def main(argv=None) -> int:
@@ -378,10 +404,17 @@ def main(argv=None) -> int:
     ap.add_argument("--execute", action="store_true", help="send the planned HTTP requests")
     ap.add_argument("--timeout", type=float, default=3600)
     ap.add_argument("--save-text", action="store_true", help="include generated content and reasoning in records")
+    ap.add_argument("--checkpoint", type=Path, help="atomically save each completed job during execution")
     ap.add_argument("--telemetry", type=Path, help="preprovided external JSONL artifact; never contacts hosts")
     args = ap.parse_args(argv)
     try:
         positive_seconds(args.timeout)
+        if args.checkpoint and not args.execute:
+            raise InvalidBenchmark("--checkpoint requires --execute")
+        if args.checkpoint:
+            args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            if args.checkpoint.exists():
+                raise InvalidBenchmark("checkpoint path already exists")
         plan = load_plan(args.config)
         report = public_plan(plan)
         report.update(executed=args.execute, quantile="nearest_rank_ceil_p_times_n_minus_one",
@@ -393,7 +426,21 @@ def main(argv=None) -> int:
                     raise InvalidBenchmark("telemetry JSONL rows must be objects")
             report["external_telemetry"] = {"path": str(args.telemetry.resolve()), "sha256": digest(raw),
                                              "rows": len(raw.splitlines()), "source": "operator-provided"}
-        report["records"] = execute_plan(plan, timeout=args.timeout, save_text=args.save_text) if args.execute else plan["jobs"]
+        if args.execute and args.checkpoint:
+            checkpoint = {key: copy.deepcopy(report[key]) for key in ("schema_version", "frozen", "files_sha256", "jobs")}
+            checkpoint.update(executed=True, status="incomplete", records=[])
+            write_checkpoint(args.checkpoint, checkpoint, initial=True)
+
+            def save_progress(records):
+                checkpoint["records"] = copy.deepcopy(records)
+                write_checkpoint(args.checkpoint, checkpoint)
+
+            report["records"] = execute_plan(plan, timeout=args.timeout, save_text=args.save_text,
+                                             on_job_complete=save_progress)
+            checkpoint["status"] = "completed"
+            write_checkpoint(args.checkpoint, checkpoint)
+        else:
+            report["records"] = execute_plan(plan, timeout=args.timeout, save_text=args.save_text) if args.execute else plan["jobs"]
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
         return 1 if any(row["status"] == "FAILED" for row in report["records"]) else 0
