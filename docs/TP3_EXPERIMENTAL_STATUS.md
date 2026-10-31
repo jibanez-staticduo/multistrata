@@ -70,7 +70,36 @@ remaining acceptance checks open.
 | 7. Coordinator and C1 | Passed scope | Windows 4/6/7 exact logits, state, RESET and traces; 8192 is configured capacity, not an 8K-token prompt. The later actual 8K and 64K gates are recorded below. |
 | 8. Capacity, MTP, graphs, C8 | Partial | Short MTP/C4/C8 full-state replay and cancellation checks pass. Full C1 NCCL graphs pass 255 replays/RESET and bounded peer loss. Phase snapshots exist; useful extra capacity and longer feature qualification remain open. |
 | 9. Server and lifecycle | Partial | OpenAI/Anthropic streaming, tools, cancellation and failure-health artifacts; recorded restoration checks through window 7. No automatic rollout. |
-| 10. Performance decision | Partial | Profiling and resident TP1 control established; matched 4K/16K/64K, 256-output, C1/C4/C8, three paired rounds remain open. |
+| 10. Performance decision | Partial | Three matched 4K C1 pairs show a -61.9% median decode-rate change for TP3. C4/C8 and 16K/64K rounds remain open. |
+
+## Matched Performance Progress
+
+The frozen matrix is running with the same original IQ3_S pack, context 65792,
+resident FP16 KV, thinking disabled, MTP off and graphs off. Three rotating
+paired rounds of the 4096-token C1 case have finished. Every request produces
+256 output tokens and passes the HTTP/usage checks.
+
+| Native phase | TP1, three rounds | TP3, three rounds |
+| --- | --- | --- |
+| Prefill seconds | 300.5406 / 305.3279 / 296.9001 | 870.5851 / 870.8654 / 869.6152 |
+| Decode seconds | 21.6196 / 21.7765 / 21.7972 | 56.8171 / 56.8002 / 57.2105 |
+
+The median paired change in native decode rate is **-61.9%** for TP3. This case
+does not meet the proposed 10% C1 improvement threshold. Median request wall
+time is 322.261 seconds for TP1 and 939.525 seconds for TP3. Correct state
+reconstruction does not imply a performance gain.
+
+The configured C4/C8 cases and the 16K/64K rounds remain in progress. TP2 and
+TP1 C4/C8 are unsupported by this candidate and are explicitly not run. No
+aggregate C8 gain against TP1 can be claimed without that control. Raw partial
+records and the analysis are in
+`/home/staticduo/tmp/strata-tp3-20261031/benchmark-qualified/execution-checkpoint.json`
+and
+`/home/staticduo/tmp/strata-tp3-20261031/benchmark-qualified/PARTIAL.md`.
+The first campaign stops before measurement because its lifecycle hook reads
+the wrong ID field for a solo SparkRun workload. That attempt is retained in
+`failed-campaign-solo-id`; the corrected campaign starts all three rounds anew.
+These are partial results, not completion of Task 10 or a production recommendation.
 
 ## Passed measurements
 
