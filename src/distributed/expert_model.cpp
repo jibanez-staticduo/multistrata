@@ -1,5 +1,6 @@
 #include "strata/distributed/expert_model.hpp"
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/native_upload.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/tp_cuda.hpp"
@@ -19,6 +20,15 @@
 namespace strata::distributed {
 namespace {
 namespace tp = kernels::tp::cuda;
+struct UploadBackend {
+    using Error = cudaError_t;
+    static constexpr Error success = cudaSuccess;
+    Error allocate(void** p, size_t bytes) { return cudaMallocHost(p, bytes); }
+    void release(void* p) { (void)cudaFreeHost(p); }
+    Error copy(void* dst, const void* src, size_t bytes) {
+        return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    }
+};
 void check(cudaError_t e) {
     if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
 }
@@ -134,6 +144,9 @@ struct NativeRoutedExperts::Impl {
                 layout.bytes.size() == std::size_t(geometry.n_layers), "TP expert model: incomplete native layer table");
         // Validate every codec and the aggregate before any large allocation.
         uint64_t planned = 0;
+        UploadBackend upload_backend;
+        core::NativeUpload<UploadBackend> upload(upload_backend);
+        std::vector<uint8_t> compact_down;
         for (int64_t index = 0; index < geometry.n_layers; ++index) {
             const auto& fmt = layout.fmt[std::size_t(index)];
             require(fmt.n_embd == geometry.n_embd && fmt.n_ff == geometry.n_ff && !fmt.tail_off &&
@@ -197,17 +210,24 @@ struct NativeRoutedExperts::Impl {
             const auto* up_source = source(index, 1, fmt.gu_type, geometry.n_embd, geometry.n_ff, fmt.up_off);
             const auto down_expert_bytes = std::size_t(geometry.n_embd) * fmt.d_row;
             const auto* down_source = source(index, 2, fmt.d_type, geometry.n_ff, geometry.n_embd, down_expert_bytes);
+            compact_down.resize(layer.down_bytes);
             for (int64_t expert = 0; expert < geometry.n_expert; ++expert) {
                 const auto gu_offset = std::size_t(expert) * fmt.up_off + std::size_t(begin) * fmt.gu_row;
-                check(cudaMemcpy(layer.gate.byte() + expert * layer.gu_bytes, gate_source + gu_offset,
-                                 layer.gu_bytes, cudaMemcpyHostToDevice));
-                check(cudaMemcpy(layer.up.byte() + expert * layer.gu_bytes, up_source + gu_offset,
-                                 layer.gu_bytes, cudaMemcpyHostToDevice));
+                check(upload.copy(layer.gate.byte() + expert * layer.gu_bytes, gate_source + gu_offset,
+                                  layer.gu_bytes));
+                check(upload.copy(layer.up.byte() + expert * layer.gu_bytes, up_source + gu_offset,
+                                  layer.gu_bytes));
                 const auto down_offset = std::size_t(expert) * down_expert_bytes + kernels::iq_row_bytes(fmt.d_type, int64_t(begin));
-                check(cudaMemcpy2D(layer.down.byte() + expert * layer.down_bytes, layer.down_row,
-                                   down_source + down_offset, fmt.d_row, layer.down_row, geometry.n_embd,
-                                   cudaMemcpyHostToDevice));
+                // Pack unchanged input blocks on the CPU; the GPU sees only pinned source memory.
+                for (int64_t row = 0; row < geometry.n_embd; ++row)
+                    std::memcpy(compact_down.data() + size_t(row) * layer.down_row,
+                                down_source + down_offset + size_t(row) * fmt.d_row, layer.down_row);
+                check(upload.copy(layer.down.byte() + expert * layer.down_bytes,
+                                  compact_down.data(), compact_down.size()));
             }
+            std::fprintf(stderr, "expert shards loaded: layer=%lld rank=%d bytes=%llu\n",
+                         static_cast<long long>(index), rank,
+                         static_cast<unsigned long long>(layer.gate.bytes + layer.up.bytes + layer.down.bytes));
             owned += layer.gate.bytes + layer.up.bytes + layer.down.bytes;
             const auto& l = layer.layout;
             layer.gate_view = shard(l.gu_type, geometry.n_embd, geometry.n_ff, 1, rank, int64_t(begin), int64_t(end),
