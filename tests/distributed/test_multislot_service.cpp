@@ -298,8 +298,9 @@ void request_timing_is_per_request() {
                  generate("d", 1, 3), cancel("blocker"), generate("queued", 2, 1)};
     rig.idle(100);
     auto callbacks = rig.callbacks();
-    callbacks.emit_timing = [&](std::string_view id, const RequestTiming& timing) {
-        rig.timings[std::string(id)] = timing;
+    callbacks.emit_timing = [&](std::string_view type, std::string_view id, const RequestTiming& timing) {
+        check(type == "done" || type == "cancelled", "timed multislot event names its terminal type");
+        if (id == "queued") rig.timings[std::string(id)] = timing;
     };
     check(!run_multislot_service(rig.config, callbacks), "interleaved timed requests complete");
     const auto queued = rig.timings.find("queued");
@@ -328,10 +329,26 @@ void timing_callback_does_not_replace_required_events() {
     Rig rig;
     auto callbacks = rig.callbacks();
     callbacks.emit = {};
-    callbacks.emit_timing = [](std::string_view, const RequestTiming&) {};
+    callbacks.emit_timing = [](std::string_view, std::string_view, const RequestTiming&) {};
     const auto result = run_multislot_service(rig.config, callbacks);
     check(result.code == FailureCode::invalid_config && rig.health_calls == 0,
           "timing-only callback is rejected before startup work");
+}
+void cancelled_multislot_reports_partial_timing() {
+    Rig rig;
+    rig.input = {generate("partial", 3, 4), cancel("partial")};
+    auto callbacks = rig.callbacks();
+    std::string terminal;
+    RequestTiming captured;
+    callbacks.emit_timing = [&](std::string_view type, std::string_view id, const RequestTiming& timing) {
+        terminal = std::string(type);
+        check(id == "partial", "multislot cancel timing keeps request identity");
+        captured = timing;
+    };
+    check(!run_multislot_service(rig.config, callbacks), "multislot partial cancellation completes");
+    check(terminal == "cancelled" && captured.prompt_tokens == 3 && captured.generated_tokens == 0 &&
+          captured.prefill_ns == 13,
+          "multislot cancelled terminal reports only committed partial prefill");
 }
 } // namespace
 
@@ -342,6 +359,7 @@ int main() {
     budgets_chunks_and_validation();
     request_timing_is_per_request();
     disabled_timing_never_reads_clock();
+    cancelled_multislot_reports_partial_timing();
     timing_callback_does_not_replace_required_events();
     std::printf("multislot_service: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

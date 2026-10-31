@@ -49,6 +49,7 @@ if mode not in ('stale', 'silent', 'legacy', 'teacher', 'ignore_term'):
     threading.Thread(target=beat, daemon=True).start()
 turn = 0
 cancelled = False
+cancel_timings = {}
 for line in sys.stdin:
     msg = json.loads(line)
     if msg['type'] == 'shutdown':
@@ -59,7 +60,12 @@ for line in sys.stdin:
             continue
         time.sleep(.08)
         cancelled = True
-        emit('cancelled', request_id=rid, state='ready')
+        ack = {'request_id': rid, 'state': 'ready'}
+        if rid in cancel_timings:
+            ack['timing'] = cancel_timings[rid]
+            if mode == 'timing_cancel_bad_count':
+                ack['timing']['generated_tokens'] += 1
+        emit('cancelled', **ack)
         continue
     turn += 1
     if turn > 1 and mode == 'cancel' and not cancelled:
@@ -87,9 +93,9 @@ for line in sys.stdin:
         continue
     if mode == 'echo':
         values = msg['ids']
-    elif mode == 'timing_eos':
+    elif mode in ('timing_eos', 'timing_cancel_eos'):
         values = list(b'</think>\n\nHello.') + [257]
-    elif mode == 'timing_stop':
+    elif mode in ('timing_stop', 'timing_cancel_stop'):
         values = list(b'</think>\n\nHello.STOPtail')
     elif mode.startswith('timing'):
         values = msg['ids']
@@ -99,13 +105,19 @@ for line in sys.stdin:
         emit('token', request_id=rid, id=token, committed=mode != 'uncommitted')
     done = {'request_id': rid, 'state': 'ready'}
     if mode.startswith('timing'):
-        done['timing'] = {
+        timing = {
             'clock': 'host_steady_wall', 'queue_ns': 11, 'prefill_ns': 22,
-            'decode_ns': 1_500_000_000 if mode in ('timing_eos', 'timing_stop') else msg['ids'][0],
+            'decode_ns': 1_500_000_000 if mode in (
+                'timing_eos', 'timing_stop', 'timing_cancel_eos', 'timing_cancel_stop',
+            ) else msg['ids'][0],
             'sampling_ns': 44, 'mtp_draft_ns': 55,
             'mtp_checkpoint_ns': 66, 'mtp_rollback_ns': 77,
             'prompt_tokens': len(msg['ids']), 'generated_tokens': len(values[:msg['max_new']]),
         }
+        if mode in ('timing_cancel_eos', 'timing_cancel_stop', 'timing_cancel_bad_count'):
+            cancel_timings[rid] = timing
+            continue
+        done['timing'] = timing
         if mode == 'timing_bad_clock':
             done['timing']['clock'] = 'gpu_kernel'
         elif mode == 'timing_bool':
@@ -500,8 +512,11 @@ def test_existing_http_apis_parse_adapter_tokens(make_engine, path, stream):
     assert text == "Hello."
 
 
-@pytest.mark.parametrize("mode,extra", [("timing_eos", {}), ("timing_stop", {"stop": ["STOP"]})])
-def test_http_frontend_close_keeps_native_done_timings(make_engine, mode, extra):
+@pytest.mark.parametrize("mode,extra", [
+    ("timing_eos", {}), ("timing_stop", {"stop": ["STOP"]}),
+    ("timing_cancel_eos", {}), ("timing_cancel_stop", {"stop": ["STOP"]}),
+])
+def test_http_frontend_close_keeps_native_terminal_timings(make_engine, mode, extra):
     engine = make_engine(mode)
     svc = Service(engine, ByteTokenizer(), ChatTemplate(ROOT / "serve/chat_template.jinja"))
     server = serve(svc, port=0)
@@ -519,6 +534,15 @@ def test_http_frontend_close_keeps_native_done_timings(make_engine, mode, extra)
     assert body["choices"][0]["message"]["content"] == "Hello."
     assert svc.last_timings is not None
     assert svc.last_timings["predicted_ms"] == 1500.0
+
+
+def test_cancelled_timing_must_match_emitted_token_count(make_engine):
+    engine = make_engine("timing_cancel_bad_count")
+    stream = engine.generate([17], 20, {}, threading.Event())
+    assert next(stream) == 17
+    with pytest.raises(EngineDied, match="invalid group state"):
+        stream.close()
+    assert not engine.alive()
 
 
 def test_http_health_reports_group_failure_and_expired_lease(make_engine):

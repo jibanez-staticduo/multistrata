@@ -83,7 +83,8 @@ std::string reference_event(std::string_view type, std::string_view request_id, 
             out += ",\"committed\":true,\"id\":" + std::to_string(token);
         } else {
             out += ",\"state\":\"ready\"";
-            if (type == "done" && timing) out += ",\"timing\":" + request_timing_json(*timing);
+            if ((type == "done" || type == "cancelled") && timing)
+                out += ",\"timing\":" + request_timing_json(*timing);
         }
     }
     return out + '}';
@@ -375,7 +376,7 @@ Failure run_reference_service(MonolithicReference& model, int32_t vocabulary, ui
         callbacks.emit_timing = [&](std::string_view type, std::string_view request, int32_t token,
                                     std::string_view state, const RequestTiming& timing) {
             output->emit(reference_event(type, request, token, context, state,
-                                         type == "done" ? &timing : nullptr));
+                                         (type == "done" || type == "cancelled") ? &timing : nullptr));
         };
     return run_autoregressive(0, vocabulary, context, callbacks, timeout_ms);
 }

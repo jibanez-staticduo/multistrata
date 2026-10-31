@@ -213,6 +213,32 @@ void request_timing() {
     check(request_timing_json(captured).find("\"clock\":\"host_steady_wall\"") != std::string::npos,
           "timing JSON identifies host steady wall measurements");
 }
+void cancelled_request_reports_partial_timing() {
+    Rig rig;
+    rig.input = {generate("partial", "1,2,3", 4), cancel("partial")};
+    uint64_t clock = 1;
+    RequestTiming captured;
+    std::string terminal;
+    auto cb = rig.callbacks();
+    auto execute = cb.execute;
+    cb.execute = [&, execute](StepPhase phase, std::string_view id, int32_t token, uint64_t position) {
+        const auto result = execute(phase, id, token, position);
+        if (!result && phase == StepPhase::prefill) clock += 11;
+        else if (!result && phase == StepPhase::commit) clock += 3;
+        return result;
+    };
+    cb.now_ns = [&] { return clock; };
+    cb.emit_timing = [&](std::string_view type, std::string_view id, int32_t, std::string_view state,
+                         const RequestTiming& timing) {
+        terminal = std::string(type);
+        check(id == "partial" && state == "ready", "cancel timing identifies the retired request");
+        captured = timing;
+    };
+    check(!run_autoregressive(0, 100, 64, cb), "partial prompt cancellation completes");
+    check(terminal == "cancelled" && captured.prompt_tokens == 3 && captured.generated_tokens == 0 &&
+          captured.prefill_ns == 14,
+          "cancelled terminal reports committed prefill accumulated before cancellation");
+}
 void large_chunked_prompt() {
     std::string ids = "1";
     for (int i = 1; i < 20000; ++i) ids += ",1";
@@ -430,7 +456,8 @@ void mtp_cancel_fresh_and_budget() {
 }
 int main() {
     normal_and_followers(); short_operation_budget(); failures_and_cancel(); large_chunked_prompt();
-    request_timing(); mtp_parity_and_followers(); mtp_timing_separates_control_cost();
+    request_timing(); cancelled_request_reports_partial_timing();
+    mtp_parity_and_followers(); mtp_timing_separates_control_cost();
     mtp_failures_withhold_output(); mtp_cancel_fresh_and_budget();
     std::printf("%d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;

@@ -65,7 +65,8 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
     auto emit = [&](std::string_view type, std::string_view request = {}, int32_t token = -1) {
         if (rank != 0) return;
         const auto state = active ? "busy" : "ready";
-        if (type == "done" && cb.emit_timing) cb.emit_timing(type, request, token, state, timing);
+        if ((type == "done" || type == "cancelled") && cb.emit_timing)
+            cb.emit_timing(type, request, token, state, timing);
         else if (cb.emit) cb.emit(type, request, token, state);
     };
     const auto timed = [&](auto&& operation) -> std::pair<Failure, uint64_t> {

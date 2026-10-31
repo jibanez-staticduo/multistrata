@@ -173,6 +173,7 @@ class _Request:
     output_done: bool = False
     done_received: bool = False
     done_timing: dict | None = None
+    cancel_timing: dict | None = None
     cancel_sent: bool = False
     cancel_ack: bool = False
     received_tokens: int = 0
@@ -372,6 +373,8 @@ class DistributedEngine:
                         elif kind == "cancelled":
                             if not request.cancel_sent or request.cancel_ack:
                                 raise ValueError
+                            if "timing" in msg:
+                                request.cancel_timing = _validate_native_timing(msg["timing"], request)
                             request.cancel_ack = True
                             request.output_done = True
                         else:
@@ -551,7 +554,8 @@ class DistributedEngine:
                         self._cancel(request, state)
                 finally:
                     with self._lock:
-                        native_timing = state.done_timing if state.done_received else None
+                        native_timing = (state.done_timing if state.done_received
+                                         else state.cancel_timing if state.cancel_ack else None)
                     if native_timing is not None:
                         self.last = _timing_last(native_timing)
                     with self._lock:

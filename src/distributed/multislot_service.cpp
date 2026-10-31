@@ -66,14 +66,14 @@ Failure run_multislot_service(MultiSlotConfig config, const MultiSlotServiceCall
             auto found = timings.find(std::string(request));
             if (found != timings.end()) ++found->second.generated_tokens;
         }
-        if (type == "done" && timing_enabled) {
-            cb.emit_timing(request, timings[std::string(request)]);
+        if ((type == "done" || type == "cancelled") && timing_enabled) {
+            cb.emit_timing(type, request, timings[std::string(request)]);
             timings.erase(std::string(request));
             admitted_ns.erase(std::string(request));
             queue_recorded.erase(std::string(request));
             pending_compute.erase(std::string(request));
         } else if (cb.emit) cb.emit(type, request, token, "ready", {});
-        if (type == "cancelled") {
+        if (type == "cancelled" && !timing_enabled) {
             timings.erase(std::string(request));
             admitted_ns.erase(std::string(request));
             queue_recorded.erase(std::string(request));
