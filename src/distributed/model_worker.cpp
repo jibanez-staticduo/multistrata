@@ -209,8 +209,9 @@ Failure ModelWorkerBackend::plan(const StepCommand& command, std::vector<Schedul
     const auto& p = *impl_;
     if (p.dead) return Failure::fail(FailureCode::aborted, "model worker was invalidated");
     if (!p.config.stream || p.config.position_base != 0 || command.session != p.config.worker.session ||
-        command.manifest_hash != p.config.worker.manifest_hash || p.config.worker.rank >= kTpWorld)
-        return bad("model worker identity/stream/position base is invalid");
+        command.manifest_hash != p.config.worker.manifest_hash || p.config.worker.rank >= kTpWorld ||
+        p.config.worker.slot >= kWorkerMaxSlots || command.slot != p.config.worker.slot)
+        return bad("model worker identity/slot/stream/position base is invalid");
     if (command.tokens.size() != command.positions.size()) return bad("model token/position mismatch");
     if (command.phase == StepPhase::checkpoint &&
         (!p.config.checkpoint_max_bytes || !p.config.checkpoint_max_context))

@@ -6,11 +6,12 @@ args (the native common flag/value pairs), server_source_root, source_manifest
 (relative file -> sha256), source_commit, tokenizer_dir, tokenizer_manifest
 (relative file -> sha256), evidence_dir, and optional env/process_timeout_s.
 Generate the manifests from the exact staged candidate; do not include credentials.
-Rank zero serves localhost:18080. Followers run the same native autoregressive driver.
+Rank zero serves localhost:18080. Followers run the same selected native driver mode.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
@@ -30,6 +31,7 @@ RunnerError = _common.RunnerError
 digest = _common.digest
 credential = _common.credential
 MAX_LOG = 32 << 20
+SERVICE_FLAGS = frozenset({"--mtp-path", "--mtp-drafts", "--mtp-hash", "--parallel"})
 
 
 def absolute(value):
@@ -66,16 +68,43 @@ def validated(supplied):
         if not absolute(config.get(key)):
             raise RunnerError("service paths must be absolute single-line strings")
     args = config.get("args")
-    if not isinstance(args, list) or len(args) % 2:
+    if (not isinstance(args, list) or len(args) % 2 or
+            not all(isinstance(x, str) and x and not any(c in x for c in "\0\n\r") for x in args)):
         raise RunnerError("args must be a flag/value argv list")
+    if len(set(args[::2])) != len(args[::2]):
+        raise RunnerError("unknown or duplicate binary flag")
     if any(flag in {"--mode", "--logits-dir", "--trace-dir", "--state-dir", "--state-positions", "--state-max-bytes"} for flag in args[::2]):
         raise RunnerError("service args cannot include mode or teacher-forced evidence flags")
+    options = dict(zip(args[::2], args[1::2]))
+    mode = config.get("mode", "autoregressive")
+    if mode not in ("autoregressive", "multislot"):
+        raise RunnerError("service mode must be autoregressive or multislot")
+    parallel = config.get("parallel", 1)
+    if type(parallel) is not int or parallel not in (1, 4, 8):
+        raise RunnerError("parallel must be 1, 4 or 8")
+    if "--parallel" in options:
+        if options["--parallel"] not in ("1", "4", "8"):
+            raise RunnerError("parallel must be 1, 4 or 8")
+        if "parallel" in config and int(options["--parallel"]) != parallel:
+            raise RunnerError("parallel settings must agree")
+        parallel = int(options["--parallel"])
+    if mode != "multislot" and (parallel != 1 or "--parallel" in options):
+        raise RunnerError("parallel requires multislot mode")
+    mtp = {flag for flag in SERVICE_FLAGS - {"--parallel"} if flag in options}
+    if mtp:
+        if mtp != SERVICE_FLAGS - {"--parallel"} or mode != "autoregressive":
+            raise RunnerError("MTP requires autoregressive mode and path, drafts and hash together")
+        if not absolute(options["--mtp-path"]) or options["--mtp-drafts"] not in ("1", "2", "3", "4"):
+            raise RunnerError("MTP requires an absolute path and drafts in 1..4")
+        if not re.fullmatch(r"[0-9a-f]{64}", options["--mtp-hash"]):
+            raise RunnerError("MTP hash must be exactly 64 lowercase hex characters")
+    common_args = [item for flag, value in zip(args[::2], args[1::2])
+                   if flag not in SERVICE_FLAGS for item in (flag, value)]
     # Reuse the pinned teacher-forced runner's common validation. Its mandatory
     # input/logits fields are placeholders here and never reach the native argv.
-    normalized = dict(config, args=[*args, "--logits-dir", config["evidence_dir"]],
+    normalized = dict(config, args=[*common_args, "--logits-dir", config["evidence_dir"]],
                       input_file=config.get("source_file"), input_sha256=config.get("source_sha256"),
                       process_timeout_s=600)
-    options = dict(zip(args[::2], args[1::2]))
     context = options.get("--context", "")
     if not isinstance(context, str) or not context.isdigit() or not 4 <= int(context) <= 65536:
         raise RunnerError("service context must be in 4..65536")
@@ -84,6 +113,22 @@ def validated(supplied):
     checked = _common.validated(normalized)
     config["options"] = checked["options"]
     config["options"]["context"] = context
+    config["options"].update({flag[2:]: options[flag] for flag in SERVICE_FLAGS if flag in options})
+    config.update(mode=mode, parallel=parallel)
+    if mode == "multislot" and "--parallel" not in options:
+        config["args"] = [*args, "--parallel", str(parallel)]
+    if mtp and int(config["options"]["rank"]) == 0:
+        root = Path(options["--mtp-path"])
+        if (root / "draft_vocab.bin").exists():
+            raise RunnerError("MTP draft vocabulary subset is not approved")
+        try:
+            text = "strata-mtp-runtime-v1\n" + "".join(
+                name + ":" + digest(root / name).removeprefix("sha256:") + "\n"
+                for name in ("dense.txt", "dense.bin", "experts.bin"))
+        except OSError as exc:
+            raise RunnerError("MTP runtime files must be accessible") from exc
+        if hashlib.sha256(text.encode("ascii")).hexdigest() != options["--mtp-hash"]:
+            raise RunnerError("MTP runtime content hash mismatch")
     config["process_timeout_s"] = number(config, "process_timeout_s", 1800, 1, 86400)
     config["terminate_timeout_s"] = number(config, "terminate_timeout_s", 10, 0.1, 30)
     config["ready_timeout"] = number(config, "ready_timeout", 600, 300, 3600)
@@ -112,9 +157,10 @@ def validated(supplied):
 def server_config(config):
     return {"host": "127.0.0.1", "port": 18080, "tokenizer": config["tokenizer_dir"],
             "arch": "qwen4exp", "model_name": "qwen3.8-flash-next-tp3-experimental",
-            "parallel": 1, "open_browser": False, "before_load": None,
+            "parallel": config["parallel"], "open_browser": False, "before_load": None,
             "cwd": config["server_source_root"], "sampling": {"temperature": 0},
-            "distributed": {"command": [config["binary"], "--mode", "autoregressive", *config["args"]],
+            "distributed": {"command": [config["binary"], "--mode", config["mode"], *config["args"]],
+                            "parallel": config["parallel"],
                             "ready_timeout": config["ready_timeout"], "health_timeout": 30,
                             "process_deadline": config["request_timeout"],
                             "cancel_timeout": config["cancel_timeout"], "shutdown_timeout": config["shutdown_timeout"]}}
@@ -164,14 +210,14 @@ def run(supplied, execute=False):
     options = config["options"]
     rank = int(options["rank"])
     evidence = Path(config["evidence_dir"])
-    native = [config["binary"], "--mode", "autoregressive", *config["args"]]
+    native = [config["binary"], "--mode", config["mode"], *config["args"]]
     command = native
     # -P omits cwd from sys.path; only the controlled staged PYTHONPATH is added.
     if rank == 0:
         command = ["/usr/bin/python3", "-P", "-m", "serve.server", "--engine", "distributed", "--config",
                    str(evidence / "server.json"), "--host", "127.0.0.1", "--port", "18080", "--no-api-key"]
     receipt = {"schema": 1, "status": "validated_not_run", "rank": rank, "world": 3,
-               "mode": "autoregressive", "numerical_validation": "not_performed", "command": command,
+               "mode": config["mode"], "numerical_validation": "not_performed", "command": command,
                "native_command": native, "source_commit": config["source_commit"],
                "binary_sha256": config["binary_sha256"], "source_sha256": config["source_sha256"],
                "library_sha256": options["library-provenance"],

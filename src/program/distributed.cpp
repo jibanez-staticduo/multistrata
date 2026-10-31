@@ -7,6 +7,8 @@
 #include "strata/distributed/model_worker.hpp"
 #include "strata/distributed/autoregressive.hpp"
 #include "strata/distributed/mtp_service.hpp"
+#include "strata/distributed/multislot_service.hpp"
+#include "strata/distributed/slot_pool.hpp"
 #include "strata/distributed/parity_trace_writer.hpp"
 #include "strata/distributed/process_exit_guard.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -43,6 +45,16 @@ using namespace strata::distributed;
 void cuda_check(cudaError_t s) { if (s != cudaSuccess) throw std::runtime_error(cudaGetErrorString(s)); }
 void require(bool ok, const std::string& err) { if (!ok) throw std::runtime_error(err); }
 void require(Failure f) { if (f) throw std::runtime_error(f.detail); }
+std::string json_quote(std::string_view text) {
+    constexpr char hex[] = "0123456789abcdef";
+    std::string out = "\"";
+    for (unsigned char c : text) {
+        if (c == '"' || c == '\\') { out.push_back('\\'); out.push_back(char(c)); }
+        else if (c < 32) { out += "\\u00"; out.push_back(hex[c >> 4]); out.push_back(hex[c & 15]); }
+        else out.push_back(char(c));
+    }
+    return out + '"';
+}
 struct Allocation {
     void* pointer = nullptr;
     ~Allocation() { if (pointer) cudaFree(pointer); }
@@ -157,6 +169,10 @@ class JsonOutput {
 // CUDA sampler buffers are fixed before READY. Host staging is pinned, and completion uses the same
 // bounded event/health polling as ModelWorker; no stream/device synchronize enters the service loop.
 class ServiceSampler {
+    struct PendingWork {
+        bool pending = false;
+        bool requires_process_exit() const noexcept { return pending; }
+    };
  public:
     ServiceSampler(size_t vocabulary, size_t context, cudaStream_t stream, Session& session,
                    GuardedTransport& transport, ModelWorkerBackend& execution)
@@ -165,8 +181,11 @@ class ServiceSampler {
         history_.allocate(context * sizeof(int32_t)); token_.allocate(sizeof(int32_t));
         host_logits_.allocate(vocabulary * sizeof(float)); host_bias_.allocate(vocabulary * sizeof(float));
         host_history_.allocate(context * sizeof(int32_t)); host_token_.allocate(sizeof(int32_t));
+        PendingWork work;
+        PendingDmaExitGuard lifetime(work);
         // sample_tokens caches split top-k scratch per stream on its first sampled call. Populate it before
         // READY so no request needs to allocate it; these dummy logits never enter model/request state.
+        work.pending = true;
         cuda_check(cudaMemsetAsync(logits_.pointer, 0, vocabulary * sizeof(float), stream_));
         kernels::SamplerParams warm;
         warm.top_k = 64; warm.top_p = 1.0f; warm.seed = 1;
@@ -174,6 +193,7 @@ class ServiceSampler {
                                warm, static_cast<int*>(token_.pointer), stream_);
         cuda_check(cudaGetLastError());
         require(wait());
+        work.pending = false;
     }
     Failure sample(const ServeRequest& request, const std::vector<int32_t>& history, uint64_t draw, int32_t& out) {
         const auto* logits = execution_.committed_logits();
@@ -181,6 +201,9 @@ class ServiceSampler {
             return Failure::fail(FailureCode::bad_operation, "sampler requires committed rank-zero logits");
         if (history.empty() || history.size() > context_)
             return Failure::fail(FailureCode::bad_operation, "sampler history exceeds fixed context capacity");
+        // This local guard also covers constructor failure, before an outer owner can observe the sampler.
+        PendingWork work;
+        PendingDmaExitGuard lifetime(work);
         if (draw == 0) {
             params_ = request.sampling;
             params_.penalty_last_n = std::min(params_.penalty_last_n, int(context_));
@@ -192,12 +215,14 @@ class ServiceSampler {
             auto* bias = static_cast<float*>(host_bias_.pointer);
             std::fill(bias, bias + vocabulary_, 0.0f);
             for (const auto& [id, value] : request.logit_bias) bias[id] = value;
+            work.pending = true;
             cuda_check(cudaMemcpyAsync(bias_.pointer, bias, vocabulary_ * sizeof(float), cudaMemcpyHostToDevice, stream_));
             params_.logit_bias = request.logit_bias.empty() ? nullptr : static_cast<const float*>(bias_.pointer);
         }
         params_.counter = request.sampling.counter + draw;
         std::memcpy(host_logits_.pointer, logits, vocabulary_ * sizeof(float));
         std::memcpy(host_history_.pointer, history.data(), history.size() * sizeof(int32_t));
+        work.pending = true;
         cuda_check(cudaMemcpyAsync(logits_.pointer, host_logits_.pointer, vocabulary_ * sizeof(float), cudaMemcpyHostToDevice, stream_));
         cuda_check(cudaMemcpyAsync(history_.pointer, host_history_.pointer, history.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream_));
         kernels::sample_tokens(static_cast<const float*>(logits_.pointer), 1, int(vocabulary_),
@@ -206,6 +231,7 @@ class ServiceSampler {
         cuda_check(cudaGetLastError());
         cuda_check(cudaMemcpyAsync(host_token_.pointer, token_.pointer, sizeof(int32_t), cudaMemcpyDeviceToHost, stream_));
         if (auto f = wait()) return f;
+        work.pending = false;
         out = *static_cast<const int32_t*>(host_token_.pointer);
         return {};
     }
@@ -287,7 +313,7 @@ int main(int argc, char** argv) {
             "library-path", "nccl-version", "library-provenance", "model-hash", "config-fingerprint",
             "pack", "native", "ple", "context", "logits-dir", "timeout-ms",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
-            "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash"};
+            "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) || args.contains(key.substr(2)))
@@ -330,8 +356,12 @@ int main(int argc, char** argv) {
                 "--graph-finish must be 0 or 1 and requires batched expert collectives");
         const bool graph_finish = graph_finish_value != 0;
         const auto mode = args.contains("mode") ? args.at("mode") : "teacher-forced";
-        require(mode == "teacher-forced" || mode == "autoregressive", "invalid distributed mode");
+        require(mode == "teacher-forced" || mode == "autoregressive" || mode == "multislot", "invalid distributed mode");
         const bool autoregressive = mode == "autoregressive";
+        const bool multislot = mode == "multislot";
+        const auto parallel = number("parallel", 1);
+        require((parallel == 1 || parallel == 4 || parallel == 8) && (multislot || !args.contains("parallel")),
+                "--parallel 1,4,8 requires --mode multislot");
         const bool mtp_enabled = args.contains("mtp-path");
         const auto mtp_drafts = number("mtp-drafts", 4);
         require((mtp_enabled || (!args.contains("mtp-drafts") && !args.contains("mtp-hash"))) &&
@@ -361,7 +391,7 @@ int main(int argc, char** argv) {
             context > 65536u)
             throw std::runtime_error("invalid rank, port, deadline or context");
         std::unique_ptr<JsonOutput> json;
-        if (autoregressive) {
+        if (autoregressive || multislot) {
             require(!args.contains("trace-dir") && !args.contains("state-dir") && !args.contains("logits-dir"),
                     "autoregressive mode does not accept teacher-forced evidence options");
             json = std::make_unique<JsonOutput>(rank == 0, uint32_t(timeout));
@@ -415,15 +445,17 @@ int main(int argc, char** argv) {
         core::set_native_embed(&embedding);
         core::SessionState state;
         Allocation state_memory, ple_embedding, ple_scratch;
-        state_memory.allocate(core::session_bytes(geometry, context, geometry.n_expert_used));
-        require(core::session_init(geometry, context, geometry.n_expert_used, state_memory.pointer, state) != 0,
-                "cannot initialize the full model session");
+        if (!multislot) {
+            state_memory.allocate(core::session_bytes(geometry, context, geometry.n_expert_used));
+            require(core::session_init(geometry, context, geometry.n_expert_used, state_memory.pointer, state) != 0,
+                    "cannot initialize the full model session");
+        }
         SessionLifetime state_lifetime{state};
         kernels::PleTable table;
         kernels::PleIoOptions ple_io; ple_io.mode = kernels::PleIo::Mmap; ple_io.cache_rows = 0;
         require(table.open(ple, err, ple_io), err);
         std::vector<float> ple_host;
-        wire_ple(weights, state, table, ple_embedding, ple_scratch, ple_host);
+        if (!multislot) wire_ple(weights, state, table, ple_embedding, ple_scratch, ple_host);
 
         Credential credential;
         require(Credential::from_env("STRATA_TP3_CREDENTIAL", credential));
@@ -447,6 +479,8 @@ int main(int argc, char** argv) {
                                        ":drafts=" + std::to_string(mtp_drafts) + ":context=" + std::to_string(context) +
                                        ":sha256=" + get("mtp-hash");
         }
+        if (multislot) join.config_fingerprint += ":multislot-v1:slots=" + std::to_string(parallel) +
+                                                  ":context=" + std::to_string(context);
         join.backend_identity = "nccl"; join.nccl_version_expected = version; join.library_provenance = provenance;
         join.nccl_bootstrap_id = std::string(256, '0');
         if (rank == 0) require(make_nccl_bootstrap_id(nccl_config.library_path, join.nccl_bootstrap_id, err), err);
@@ -482,6 +516,60 @@ int main(int argc, char** argv) {
                 std::cerr << "LOAD rank=" << rank << " stage=expert-finish-graphs count=" << stats.graph_count << '\n';
             }
             std::cerr << "LOAD rank=" << rank << " stage=expert-shards-complete bytes=" << experts.owned_weight_bytes() << std::endl;
+            if (multislot) {
+                SlotPoolConfig pool_config{uint32_t(parallel), uint32_t(context), uint32_t(timeout),
+                                            join.session_uuid, join.model_hash, uint32_t(rank), batched_experts, 0};
+                SlotPool pool(pool_config, {weights, geometry, head, table, collectives, experts, session, transport,
+                                            stream.value, [&] { return experts.requires_process_exit(); }});
+                PendingDmaExitGuard pool_lifetime(pool);
+                require(pool.initialize());
+                std::cerr << "LOAD rank=" << rank << " stage=slot-pool-complete slots=" << parallel
+                          << " session-arena-bytes=" << pool.allocated_session_bytes() << '\n';
+                std::unique_ptr<JsonInput> input;
+                std::vector<std::unique_ptr<ServiceSampler>> samplers;
+                if (rank == 0) {
+                    input = std::make_unique<JsonInput>();
+                    for (uint32_t slot = 0; slot < parallel; ++slot)
+                        samplers.push_back(std::make_unique<ServiceSampler>(size_t(geometry.n_vocab), size_t(context),
+                                             stream.value, session, transport, pool.execution(slot)));
+                }
+                PendingDmaExitGuard sampler_lifetime(pool);
+                MultiSlotServiceCallbacks callbacks;
+                callbacks.poll = [&](uint32_t wait, std::string& line, bool& eof) { return input->poll(wait, line, eof); };
+                callbacks.health = [&] { return transport.check_health(); };
+                callbacks.scheduler.broadcast = [&](std::string_view label, std::string& bytes) {
+                    Deadline at;
+                    if (auto f = session.operation_deadline(at)) return f;
+                    return session.broadcast_control_payload(label, bytes, at);
+                };
+                callbacks.scheduler.execute = [&](uint32_t slot, StepPhase phase, std::string_view request,
+                                                     int32_t token, uint64_t position) {
+                    const auto result = pool.execute(slot, phase, request, token, position);
+                    if (pool.requires_process_exit()) std::_Exit(2);
+                    return result.status == StepStatus::completed || result.status == StepStatus::cancelled ?
+                        Failure{} : result.failure ? result.failure : Failure::fail(FailureCode::comm_failed, "slot command failed");
+                };
+                callbacks.scheduler.sample = [&](uint32_t slot, const ServeRequest& request,
+                                                    const std::vector<int32_t>& history, uint64_t draw, int32_t& token) {
+                    return samplers.at(slot)->sample(request, history, draw, token);
+                };
+                callbacks.scheduler.abort_all = [&] { pool.abort(); };
+                callbacks.emit = [&](std::string_view type, std::string_view request, int32_t token,
+                                       std::string_view status, std::string_view reason) {
+                    std::string event;
+                    if (type == "rejected") {
+                        event = "{\"type\":\"rejected\",\"alive_ranks\":[0,1,2],\"request_id\":" +
+                                json_quote(request) + ",\"state\":\"ready\",\"reason\":" + json_quote(reason) + '}';
+                    } else event = serve_event(type, request, token, uint32_t(context), status);
+                    if (type == "ready") event.insert(event.size() - 1, ",\"slots\":" + std::to_string(parallel));
+                    json->emit(event);
+                };
+                const auto service_result = run_multislot_service({uint32_t(rank), uint32_t(parallel),
+                     int32_t(geometry.n_vocab), uint32_t(context)}, callbacks,
+                     std::min(config.budgets.operation_ms, session.roster().budgets.operation_ms));
+                if (pool.requires_process_exit()) std::_Exit(2);
+                require(service_result);
+            } else {
             ModelForward model(weights, geometry, state, int(rank), collectives, experts);
             model.native_head(&head);
             std::unique_ptr<ParityTraceWriter> trace;
@@ -654,6 +742,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 require(any && input.eof(), "GEN needs valid integer token IDs");
+            }
             }
             }
             transport.abort("driver finished");

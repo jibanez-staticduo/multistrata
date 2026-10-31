@@ -57,14 +57,15 @@ Worker::~Worker() {
 }
 
 Failure Worker::validate(const StepCommand& command) const {
-    if (config_.session.empty() || config_.manifest_hash.empty() || config_.rank >= kTpWorld) {
-        return Failure::fail(FailureCode::invalid_config, "worker identity/manifest/rank is invalid");
+    if (config_.session.empty() || config_.manifest_hash.empty() || config_.rank >= kTpWorld ||
+        config_.slot >= kWorkerMaxSlots || collective_sequence() == 0) {
+        return Failure::fail(FailureCode::invalid_config, "worker identity/manifest/rank/slot/cursor is invalid");
     }
     if (command.session != config_.session) return reject("foreign session");
     if (command.manifest_hash != config_.manifest_hash) {
         return Failure::fail(FailureCode::model_mismatch, "manifest mismatch");
     }
-    if (command.slot != 0) return reject("only C1 slot zero is supported");
+    if (command.slot != config_.slot) return reject("command belongs to another worker slot");
     if (command.step != next_step_ || next_step_ == std::numeric_limits<uint64_t>::max()) {
         return reject("stale, duplicate, skipped or exhausted step");
     }
@@ -126,24 +127,28 @@ Failure Worker::validate(const StepCommand& command) const {
             return reject("command belongs to another request");
         }
     }
-    if ((command.phase == StepPhase::abort || command.phase == StepPhase::checkpoint ||
-         command.phase == StepPhase::rollback) && !command.expected_collective_schedule.empty()) {
-        return reject("abort/checkpoint/rollback cannot carry a collective schedule");
+    if (!compute && !command.expected_collective_schedule.empty()) {
+        return reject("only prefill/decode may carry a collective schedule");
     }
-    return validate_schedule(command, next_collective_);
+    return validate_schedule(command, collective_sequence());
+}
+
+uint64_t Worker::collective_sequence() const {
+    return config_.collective_sequence ? *config_.collective_sequence : next_collective_;
 }
 
 std::string Worker::digest() const {
     // Explicit lengths keep opaque backend digest bytes unambiguous. Rank is omitted intentionally:
     // backend implementations supply their declared global/canonical state summary for peer comparison.
     std::string value = "noncrypto:worker-v1:" + std::to_string(static_cast<uint32_t>(state_)) + ":" +
-           std::to_string(next_step_) + ":" + std::to_string(next_collective_) + ":" +
+           std::to_string(next_step_) + ":" + std::to_string(collective_sequence()) + ":" +
            std::to_string(committed_positions_) + ":" + std::to_string(pending_positions_) + ":" +
            std::to_string(decoding_) + ":" + std::to_string(pending_decode_) + ":" +
            std::to_string(config_.session.size()) + ":" + config_.session + ":" +
            std::to_string(config_.manifest_hash.size()) + ":" + config_.manifest_hash + ":" +
            std::to_string(request_.size()) + ":" + request_ + ":" +
            std::to_string(backend_digest_.size()) + ":" + backend_digest_;
+    if (config_.slot != 0) value += ":slot=" + std::to_string(config_.slot);
     if (checkpoint_step_ != 0)
         value += ":checkpoint=" + std::to_string(checkpoint_step_) + ":" +
                  std::to_string(checkpoint_positions_) + ":" + std::to_string(checkpoint_decoding_);
@@ -186,6 +191,7 @@ StepResult Worker::execute(const StepCommand& command) {
     }
 
     try {
+        const uint64_t first_collective = collective_sequence();
         std::vector<ScheduledCollective> planned;
         if (auto f = backend_.plan(command, planned)) return fail(std::move(f));
         if (planned.size() != command.expected_collective_schedule.size() ||
@@ -210,6 +216,8 @@ StepResult Worker::execute(const StepCommand& command) {
             return fail(reject("state transition was not committed on all ranks"));
         }
         if (completed.state_digest.empty()) return fail(reject("backend supplied no state summary"));
+        if (collective_sequence() != first_collective)
+            return fail(reject("shared worker cursor changed during backend execution"));
 
         bool output_ready = false;
         switch (command.phase) {
@@ -258,7 +266,11 @@ StepResult Worker::execute(const StepCommand& command) {
             case StepPhase::abort: break;  // Handled before backend execution.
         }
         ++next_step_;
-        next_collective_ += command.expected_collective_schedule.size();
+        if (compute) {
+            const auto next = first_collective + command.expected_collective_schedule.size();
+            if (config_.collective_sequence) *config_.collective_sequence = next;
+            else next_collective_ = next;
+        }
         backend_digest_ = std::move(completed.state_digest);
         return {command.phase == StepPhase::cancel ? StepStatus::cancelled : StepStatus::completed,
                 {}, digest(), output_ready};

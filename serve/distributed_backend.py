@@ -2,7 +2,7 @@
 
 The configured command must own all three ranks and speak JSON lines on stdio.
 READY: type=ready, protocol=strata-distributed-v1, mode=autoregressive, world=3,
-alive_ranks=[0,1,2], max_context. Commands are generate(request_id, ids, max_new,
+alive_ranks=[0,1,2], max_context, slots=1|4|8 (optional for C1). Commands are generate(request_id, ids, max_new,
 sampling), cancel(request_id), and shutdown. Replies token(request_id, id,
 committed=true), done(request_id, state=ready), and cancelled(request_id,
 state=ready) must each include alive_ranks. Periodic health(state=ready|busy,
@@ -25,6 +25,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 
 
 PROTOCOL = "strata-distributed-v1"
@@ -133,11 +134,15 @@ def validate_config(cfg: dict) -> dict:
     for key in ("vision", "images", "replicas", "split_serve", "lazy_load", "idle_unload_s", "slot_save_path", "before_load"):
         if cfg.get(key):
             raise ValueError(f"distributed engine does not support {key}")
-    if cfg.get("parallel", 1) != 1:
-        raise ValueError("distributed engine currently serves one request at a time")
+    parallel = cfg.get("parallel", spec.get("parallel", 1))
+    if type(parallel) is not int or parallel not in (1, 4, 8):
+        raise ValueError("distributed parallel must be 1, 4 or 8")
+    if "parallel" in spec and (type(spec["parallel"]) is not int or spec["parallel"] != parallel):
+        raise ValueError("distributed parallel settings must agree")
     if cfg.get("arch") not in (None, "", "qwen4exp", "qwen35moe"):
         raise ValueError("distributed engine currently supports Qwen model families only")
     out = dict(spec)
+    out["parallel"] = parallel
     for key, default in (("ready_timeout", 60.0), ("health_timeout", 15.0),
                          ("process_deadline", 900.0), ("cancel_timeout", 10.0), ("shutdown_timeout", 5.0)):
         value = spec.get(key, default)
@@ -147,8 +152,22 @@ def validate_config(cfg: dict) -> dict:
     return out
 
 
+@dataclass
+class _Request:
+    token_limit: int
+    events: queue.Queue = field(init=False)
+    output_done: bool = False
+    cancel_sent: bool = False
+    cancel_ack: bool = False
+    received_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        # Tokens, done and a possible cancel acknowledgement fit without blocking the reader.
+        self.events = queue.Queue(maxsize=self.token_limit + 2)
+
+
 class DistributedEngine:
-    """One FIFO turn through a rank-zero coordinator, with group-wide failure."""
+    """Bounded concurrent turns through rank zero, with group-wide failure."""
 
     batch = 0
     distributed_health = True
@@ -160,6 +179,8 @@ class DistributedEngine:
             engine_error = EngineDied
         self._error_type = engine_error
         self.spec = validate_config(cfg)
+        self.parallel = self.spec["parallel"]
+        self.batch = self.parallel if self.parallel > 1 else 0
         self.n_vocab = MAX_TOKEN
         if cfg.get("tokenizer"):
             try:
@@ -170,27 +191,23 @@ class DistributedEngine:
             except (OSError, ValueError):
                 raise ValueError("distributed engine needs the native pack vocabulary") from None
         self.max_context = 0
-        self.info = {"backend": "distributed", "world": 3, "batch_slots": 0}
+        self.info = {"backend": "distributed", "world": 3, "batch_slots": self.batch}
+        self._local = threading.local()
         self.last = None
         self._lock = threading.RLock()
-        self._turn = threading.Lock()
+        self._capacity = threading.BoundedSemaphore(self.parallel)
+        self._write_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._cleanup_started = False
         self._ready = threading.Event()
-        # The reader enforces the request's token budget before enqueueing. Never block health on HTTP output.
-        self._events: queue.Queue = queue.Queue()
+        self._requests: dict[str, _Request] = {}
         self._terminal: str | None = None
         self._state = "starting"
         self._roster: list[int] = []
         self._last_health = time.monotonic()
-        self._request: str | None = None
-        self._output_done = False
-        self._cancel_sent = False
-        self._cancel_ack = False
-        self._token_limit = 0
-        self._received_tokens = 0
         self._write_done = threading.Event()
         self._write_done.set()
+        self._writers = 0
         self.proc = None
         try:
             # Discard stderr: a noisy worker cannot fill a pipe or expose prompts or keys in API errors.
@@ -209,6 +226,23 @@ class DistributedEngine:
         except BaseException:
             self.close()
             raise
+
+    @property
+    def last(self) -> dict | None:
+        return getattr(self._local, "last", None) if self.batch else getattr(self, "_last", None)
+
+    @last.setter
+    def last(self, value: dict | None) -> None:
+        if self.batch:
+            self._local.last = value
+        else:
+            self._last = value
+
+    @property
+    def _request(self) -> str | None:
+        """Keep the C1 inspection boundary while storing requests independently."""
+        with self._lock:
+            return next(iter(self._requests), None)
 
     def _fail(self, reason: str) -> None:
         with self._lock:
@@ -249,15 +283,17 @@ class DistributedEngine:
                                         if type(x) is int and x in ROSTER] if isinstance(msg.get("alive_ranks"), list) else []
                     raise ValueError
                 kind = msg.get("type")
-                event = False
+                event = None
                 with self._lock:
                     if self._terminal:
                         return
                     if kind == "ready" and not self._ready.is_set():
                         ctx = msg.get("max_context")
+                        slots = msg.get("slots", 1)
                         if (msg.get("protocol") != PROTOCOL or msg.get("mode") != "autoregressive"
                                 or type(msg.get("world")) is not int or msg["world"] != 3
-                                or type(ctx) is not int or ctx <= 0):
+                                or type(ctx) is not int or ctx <= 0
+                                or type(slots) is not int or slots != self.parallel):
                             raise ValueError
                         self.max_context, self._state = ctx, "ready"
                         self._ready.set()
@@ -266,34 +302,37 @@ class DistributedEngine:
                     elif kind == "health":
                         if msg.get("state") not in ("ready", "busy"):
                             raise ValueError
-                        self._state = msg["state"]
-                    elif kind in ("token", "done", "cancelled"):
-                        if not self._request or msg.get("request_id") != self._request:
+                        self._state = "busy" if any(not r.output_done for r in self._requests.values()) else msg["state"]
+                    elif kind in ("token", "done", "cancelled", "rejected"):
+                        request = self._requests.get(msg.get("request_id"))
+                        if request is None:
                             raise ValueError
                         if kind == "token":
-                            if (self._output_done or msg.get("committed") is not True
+                            if (request.output_done or msg.get("committed") is not True
                                     or type(msg.get("id")) is not int or msg["id"] < 0
-                                    or self._received_tokens >= self._token_limit):
+                                    or msg["id"] >= self.n_vocab
+                                    or request.received_tokens >= request.token_limit):
                                 raise ValueError
-                            self._received_tokens += 1
-                        elif msg.get("state") != "ready":
+                            request.received_tokens += 1
+                        elif msg.get("state") not in (("ready", "busy") if kind == "rejected" else ("ready",)):
                             raise ValueError
                         elif kind == "cancelled":
-                            if not self._cancel_sent or self._cancel_ack:
+                            if not request.cancel_sent or request.cancel_ack:
                                 raise ValueError
-                            self._cancel_ack = True
-                            self._output_done = True
+                            request.cancel_ack = True
+                            request.output_done = True
                         else:
-                            if self._output_done:
+                            if request.output_done or (kind == "rejected" and request.received_tokens):
                                 raise ValueError
-                            self._output_done = True
-                        event = True
+                            request.output_done = True
+                        self._state = "busy" if any(not r.output_done for r in self._requests.values()) else "ready"
+                        event = request.events
                     else:
                         raise ValueError
                     self._roster, self._last_health = list(ROSTER), time.monotonic()
-                if event:
-                    self._events.put_nowait(msg)
-        except (OSError, ValueError, UnicodeError, queue.Full):
+                if event is not None:
+                    event.put_nowait(msg)
+        except (OSError, ValueError, TypeError, UnicodeError, queue.Full):
             self._fail("the distributed coordinator sent invalid group state")
 
     def health(self) -> dict:
@@ -325,42 +364,55 @@ class DistributedEngine:
         except (ValueError, TypeError):
             raise ValueError("distributed request must contain finite JSON values") from None
         sent = threading.Event()
-        self._write_done = sent
         failed = []
 
         def write():
             try:
-                self.proc.stdin.write(data)
-                self.proc.stdin.flush()
+                with self._write_lock:
+                    # A timed-out predecessor must never be followed by another command.
+                    self._check()
+                    self.proc.stdin.write(data)
+                    self.proc.stdin.flush()
             except (OSError, ValueError):
+                failed.append(True)
+            except RuntimeError:
                 failed.append(True)
             finally:
                 sent.set()
+                with self._lock:
+                    self._writers -= 1
+                    if not self._writers:
+                        self._write_done.set()
 
-        threading.Thread(target=write, daemon=True, name="strata-distributed-input").start()
+        with self._lock:
+            self._writers += 1
+            self._write_done.clear()
+            threading.Thread(target=write, daemon=True, name="strata-distributed-input").start()
         if not sent.wait(timeout) or failed:
             self._fail("the distributed coordinator did not accept the command")
             self._check()
 
-    def _next(self, deadline: float) -> dict | None:
+    def _next(self, request: _Request, deadline: float) -> dict | None:
         self._check()
         if time.monotonic() >= deadline:
             self._fail("the distributed request deadline expired")
             self._check()
         try:
-            msg = self._events.get(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
+            msg = request.events.get(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
         except queue.Empty:
             return None
         self._check()
         return msg
 
-    def _cancel(self, request: str) -> None:
+    def _cancel(self, request_id: str, request: _Request) -> None:
         deadline = time.monotonic() + self.spec["cancel_timeout"]
         with self._lock:
-            self._cancel_sent = True
-        self._send({"type": "cancel", "request_id": request}, self.spec["cancel_timeout"])
+            if request.output_done:
+                return
+            request.cancel_sent = True
+        self._send({"type": "cancel", "request_id": request_id}, self.spec["cancel_timeout"])
         while True:
-            msg = self._next(deadline)
+            msg = self._next(request, deadline)
             if msg and msg["type"] == "cancelled":
                 return
 
@@ -383,23 +435,41 @@ class DistributedEngine:
                    "max_new": max_new, "sampling": sampling}
         if len((json.dumps(message, separators=(",", ":"), allow_nan=False) + "\n").encode()) > MAX_LINE:
             raise ValueError("distributed request exceeds one MiB")
-        with self._turn:
+        deadline = time.monotonic() + self.spec["process_deadline"]
+        queue_deadline = getattr(cancel, "_strata_queue_deadline", None)
+        admission_deadline = min(deadline, queue_deadline) if queue_deadline is not None else deadline
+        heartbeat = time.monotonic()
+        while not self._capacity.acquire(timeout=.05):
             self._check()
             if cancel.is_set():
                 return
+            if time.monotonic() >= admission_deadline:
+                raise ValueError("the distributed request admission deadline expired")
+            if time.monotonic() - heartbeat >= 1.0:
+                heartbeat = time.monotonic()
+                yield None
+        try:
+            self._check()
+            if cancel.is_set():
+                return
+            if time.monotonic() >= admission_deadline:
+                raise ValueError("the distributed request admission deadline expired")
             complete, submitted = False, False
+            state = _Request(max_new)
             with self._lock:
-                self._request, self._state = request, "busy"
-                self._output_done, self._cancel_sent, self._cancel_ack = False, False, False
-                self._token_limit, self._received_tokens = max_new, 0
-            deadline = time.monotonic() + self.spec["process_deadline"]
+                if request in self._requests:
+                    raise ValueError("duplicate distributed request ID")
+                self._requests[request], self._state = state, "busy"
             count = 0
             heartbeat = time.monotonic()
             try:
-                self._send(message, self.spec["process_deadline"])
+                self._send(message, max(.001, deadline - time.monotonic()))
                 submitted = True
+                started = getattr(cancel, "_strata_queue_started", None)
+                if started is not None:
+                    started()
                 while not cancel.is_set():
-                    msg = self._next(deadline)
+                    msg = self._next(state, deadline)
                     if msg is None:
                         if time.monotonic() - heartbeat >= 1.0:
                             heartbeat = time.monotonic()
@@ -409,6 +479,9 @@ class DistributedEngine:
                         self.last = {"generated": count}
                         complete = True
                         break
+                    if msg["type"] == "rejected":
+                        complete = True
+                        raise ValueError("the distributed coordinator could not admit the request; retry later")
                     if msg["type"] != "token" or count >= max_new:
                         self._fail("the distributed coordinator violated the generation boundary")
                         self._check()
@@ -418,14 +491,20 @@ class DistributedEngine:
                 try:
                     # Generator.close() (EOS, stop strings, disconnected HTTP) must also drain the group turn.
                     if submitted and not complete and self.alive():
-                        self._cancel(request)
+                        self._cancel(request, state)
                 finally:
                     with self._lock:
-                        self._request = None
+                        self._requests.pop(request, None)
                         if self._terminal is None:
-                            self._state = "ready"
+                            self._state = "busy" if any(not r.output_done for r in self._requests.values()) else "ready"
                     if self._terminal:
                         self.close()
+        finally:
+            self._capacity.release()
+
+    def generate_batched(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event,
+                         embeddings=None) -> Iterator[int | None]:
+        yield from self.generate(ids, max_new, sampling, cancel, embeddings)
 
     def close(self) -> None:
         """Bounded process shutdown; never wait on stderr or a blocked stdin writer."""

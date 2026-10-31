@@ -60,6 +60,9 @@ void canonical_fields() {
           "checkpoint and rollback participate distinctly in exact agreement");
     check(uint32_t(StepPhase::abort) == 6 && uint32_t(StepPhase::checkpoint) == 7 &&
           uint32_t(StepPhase::rollback) == 8, "new phases append without changing existing wire values");
+    a = baseline; a.slot = kWorkerMaxSlots - 1;
+    check(!canonical_step_command(a, left) && left != original,
+          "configured final slot identity participates in complete command agreement");
 }
 void model_schedule() {
     StepCommand command{"session", "request", 0, 3, StepPhase::prefill, {4}, {0}, "manifest", {}};

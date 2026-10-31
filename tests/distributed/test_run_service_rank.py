@@ -1,5 +1,6 @@
 """Service launcher boundaries with real local children; no GPU, SSH or model."""
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -62,6 +63,86 @@ def change_binary(config, text):
     path = Path(config["binary"])
     path.write_text("#!/usr/bin/python3\n" + text)
     config["binary_sha256"] = runner.digest(path)
+
+
+def mtp_args(config, tmp_path, rank="0"):
+    root = tmp_path / "mtp"
+    root.mkdir()
+    for name in ("dense.txt", "dense.bin", "experts.bin"):
+        (root / name).write_text(name)
+    manifest = "strata-mtp-runtime-v1\n" + "".join(
+        name + ":" + runner.digest(root / name)[7:] + "\n" for name in ("dense.txt", "dense.bin", "experts.bin"))
+    args = list(config["args"])
+    args[args.index("--rank") + 1] = rank
+    return args + ["--mtp-path", str(root), "--mtp-drafts", "4", "--mtp-hash",
+                   hashlib.sha256(manifest.encode()).hexdigest()]
+
+
+def test_mtp_root_dry_run_verifies_files_without_credentials(config, tmp_path, monkeypatch):
+    args = mtp_args(config, tmp_path, rank="00")
+    monkeypatch.setattr(runner, "credential", lambda *_: pytest.fail("read credential"))
+    result = runner.run(dict(config, args=args))
+    assert result["mode"] == "autoregressive" and result["native_command"][-6:] == args[-6:]
+    for name in ("dense.txt", "dense.bin", "experts.bin"):
+        path = tmp_path / "mtp" / name
+        original = path.read_bytes()
+        path.write_bytes(b"changed")
+        with pytest.raises(runner.RunnerError, match="hash mismatch"):
+            runner.run(dict(config, args=args))
+        path.unlink()
+        with pytest.raises(runner.RunnerError, match="accessible"):
+            runner.run(dict(config, args=args))
+        path.write_bytes(original)
+    (tmp_path / "mtp/draft_vocab.bin").write_bytes(b"unapproved")
+    with pytest.raises(runner.RunnerError, match="subset"):
+        runner.run(dict(config, args=args))
+
+
+def test_mtp_follower_does_not_need_runtime_files(config, tmp_path):
+    args = mtp_args(config, tmp_path, rank="1")
+    for path in (tmp_path / "mtp").iterdir():
+        path.unlink()
+    (tmp_path / "mtp").rmdir()
+    assert runner.run(dict(config, args=args))["rank"] == 1
+
+
+@pytest.mark.parametrize("change", ["missing", "hash", "drafts", "path", "unknown", "duplicate", "multislot"])
+def test_mtp_invalid_fields_are_not_hidden(config, tmp_path, change):
+    args = mtp_args(config, tmp_path)
+    if change == "missing":
+        args = args[:-2]
+    elif change in ("hash", "drafts", "path"):
+        flag, value = {"hash": ("--mtp-hash", "A" * 64), "drafts": ("--mtp-drafts", "5"),
+                       "path": ("--mtp-path", "relative")}[change]
+        args[args.index(flag) + 1] = value
+    elif change == "unknown":
+        args += ["--mtp-unknown", "1"]
+    elif change == "duplicate":
+        args += ["--mtp-drafts", "2"]
+    with pytest.raises(runner.RunnerError):
+        runner.run(dict(config, args=args, **({"mode": "multislot"} if change == "multislot" else {})))
+
+
+@pytest.mark.parametrize("parallel", [1, 4, 8])
+def test_multislot_parallel_config_command_and_receipt(config, parallel):
+    cfg = runner.validated(dict(config, mode="multislot", parallel=parallel))
+    server = runner.server_config(cfg)
+    assert server["parallel"] == server["distributed"]["parallel"] == parallel
+    assert server["distributed"]["ready_timeout"] >= 300
+    assert server["distributed"]["command"] == [config["binary"], "--mode", "multislot", *config["args"],
+                                                 "--parallel", str(parallel)]
+    result = runner.run(dict(config, mode="multislot", parallel=parallel))
+    assert result["mode"] == "multislot" and result["native_command"] == server["distributed"]["command"]
+
+
+@pytest.mark.parametrize("fields,args", [({"mode": "unknown"}, []), ({"parallel": 4}, []),
+    ({"mode": "multislot", "parallel": True}, []), ({}, ["--parallel", "1"]),
+    ({"mode": "multislot", "parallel": 4}, ["--parallel", "8"]),
+    ({"mode": "multislot"}, ["--parallel", "2"]),
+    ({"mode": "multislot"}, ["--parallel", "4", "--parallel", "4"])])
+def test_mode_and_parallel_are_strict(config, fields, args):
+    with pytest.raises(runner.RunnerError):
+        runner.validated(dict(config, args=config["args"] + args, **fields))
 
 
 def test_dry_run_hashes_without_reading_credential_or_launch(config, monkeypatch):

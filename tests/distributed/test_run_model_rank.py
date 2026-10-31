@@ -82,6 +82,24 @@ def test_explicit_batched_polling_policy_and_64k_bounds(config):
             runner.validated(dict(config, args=wrong))
 
 
+@pytest.mark.parametrize("policy,value,allowed", [("batched", "1", True), ("sequential", "0", True),
+    ("sequential", "1", False), ("batched", "2", False), ("batched", "01", False)])
+def test_graph_finish_policy(config, policy, value, allowed):
+    config["args"] += ["--expert-collectives", policy, "--graph-finish", value]
+    if allowed:
+        assert runner.validated(config)["options"]["graph-finish"] == value
+    else:
+        with pytest.raises(runner.RunnerError):
+            runner.validated(config)
+
+
+@pytest.mark.parametrize("flag", ["--mtp-path", "--mtp-drafts", "--mtp-hash", "--parallel"])
+def test_teacher_parser_refuses_service_flags(config, flag):
+    config["args"] += [flag, "1"]
+    with pytest.raises(runner.RunnerError, match="unknown"):
+        runner.validated(config)
+
+
 def test_execute_redaction_exact_input_and_hashes(config, tmp_path, monkeypatch):
     calls = fake_process(monkeypatch, config)
     monkeypatch.setenv("NCCL_NET", "Socket")

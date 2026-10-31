@@ -29,7 +29,7 @@ class RunnerError(ValueError):
 FLAGS = frozenset("rank rank0-address port session-uuid library-path nccl-version library-provenance model-hash config-fingerprint pack native ple context timeout-ms logits-dir".split())
 STATE_FLAGS = frozenset({"state-dir", "state-positions", "state-max-bytes"})
 TRACE_FLAGS = frozenset({"trace-dir"})
-POLICY_FLAGS = frozenset({"expert-collectives", "poll-interval-ms"})
+POLICY_FLAGS = frozenset({"expert-collectives", "poll-interval-ms", "graph-finish"})
 NETWORK_ENV = frozenset("NCCL_IB_HCA NCCL_SOCKET_IFNAME NCCL_IB_GID_INDEX NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE NCCL_IB_ROCE_VERSION_NUM NCCL_CROSS_NIC NCCL_IB_QPS_PER_CONNECTION NCCL_IB_TC NCCL_IB_SL NCCL_IB_TIMEOUT NCCL_IB_RETRY_CNT NCCL_NET_GDR_LEVEL NCCL_CUMEM_ENABLE NCCL_IB_MERGE_NICS NCCL_IB_SUBNET_AWARE_ROUTING NCCL_NET_MERGE_LEVEL NCCL_NVLS_ENABLE NCCL_IGNORE_CPU_AFFINITY".split())
 SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
@@ -56,6 +56,9 @@ def validated(config):
         raise RunnerError("args must provide every distributed model flag exactly once")
     if options.get("expert-collectives", "sequential") not in ("sequential", "batched"):
         raise RunnerError("invalid expert collective policy")
+    graph_finish = options.get("graph-finish", "0")
+    if graph_finish not in ("0", "1") or (graph_finish == "1" and options.get("expert-collectives") != "batched"):
+        raise RunnerError("graph-finish must be 0 or 1 and requires batched expert collectives")
     poll = options.get("poll-interval-ms", "1")
     if not poll.isdigit() or not 0 <= int(poll) <= 1000:
         raise RunnerError("poll interval must be in 0..1000 ms")

@@ -2840,7 +2840,8 @@ if(STRATA_BUILD_DISTRIBUTED)
                  src/distributed/serve_protocol.cpp src/distributed/autoregressive.cpp
                  src/distributed/model_checkpoint.cpp src/distributed/model_state.cpp
                  src/distributed/speculative.cpp src/distributed/cuda_segment_graph.cpp
-                 src/distributed/mtp_service.cpp)
+                 src/distributed/mtp_service.cpp src/distributed/slot_pool.cpp src/distributed/multislot.cpp
+                 src/distributed/multislot_service.cpp)
   target_compile_definitions(strata-distributed PRIVATE STRATA_BUILD_DISTRIBUTED
                              STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE
                              STRATA_MODEL_CHECKPOINT_WITH_CUDA)
@@ -2947,6 +2948,18 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_include_directories(test_speculative PRIVATE include)
   target_link_libraries(test_speculative PRIVATE strata_warnings)
   add_test(NAME test_speculative COMMAND test_speculative)
+
+  add_executable(test_multislot tests/distributed/test_multislot.cpp src/distributed/multislot.cpp
+                 src/distributed/serve_protocol.cpp)
+  target_include_directories(test_multislot PRIVATE include)
+  target_link_libraries(test_multislot PRIVATE strata_warnings)
+  add_test(NAME test_multislot COMMAND test_multislot)
+
+  add_executable(test_multislot_service tests/distributed/test_multislot_service.cpp
+                 src/distributed/multislot_service.cpp src/distributed/multislot.cpp src/distributed/serve_protocol.cpp)
+  target_include_directories(test_multislot_service PRIVATE include)
+  target_link_libraries(test_multislot_service PRIVATE strata_warnings)
+  add_test(NAME test_multislot_service COMMAND test_multislot_service)
 
   add_executable(test_model_worker_command tests/distributed/test_model_worker_command.cpp
                                           src/distributed/model_worker.cpp)

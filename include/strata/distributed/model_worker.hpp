@@ -27,7 +27,8 @@ struct ModelWorkerConfig {
     uint64_t checkpoint_max_context = 0;
 };
 
-// CUDA C1 uncaptured bridge. Borrowed model, collectives, session, transport and stream outlive this
+// CUDA single-slot uncaptured bridge. Every slot owns a model; serialized slots may share collectives.
+// Borrowed model, collectives, session, transport and stream outlive this
 // object. Init initializes the model and zeros request state. Candidate forward mutates private model
 // state, but no logits escape until explicit group commit. Failure permanently invalidates the model.
 class ModelWorkerBackend final : public ExecutionBackend {

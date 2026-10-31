@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import io
 import json
@@ -330,7 +331,7 @@ def test_spawn_errors_never_echo_argv():
     assert "private" not in str(exc.value)
 
 
-@pytest.mark.parametrize("key,value", [("parallel", 8), ("replicas", 3), ("vision", {"exe": "x"}),
+@pytest.mark.parametrize("key,value", [("parallel", 2), ("replicas", 3), ("vision", {"exe": "x"}),
                                        ("split_serve", {"decode_gpu": 1}), ("lazy_load", True)])
 def test_incompatible_profiles_are_rejected(key, value):
     cfg = config()
@@ -420,3 +421,291 @@ def test_http_failed_distributed_group_requires_explicit_restart(make_engine):
     message = json.loads(body)["error"]["message"]
     assert "restart the distributed group" in message
     assert "next request restarts" not in message
+
+
+MULTISLOT_COORDINATOR = r'''
+import json, sys, threading, time
+slots, cohort, mode = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+output, state = threading.Lock(), threading.Lock()
+active, workers = set(), {}
+gate = threading.Event()
+def emit(kind, **kw):
+    with output:
+        print(json.dumps(dict(type=kind, alive_ranks=[0,1,2], **kw)), flush=True)
+emit('ready', protocol='strata-distributed-v1', mode='autoregressive', world=3,
+     max_context=32768, slots=slots)
+def beat():
+    while True:
+        time.sleep(.02)
+        with state:
+            busy = bool(active)
+        emit('health', state='busy' if busy else 'ready')
+threading.Thread(target=beat, daemon=True).start()
+def generate(msg, stopped):
+    rid = msg['request_id']
+    try:
+        while not gate.wait(.01):
+            if stopped.is_set():
+                return
+        if msg['ids'][0] == 900:
+            stopped.wait(2)
+            return
+        if mode == 'api':
+            text = '</think>\n\nHello.'
+            if msg['sampling'].get('seed') == 7:
+                text = '</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>'
+            values = list(text.encode())
+        else:
+            values = msg['ids'][:msg['max_new']]
+        if msg['ids'][0] == 999:
+            values = [65] * (msg['max_new'] + 1)
+        if msg['ids'][0] == 997:
+            emit('token', request_id='unknown', id=65, committed=True)
+            return
+        for token in values:
+            if stopped.wait(.003):
+                return
+            emit('token', request_id=rid, id=token, committed=True)
+        emit('done', request_id=rid, state='ready')
+        if msg['ids'][0] == 996:
+            emit('done', request_id=rid, state='ready')
+    finally:
+        with state:
+            active.discard(rid)
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg['type'] == 'shutdown':
+        break
+    rid = msg['request_id']
+    if msg['type'] == 'cancel':
+        if rid in workers:
+            stopped, worker = workers[rid]
+            stopped.set()
+            worker.join()
+        emit('cancelled', request_id=rid, state='ready')
+        continue
+    if msg['ids'][0] == 998:
+        emit('rejected', request_id=rid, state='busy')
+        continue
+    with state:
+        active.add(rid)
+        if len(active) > slots:
+            emit('error')
+        if len(active) >= cohort:
+            gate.set()
+    stopped = threading.Event()
+    worker = threading.Thread(target=generate, args=(msg, stopped), daemon=True)
+    workers[rid] = stopped, worker
+    worker.start()
+'''
+
+
+@pytest.fixture
+def make_multislot():
+    engines = []
+
+    def make(slots=4, cohort=2, mode="echo", requested=None, **options):
+        cfg = config(**options)
+        cfg["parallel"] = slots if requested is None else requested
+        cfg["distributed"]["command"] = [sys.executable, "-u", "-c", MULTISLOT_COORDINATOR,
+                                             str(slots), str(cohort), mode]
+        engine = DistributedEngine(cfg)
+        engines.append(engine)
+        return engine
+
+    yield make
+    for engine in engines:
+        engine.close()
+
+
+@pytest.mark.parametrize("value", [0, 2, 3, 16, True, 4.0, "4"])
+def test_distributed_parallel_only_allows_native_capacities(value):
+    cfg = config(parallel=value)
+    with pytest.raises(ValueError, match="parallel"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize("slots,requested", [(1, 4), (4, 8), (8, 4)])
+def test_multislot_handshake_requires_exact_capacity(make_multislot, slots, requested):
+    with pytest.raises(EngineDied):
+        make_multislot(slots, requested=requested)
+
+
+def test_legacy_handshake_cannot_enable_concurrency():
+    cfg = config()
+    cfg["parallel"] = 4
+    with pytest.raises(EngineDied):
+        DistributedEngine(cfg)
+
+
+@pytest.mark.parametrize("slots", [4, 8])
+def test_multislot_routes_interleaved_mixed_requests_and_bounds_admission(make_multislot, slots):
+    engine = make_multislot(slots, cohort=slots)
+    assert engine.batch == engine.info["batch_slots"] == slots
+    peak = 0
+    original = engine._send
+
+    def send(message, timeout):
+        nonlocal peak
+        with engine._lock:
+            peak = max(peak, len(engine._requests))
+        return original(message, timeout)
+
+    engine._send = send
+    prompts = [[100 + i] * (5 + i) for i in range(slots + 3)]
+    with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
+        results = list(pool.map(lambda ids: list(engine.generate_batched(ids, len(ids), {}, threading.Event())), prompts))
+    assert results == prompts
+    assert peak == slots
+    assert engine.alive() and not engine._requests
+
+
+def test_multislot_serializes_large_jsonl_writes(make_multislot):
+    engine = make_multislot(cohort=4)
+    prompts = [[100 + index] * 10000 for index in range(4)]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda ids: list(engine.generate(ids, 3, {}, threading.Event())), prompts))
+    assert results == [ids[:3] for ids in prompts]
+    assert engine.alive()
+
+
+def test_blocked_stdin_write_fails_all_requests_with_bounded_cleanup(make_multislot):
+    cfg = config(process_deadline=.15, shutdown_timeout=.1)
+    cfg["parallel"] = 4
+    cfg["distributed"]["command"] = [sys.executable, "-u", "-c", r'''
+import json, time
+print(json.dumps(dict(type='ready', protocol='strata-distributed-v1', mode='autoregressive',
+      world=3, alive_ranks=[0,1,2], slots=4, max_context=32768)), flush=True)
+while True:
+    time.sleep(.02)
+    print(json.dumps(dict(type='health', state='ready', alive_ranks=[0,1,2])), flush=True)
+''']
+    engine = DistributedEngine(cfg)
+    started = time.monotonic()
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(lambda: list(engine.generate([12345] * 20000, 1, {}, threading.Event())))
+                       for _ in range(4)]
+            for future in futures:
+                with pytest.raises(EngineDied):
+                    future.result(timeout=2)
+        assert time.monotonic() - started < 2
+        assert engine.proc.poll() is not None
+    finally:
+        engine.close()
+
+
+@pytest.mark.parametrize("slots", [4, 8])
+def test_cancel_during_prefill_is_isolated_and_releases_only_its_slot(make_multislot, slots):
+    engine = make_multislot(slots, cohort=2)
+    cancel = threading.Event()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = pool.submit(lambda: list(engine.generate([900], 1, {}, cancel)))
+        survivor = pool.submit(lambda: list(engine.generate([42] * 80, 80, {}, threading.Event())))
+        deadline = time.monotonic() + 1
+        while len(engine._requests) != 2 and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert len(engine._requests) == 2
+        cancel.set()
+        assert pending.result(timeout=1) == []
+        assert engine.health()["state"] == "busy"
+        assert survivor.result(timeout=2) == [42] * 80
+    assert engine.alive()
+    assert list(engine.generate([1], 1, {}, threading.Event())) == [1]
+
+
+def test_multislot_generator_close_cancels_only_its_request(make_multislot):
+    engine = make_multislot(cohort=1)
+    stream = engine.generate([17] * 100, 100, {}, threading.Event())
+    assert next(stream) == 17
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        survivor = pool.submit(lambda: list(engine.generate([42] * 50, 50, {}, threading.Event())))
+        stream.close()
+        assert survivor.result(timeout=2) == [42] * 50
+    assert engine.alive()
+
+
+@pytest.mark.parametrize("marker", [999, 997])
+def test_one_invalid_stream_fails_all_active_requests(make_multislot, marker):
+    engine = make_multislot(cohort=2)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(lambda ids=ids: list(engine.generate(ids, len(ids), {}, threading.Event())))
+                   for ids in ([marker], [42] * 200)]
+        for future in futures:
+            with pytest.raises(EngineDied):
+                future.result(timeout=2)
+    assert not engine.alive()
+
+
+def test_duplicate_terminal_fails_remaining_active_requests(make_multislot):
+    engine = make_multislot(cohort=2)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        finished = pool.submit(lambda: list(engine.generate([996], 1, {}, threading.Event())))
+        survivor = pool.submit(lambda: list(engine.generate([42] * 200, 200, {}, threading.Event())))
+        # The first valid done may already have reached its caller before the duplicate is read.
+        try:
+            assert finished.result(timeout=2) == [996]
+        except EngineDied:
+            pass
+        with pytest.raises(EngineDied):
+            survivor.result(timeout=2)
+    assert not engine.alive()
+
+
+def test_native_rejection_and_invalid_preflight_leave_other_stream_running(make_multislot):
+    engine = make_multislot(cohort=1)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        survivor = pool.submit(lambda: list(engine.generate([42] * 100, 100, {}, threading.Event())))
+        with pytest.raises(ValueError, match="admit"):
+            list(engine.generate([998], 1, {}, threading.Event()))
+        with pytest.raises(ValueError):
+            list(engine.generate([17], 1, {"temperature": float("nan")}, threading.Event()))
+        assert survivor.result(timeout=2) == [42] * 100
+    assert engine.alive()
+
+
+@pytest.mark.parametrize("cancelled", [True, False])
+def test_queued_cancel_or_deadline_does_not_affect_active_requests(make_multislot, cancelled):
+    engine = make_multislot(cohort=1)
+    streams = [engine.generate([17] * 100, 100, {}, threading.Event()) for _ in range(4)]
+    for stream in streams:
+        assert next(stream) == 17
+    cancel = threading.Event()
+    if not cancelled:
+        cancel._strata_queue_deadline = time.monotonic() + .08
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        queued = pool.submit(lambda: list(engine.generate([42], 1, {}, cancel)))
+        time.sleep(.06)
+        if cancelled:
+            cancel.set()
+            assert queued.result(timeout=.5) == []
+        else:
+            with pytest.raises(ValueError, match="admission deadline"):
+                queued.result(timeout=.5)
+    assert len(engine._requests) == 4 and engine.alive()
+    for stream in streams:
+        stream.close()
+
+
+@pytest.mark.parametrize("slots", [4, 8])
+def test_concurrent_http_streams_use_adapter_and_existing_tool_parser(make_multislot, slots):
+    engine = make_multislot(slots, cohort=slots, mode="api", process_deadline=5)
+    with http_service(engine) as port, contextlib.redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=slots) as pool:
+        def call(index):
+            return request(port, "/v1/chat/completions", {
+                "model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 200,
+                "stream": True, "seed": 7 if index == 0 else 8,
+                "tools": [{"type": "function", "function": {"name": "get_weather",
+                          "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+            })
+        responses = list(pool.map(call, range(slots)))
+    for index, (status, raw) in enumerate(responses):
+        assert status == 200 and "data: [DONE]" in raw
+        events = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+        deltas = [choice.get("delta", {}) for event in events for choice in event.get("choices", [])]
+        if index == 0:
+            calls = [call for delta in deltas for call in delta.get("tool_calls", [])]
+            assert any(call.get("function", {}).get("name") == "get_weather" for call in calls)
+            assert "Paris" in "".join(call.get("function", {}).get("arguments", "") for call in calls)
+        else:
+            assert "".join(delta.get("content", "") for delta in deltas) == "Hello."

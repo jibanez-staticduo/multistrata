@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -378,6 +379,136 @@ void checkpoint_failures() {
         }
     }
 }
+
+void serialized_slots() {
+    struct SlotBackend final : ExecutionBackend {
+        uint64_t& cursor;
+        std::vector<int32_t> tokens;
+        std::vector<uint64_t> executed;
+        bool failed = false;
+        int aborts = 0;
+        explicit SlotBackend(uint64_t& sequence) : cursor(sequence) {}
+        Failure plan(const StepCommand& c, std::vector<ScheduledCollective>& out) const override {
+            out.clear();
+            if (c.phase == StepPhase::prefill || c.phase == StepPhase::decode)
+                for (uint64_t i = 0; i < uint64_t(c.tokens.front() % 4 + 1); ++i)
+                    out.push_back(operation(cursor + i, c.step, "slot-compute"));
+            return {};
+        }
+        Failure agree(const StepCommand&) override { return {}; }
+        Failure begin(const StepCommand& c) override {
+            if (c.phase == StepPhase::prefill || c.phase == StepPhase::decode)
+                tokens.insert(tokens.end(), c.tokens.begin(), c.tokens.end());
+            if (c.phase == StepPhase::reset || c.phase == StepPhase::cancel) tokens.clear();
+            return {};
+        }
+        Failure collective(const ScheduledCollective& c) override { executed.push_back(c.descriptor.operation.sequence); return {}; }
+        Failure finish(const StepCommand&, BackendCompletion& out) override {
+            if (failed) return Failure::fail(FailureCode::comm_failed, "injected slot failure");
+            out = {true, true, true, "slot-model-state"}; return {};
+        }
+        void abort() noexcept override { ++aborts; }
+        void discard_session() noexcept override { tokens.clear(); }
+    };
+    uint64_t cursor = 1;
+    std::vector<std::unique_ptr<SlotBackend>> backends;
+    std::vector<std::unique_ptr<Worker>> workers;
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+        backends.push_back(std::make_unique<SlotBackend>(cursor));
+        workers.push_back(std::make_unique<Worker>(WorkerConfig{"session", "manifest", 0, slot, &cursor}, *backends.back()));
+    }
+    auto command = [&](uint32_t slot, StepPhase phase, std::string request, int32_t token = -1, uint64_t position = 0) {
+        StepCommand c{"session", std::move(request), slot, workers[slot]->next_step(), phase, {}, {}, "manifest", {}};
+        if (phase == StepPhase::prefill || phase == StepPhase::decode) { c.tokens = {token}; c.positions = {position}; }
+        backends[slot]->plan(c, c.expected_collective_schedule);
+        return c;
+    };
+    auto execute = [&](uint32_t slot, StepPhase phase, std::string request, int32_t token = -1, uint64_t position = 0) {
+        return workers[slot]->execute(command(slot, phase, std::move(request), token, position));
+    };
+    for (uint32_t slot = 0; slot < 3; ++slot)
+        check(execute(slot, StepPhase::init, "").status == StepStatus::completed && cursor == 1,
+              "each slot initializes without consuming shared collective sequence");
+    auto stale = command(2, StepPhase::prefill, "slot-two", 2);
+    check(execute(0, StepPhase::prefill, "slot-zero", 0).status == StepStatus::completed && cursor == 2,
+          "slot zero consumes first global collective");
+    const auto before = workers[2]->next_step();
+    auto result = workers[2]->execute(stale);
+    check(result.status == StepStatus::rejected && !result.output_ready && workers[2]->next_step() == before &&
+          backends[2]->tokens.empty() && cursor == 2, "schedule planned before another slot advanced is rejected without mutation");
+    check(execute(1, StepPhase::prefill, "slot-one", 1).status == StepStatus::completed && cursor == 4 &&
+          execute(2, StepPhase::prefill, "slot-two", 2).status == StepStatus::completed && cursor == 7,
+          "serialized slots consume contiguous varying global collective extents");
+    for (uint32_t slot = 0; slot < 3; ++slot)
+        check(execute(slot, StepPhase::commit, "slot-" + std::string(slot == 0 ? "zero" : slot == 1 ? "one" : "two")).output_ready &&
+              cursor == 7 && workers[slot]->next_step() == 4, "each slot commits independently without advancing collective cursor");
+    auto wrong = command(1, StepPhase::decode, "slot-one", 5, 1); wrong.slot = 0;
+    result = workers[1]->execute(wrong);
+    check(result.status == StepStatus::rejected && cursor == 7 && !result.output_ready,
+          "worker rejects another slot's command before backend mutation");
+    wrong = command(2, StepPhase::decode, "slot-two", 9, 1);
+    ++wrong.expected_collective_schedule.front().descriptor.operation.sequence;
+    check(workers[2]->execute(wrong).status == StepStatus::rejected && cursor == 7,
+          "slot rejects skipped global collective sequence");
+    check(execute(1, StepPhase::cancel, "slot-one").status == StepStatus::cancelled && cursor == 7 &&
+          backends[1]->tokens.empty() && backends[0]->tokens == std::vector<int32_t>{0} &&
+          backends[2]->tokens == std::vector<int32_t>{2} && workers[0]->state() == WorkerState::active &&
+          workers[2]->state() == WorkerState::active, "cancel clears only its own slot state");
+    check(execute(2, StepPhase::decode, "slot-two", 3, 1).status == StepStatus::completed && cursor == 11 &&
+          execute(2, StepPhase::commit, "slot-two").output_ready, "another slot continues at its own next token and command step");
+    backends[0]->failed = true;
+    result = execute(0, StepPhase::decode, "slot-zero", 3, 1);
+    check(result.status == StepStatus::failed && cursor == 11 && !result.output_ready && backends[0]->aborts == 1,
+          "failed compute does not publish shared cursor advancement");
+    check(backends[2]->executed == std::vector<uint64_t>{4,5,6,7,8,9,10} &&
+          backends[1]->executed == std::vector<uint64_t>{2,3}, "interleaved workers execute each shared sequence exactly once");
+    // A backend failure can already have moved transport state: the owner aborts every other slot.
+    for (uint32_t slot : {1u, 2u})
+        check(execute(slot, StepPhase::abort, "").status == StepStatus::aborted && backends[slot]->aborts == 1,
+              "owner group abort invalidates remaining slots after any compute failure");
+    {
+        BoundaryBackend backend;
+        Worker invalid({"session", "manifest", 0, kWorkerMaxSlots}, backend);
+        StepCommand c{"session", "", kWorkerMaxSlots, 1, StepPhase::init, {}, {}, "manifest", {}};
+        check(invalid.execute(c).failure.code == FailureCode::invalid_config && backend.calls.empty(),
+              "slot at maximum count is invalid");
+    }
+    {
+        BoundaryBackend backend;
+        Worker last({"session", "manifest", 0, kWorkerMaxSlots - 1}, backend);
+        const auto result = last.execute({"session", "", kWorkerMaxSlots - 1, 1, StepPhase::init, {}, {}, "manifest", {}});
+        check(result.status == StepStatus::completed && result.state_digest.find(":slot=7:") != std::string::npos,
+              "last supported slot initializes and diagnostic digest binds slot identity");
+    }
+    {
+        uint64_t bad_cursor = 0;
+        BoundaryBackend backend;
+        Worker invalid({"session", "manifest", 0, 0, &bad_cursor}, backend);
+        check(invalid.execute({"session", "", 0, 1, StepPhase::init, {}, {}, "manifest", {}}).failure.code == FailureCode::invalid_config,
+              "shared sequence cannot start at zero");
+    }
+    {
+        Fixture f; f.init(); f.prefill(); f.commit();
+        for (auto phase : {StepPhase::commit, StepPhase::reset, StepPhase::cancel, StepPhase::checkpoint, StepPhase::rollback}) {
+            if (phase == StepPhase::commit) continue;
+            auto c = f.command(phase);
+            c.expected_collective_schedule = {operation(f.backend.first_sequence, f.step, "illegal")};
+            f.expect_rejected(c, "noncompute transitions cannot move the global collective cursor");
+        }
+    }
+    {
+        uint64_t sequence = 1;
+        BoundaryBackend backend;
+        Worker worker({"session", "manifest", 0, 0, &sequence}, backend);
+        check(worker.execute({"session", "", 0, 1, StepPhase::init, {}, {}, "manifest", {}}).status == StepStatus::completed,
+              "shared cursor drift fixture initialized");
+        backend.observe_finish = [&] { ++sequence; };
+        StepCommand c{"session", "r", 0, 2, StepPhase::prefill, {1}, {0}, "manifest", {}};
+        backend.plan(c, c.expected_collective_schedule);
+        check(worker.execute(c).status == StepStatus::failed && backend.aborts == 1,
+              "backend must not alias or mutate the Worker's independent shared cursor");
+    }
+}
 }  // namespace
 
 int main() {
@@ -389,6 +520,7 @@ int main() {
     model_driven_no_replay();
     checkpoint_rollback();
     checkpoint_failures();
+    serialized_slots();
     std::printf("worker protocol boundary: %d checks, %d failures (no model/GPU execution)\n", checks, failures);
     return failures == 0 ? 0 : 1;
 }
