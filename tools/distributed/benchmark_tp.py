@@ -216,7 +216,8 @@ def post_stream(endpoint: dict, prompt: dict, frozen: dict, *, timeout: float, s
     row = {"start_monotonic_s": start, "first_reasoning_monotonic_s": None,
            "first_content_monotonic_s": None, "end_monotonic_s": None, "usage": None,
            "status": "FAILED", "finish_reason": None, "server_decode_s": None,
-           "server_prefill_s": None, "server_queue_s": None, "server_sampling_s": None}
+           "server_prefill_s": None, "server_queue_s": None, "server_sampling_s": None,
+           "server_native_generated_tokens": None}
     conn, response, timer = None, None, None
     try:
         parsed = urlsplit(endpoint["url"])
@@ -278,6 +279,11 @@ def post_stream(endpoint: dict, prompt: dict, frozen: dict, *, timeout: float, s
                     row["usage"] = event["usage"]
                 timings = event.get("timings")
                 if isinstance(timings, dict):
+                    if timings.get("native_generated_n") is not None:
+                        count = timings["native_generated_n"]
+                        if type(count) is not int or count < 0:
+                            raise InvalidBenchmark("invalid provided native generated count")
+                        row["server_native_generated_tokens"] = count
                     for source, target in (("predicted_ms", "server_decode_s"),
                                            ("prompt_ms", "server_prefill_s"),
                                            ("queue_ms", "server_queue_s"),

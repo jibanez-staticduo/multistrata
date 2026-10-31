@@ -5876,6 +5876,17 @@ def answer_speed(last: dict, generated: int, wall_s: float | None = None) -> flo
     return None
 
 
+_REQUEST_PHASE_FIELDS = ("queue_ms", "sampling_ms", "mtp_draft_ms", "mtp_checkpoint_ms", "mtp_rollback_ms")
+
+
+def _valid_phase_ms(value: object) -> float | None:
+    """Accept only finite, non-negative optional phase durations from engines."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and value >= 0 else None
+
+
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
     """One request's `timings` in llama.cpp's names (what its clients show as speed), from the engine's own clock
     (StrataEngine.last): prompt_n is what was read, cache_n what the conversation cache already held.  None when the
@@ -5889,7 +5900,7 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
         cache_n = max(cache_n, max(0, prompt_tokens - int(last["prompt_read"])))
     prompt_n, prompt_ms, decode_ms = max(0, prompt_tokens - cache_n), float(last["prompt_ms"]), float(last.get("decode_ms") or 0)
     decoded = int(last.get("generated") or generated)          # the engine's count gives its rate, as /metrics does
-    return {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": round(prompt_ms, 1),
+    result = {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": round(prompt_ms, 1),
             "prompt_per_token_ms": round(prompt_ms / prompt_n, 3) if prompt_n else None,
             "prompt_per_second": round(prompt_n / (prompt_ms / 1000), 1) if prompt_n and prompt_ms > 0 else None,
             "predicted_n": generated, "predicted_ms": round(decode_ms, 1),
@@ -5898,6 +5909,15 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
+    for key in _REQUEST_PHASE_FIELDS:
+        phase_ms = _valid_phase_ms(last.get(key))
+        if phase_ms is not None:
+            result[key] = round(phase_ms, 3)
+    if any(_valid_phase_ms(last.get(key)) is not None for key in _REQUEST_PHASE_FIELDS):
+        result["native_generated_n"] = max(0, int(last.get("generated") or 0))
+    if isinstance(last.get("native_phase_timing"), dict):
+        result["native_phase_timing"] = dict(last["native_phase_timing"])
+    return result
 
 
 def request_stats(segments: list[dict]) -> dict:
@@ -5914,6 +5934,16 @@ def request_stats(segments: list[dict]) -> dict:
                 "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb", "experts_streamed"):
         if any(segment.get(key) is not None for segment in segments):
             result[key] = sum(segment.get(key) or 0 for segment in segments)
+    for key in _REQUEST_PHASE_FIELDS:
+        phase_values = [_valid_phase_ms(segment.get(key)) for segment in segments]
+        if any(value is not None for value in phase_values):
+            result[key] = sum(value or 0.0 for value in phase_values)
+    if len(segments) > 1:
+        # A raw payload describes one native segment and has no defined aggregate contract.
+        result.pop("native_phase_timing", None)
+    if any(any(_valid_phase_ms(segment.get(key)) is not None for key in _REQUEST_PHASE_FIELDS)
+           for segment in segments):
+        result["native_generated_n"] = sum(max(0, int(segment.get("generated") or 0)) for segment in segments)
     return result
 
 

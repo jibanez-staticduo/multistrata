@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, Service, add_carry, carry_leg, request_timings, serve
+from serve.server import ByteTokenizer, EngineDied, Service, add_carry, carry_leg, request_stats, request_timings, serve
 from serve.test_server import ThinkingEngine
 
 
@@ -23,6 +23,7 @@ class ClockedThinkingEngine(ThinkingEngine):
         self.done = []
         self.fail_continuation = False
         self.cancel_continuation = False
+        self.phase_instrumentation = False
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.attempts += 1
@@ -48,6 +49,18 @@ class ClockedThinkingEngine(ThinkingEngine):
                              hits=9 if first else 7, lookups=10 if first else 8,
                              ram_blobs=1 if first else 3, file_blobs=2 if first else 4,
                              file_mb=1.5 if first else 2.5)
+            if self.phase_instrumentation:
+                self.last.update(
+                    queue_ms=2.25 if first else 3.75,
+                    sampling_ms=0.5 if first else 0.75,
+                    mtp_draft_ms=1.0 if first else 2.0,
+                    mtp_checkpoint_ms=0.25 if first else 0.5,
+                    mtp_rollback_ms=0.125 if first else 0.375,
+                    native_phase_timing={
+                        "clock": "host_steady_wall",
+                        "queue_ns": 2_250_000 if first else 3_750_000,
+                        "generated_tokens": generated,
+                    })
             self.done.append(dict(self.last))
 
 
@@ -164,6 +177,29 @@ class RequestAccounting(unittest.TestCase):
         timings = response["timings"]
         self.assertEqual((timings["prompt_ms"], timings["predicted_ms"]), (40.0, 200.0))
         self.assertEqual((timings["draft_n"], timings["draft_n_accepted"]), (18, 8))
+        for key in ("queue_ms", "sampling_ms", "mtp_draft_ms", "mtp_checkpoint_ms",
+                    "mtp_rollback_ms", "native_generated_n", "native_phase_timing"):
+            self.assertNotIn(key, timings)
+
+    def test_http_timings_include_opt_in_phase_instrumentation(self):
+        self.engine.phase_instrumentation = True
+        response = self.chat()
+        timings = response["timings"]
+        self.assertEqual(
+            {key: timings[key] for key in ("queue_ms", "sampling_ms", "mtp_draft_ms",
+                                           "mtp_checkpoint_ms", "mtp_rollback_ms")},
+            {"queue_ms": 6.0, "sampling_ms": 1.25, "mtp_draft_ms": 3.0,
+             "mtp_checkpoint_ms": 0.75, "mtp_rollback_ms": 0.5})
+        self.assertEqual(timings["native_generated_n"], sum(done["generated"] for done in self.engine.done))
+        _, raw = self.request("/v1/status")
+        self.assertEqual(json.loads(raw)["last_timings"]["queue_ms"], 6.0)
+
+    def test_http_stream_timings_include_opt_in_phase_instrumentation(self):
+        self.engine.phase_instrumentation = True
+        events = self.chat(stream=True)
+        timings = events[-1]["timings"]
+        self.assertEqual((timings["queue_ms"], timings["sampling_ms"]), (6.0, 1.25))
+        self.assertEqual(timings["native_generated_n"], sum(done["generated"] for done in self.engine.done))
 
     def test_failed_continuation_does_not_count_the_first_done_twice(self):
         self.engine.fail_continuation = True
@@ -219,6 +255,30 @@ class SlotLegAccounting(unittest.TestCase):
         # the conversation cache's own count still counts when larger
         both = request_timings(1000, 10, {**last, "reused": 900, "prompt_read": 100})
         self.assertEqual((both["prompt_n"], both["cache_n"]), (100, 900))
+
+    def test_request_stats_sums_phase_fields_and_drops_stale_raw_payload(self):
+        segments = [
+            {"generated": 4, "queue_ms": 1.125, "sampling_ms": 0.25, "native_phase_timing": {"queue_ns": 1}},
+            {"generated": 6, "queue_ms": 2.375, "sampling_ms": 0.75, "native_phase_timing": {"queue_ns": 2}},
+        ]
+        result = request_stats(segments)
+        self.assertEqual((result["queue_ms"], result["sampling_ms"]), (3.5, 1.0))
+        self.assertEqual(result["generated"], 10)
+        self.assertNotIn("native_phase_timing", result)
+
+    def test_request_timings_omits_invalid_optional_phases(self):
+        last = {"prompt_ms": 1.0, "decode_ms": 2.0, "generated": 3,
+                "queue_ms": float("nan"), "sampling_ms": -1.0, "mtp_draft_ms": 0.5}
+        timings = request_timings(1, 3, last)
+        self.assertNotIn("queue_ms", timings)
+        self.assertNotIn("sampling_ms", timings)
+        self.assertEqual(timings["mtp_draft_ms"], 0.5)
+        self.assertEqual(timings["native_generated_n"], 3)
+
+    def test_single_segment_retains_raw_native_payload(self):
+        raw = {"clock": "host_steady_wall", "queue_ns": 100}
+        result = request_stats([{"generated": 2, "queue_ms": 0.1, "native_phase_timing": raw}])
+        self.assertEqual(result["native_phase_timing"], raw)
 
 
 if __name__ == "__main__":

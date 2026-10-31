@@ -193,7 +193,8 @@ def endpoint():
                     self.wfile.write(sse({"choices": [], "usage": {"prompt_tokens": 4097 if state["mode"] == "wrong_prompt" else 4096,
                                                                  "completion_tokens": 256},
                                           "timings": {"predicted_ms": 12, "prompt_ms": 34,
-                                                      "queue_ms": 5, "sampling_ms": 2}}))
+                                                      "queue_ms": 5, "sampling_ms": 2,
+                                                      "native_generated_n": 257}}))
                 if state["mode"] != "no_done":
                     self.wfile.write(sse("[DONE]"))
                 self.wfile.flush()
@@ -228,6 +229,7 @@ def test_first_actual_content_not_role_or_reasoning_defines_ttft(endpoint, input
     assert row["server_prefill_s"] == .034
     assert row["server_queue_s"] == .005
     assert row["server_sampling_s"] == .002
+    assert row["server_native_generated_tokens"] == 257
     assert "answer-secret" not in json.dumps(row) and "reason-secret" not in json.dumps(row)
     assert row["usage"] == {"prompt_tokens": 4096, "completion_tokens": 256}
     assert endpoint["bodies"][0]["stream_options"] == {"include_usage": True}

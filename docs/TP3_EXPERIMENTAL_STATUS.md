@@ -65,7 +65,7 @@ remaining acceptance checks open.
 | 5. Projection and MoE | Partial | Exact expert gate and short whole-model parity pass after arithmetic fixes; short decode evidence does not qualify GEMM prefill. |
 | 6. GDN, QSA and PLE | Partial | All 48 layers represented in C1 state/trace checks; short 2/4/8 chunk-boundary and RESET parity now pass. Long continuation remains open. |
 | 7. Coordinator and C1 | Partial | Windows 4/6/7 exact logits, state, RESET and traces; 8192 is configured capacity, not an 8K-token prompt. The later 8K gate is recorded below; 64K prompt qualification remains open. |
-| 8. Capacity, MTP, graphs, C8 | Partial | Short MTP/C4/C8 full-state replay and cancellation checks pass; partial graphs and memory accounting exist. Useful extra capacity, long feature/failure qualification and full-model graphs remain open. |
+| 8. Capacity, MTP, graphs, C8 | Partial | Short MTP/C4/C8 full-state replay and cancellation checks pass. Full C1 NCCL graphs pass 255 replays/RESET and bounded peer loss. Phase snapshots exist; useful extra capacity and longer feature qualification remain open. |
 | 9. Server and lifecycle | Partial | OpenAI/Anthropic streaming, tools, cancellation and failure-health artifacts; recorded restoration checks through window 7. No automatic rollout. |
 | 10. Performance decision | Partial | Profiling and resident TP1 control established; matched 4K/16K/64K, 256-output, C1/C4/C8, three paired rounds remain open. |
 
@@ -349,7 +349,7 @@ the qualifying outputs. These failed attempts are not counted as passes.
 - Full 64K prompt C1 state/logit continuation, long resets and failure recovery.
 - A useful additional capacity case and complete per-rank warmup/prefill/decode accounting.
 - MTP acceptance probabilities, long rollback/reset and failure state against TP1; sampled distribution checks.
-- Full-model CUDA graphs and long replay/reset/timeout behavior; short C4/C8 state isolation passes as recorded.
+- Longer graph contexts and combined MTP/C4/C8 graph modes; C1 NCCL 255 replay/reset and bounded peer-loss gates pass as recorded.
 - Matched TP1/TP2/TP3 performance matrix and continuation thresholds; a separate Staticduo21/vLLM comparison when quantization differs.
 
 No upstream PR is implied. Maintainer scope agreement and the required backend
