@@ -437,8 +437,10 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
         if (auto f = cuda_failure(cudaEventCreateWithFlags(&p.completion, cudaEventDisableTiming))) return f;
         if (p.config.decode_graph_api) {
             if (!p.config.preagreed_collectives || !p.config.batched_expert_collectives ||
-                !p.config.expert_operands.compact || p.config.prefill_batch_exactnative || p.config.prefill_expert_batch)
-                return bad("full model graph requires singleton preagreed compact batched execution");
+                !p.config.expert_operands.compact ||
+                (!p.config.decode_graph_only &&
+                 (p.config.prefill_batch_exactnative || p.config.prefill_expert_batch)))
+                return bad("full model graph configuration is incompatible with preagreed compact execution");
             if (auto f = cuda_failure(cudaHostAlloc(reinterpret_cast<void**>(&p.host_route_status), sizeof(int),
                                                       cudaHostAllocDefault))) return f;
         }
@@ -449,10 +451,17 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
     } else if (command.phase == StepPhase::prefill || command.phase == StepPhase::decode) {
         if (!p.initialized || p.candidate) return bad("forward requires initialized model without pending candidate");
         if (p.request != command.request) {
+            if (p.config.decode_graph_only && p.graph_warmed) {
+                if (!p.release_graph()) return bad("cannot release decode graph before request switch");
+                if (!p.model.discard_prepared_graph(err)) return bad(err);
+                p.graph_warmed = false;
+            }
             p.clear_checkpoint();
             p.request = command.request;
         }
-        if (p.config.decode_graph_api && p.graph_warmed) {
+        if (p.config.decode_graph_api &&
+            ((!p.config.decode_graph_only && p.graph_warmed) ||
+             (p.config.decode_graph_only && command.phase == StepPhase::decode))) {
             if (command.tokens.size() != 1) return bad("full model graph requires one token per command");
             if (auto f = p.graph_token(command.tokens.front(), int64_t(command.positions.front()), command.step,
                                        command.expected_collective_schedule)) return f;
@@ -461,18 +470,27 @@ Failure ModelWorkerBackend::begin(const StepCommand& command) {
             if (!p.model.tokens(command.tokens, int64_t(command.positions.front()), p.config.position_base,
                                 p.device_logits, p.config.stream, err)) return bad(err);
             if (auto f = p.finite_logits()) return f;
+            if (p.config.decode_graph_api && p.config.decode_graph_only)
+                p.graph_warmed = true;
         } else {
             for (size_t i = 0; i < command.tokens.size(); ++i) {
                 if (!p.model.token(command.tokens[i], int64_t(command.positions[i]), p.config.position_base,
                                    p.device_logits, p.config.stream, err)) return bad(err);
                 if (auto f = p.finite_logits()) return f;
             }
-            if (p.config.decode_graph_api) p.graph_warmed = true;
+            if (p.config.decode_graph_api &&
+                (!p.config.decode_graph_only || command.phase == StepPhase::prefill))
+                p.graph_warmed = true;
         }
         p.candidate = true;
     } else if (command.phase == StepPhase::reset || command.phase == StepPhase::cancel) {
         p.clear_checkpoint();
         p.request.clear();
+        if (p.config.decode_graph_api && p.config.decode_graph_only && p.graph_warmed) {
+            if (!p.release_graph()) return bad("cannot release decode graph before reset");
+            if (!p.model.discard_prepared_graph(err)) return bad(err);
+            p.graph_warmed = false;
+        }
         if (!p.model.reset(p.config.stream, err)) return bad(err);
         p.candidate = false;
     } else if (command.phase == StepPhase::checkpoint) {

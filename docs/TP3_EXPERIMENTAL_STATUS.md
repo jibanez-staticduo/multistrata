@@ -1,10 +1,10 @@
 # Native TP3 experimental acceptance record
 
-**Recorded 31 October 2026, including actual 8K/64K gates. Performance qualification is in progress.**
+**Recorded 31 October 2026, including actual 8K/64K gates. GPU acceleration is in progress.**
 Native Strata runs all 48 layers of the original Qwen pack across DG1, DG2 and
 DG3. Short C1 checks match the independent TP1 reference bit for bit. The full
 plan is still open: useful extra capacity, long feature combinations and
-matched performance rounds remain unqualified. The actual 64K prompt and
+accelerated feature combinations remain unqualified. The actual 64K prompt and
 256-token continuation pass the full model comparison. Short and extended sampled
 MTP state and C1 full-model graphs pass the scoped checks recorded below. There is no speed claim
 against TP1 or vLLM, and no production recommendation.
@@ -70,11 +70,76 @@ remaining acceptance checks open.
 | 7. Coordinator and C1 | Passed scope | Windows 4/6/7 exact logits, state, RESET and traces; 8192 is configured capacity, not an 8K-token prompt. The later actual 8K and 64K gates are recorded below. |
 | 8. Capacity, MTP, graphs, C8 | Partial | Short MTP/C4/C8 full-state replay and cancellation checks pass. Full C1 NCCL graphs pass 255 replays/RESET and bounded peer loss. Phase snapshots exist; useful extra capacity and longer feature qualification remain open. |
 | 9. Server and lifecycle | Partial | OpenAI/Anthropic streaming, tools, cancellation and failure-health artifacts; recorded restoration checks through window 7. No automatic rollout. |
-| 10. Performance decision | Partial | Three matched 4K C1 pairs show a -61.9% median decode-rate change for TP3. C4/C8 and 16K/64K rounds remain open. |
+| 10. Performance decision | Partial | Three matched 4K C1 pairs show a -61.9% median decode-rate change for reference TP3. The remaining exhaustive matrix is stopped; short GPU acceleration A/B work is active. |
 
-## Matched Performance Progress
+## Current GPU Acceleration Work
 
-The frozen matrix is running with the same original IQ3_S pack, context 65792,
+Jordi changed the execution priority to GPU kernels, grouped prefill and CUDA
+Graph decode. The exhaustive reference matrix is stopped. Completed measurements
+below remain evidence; unfinished cases are interrupted or not run. See the
+[current execution priority](superpowers/plans/2026-10-30-strata-tp3-implementation.md#current-execution-priority).
+
+The current candidate fuses routed expert gate/up, SwiGLU and padded output into
+one GPU kernel. The DG3 component check passes with the original frozen limits,
+including an actual GGUF sample and exact comparisons for six gate/up formats.
+The ARM CUDA build and 126 launcher tests pass. Separate static reviews found
+no blocking issue in their reviewed scopes.
+
+Combining grouped prefill with decode-only model graphs exposed a transition
+defect: the legacy grouped path leaves mutable expert pointers offset from the
+weight-plane base. The first combined service returned HTTP 503 on decode;
+that failed run is retained. The corrected device-routed prefill path expands
+Q8_1 rows by top-k on GPU, runs routed gate/up and down without CPU grouping,
+quantizes hidden rows in one batch and writes final parts directly. The ARM
+build and DG3 component check pass, including byte-exact expansion of distinct
+token rows.
+
+The corrected combined service completes four sequential requests on all three
+hosts, including reset and graph recapture. Each request uses 71 prompt tokens
+and produces 32 output tokens. The first two requests are independently replayed
+on TP1 using their exact 102 consumed IDs: two full-vocabulary logits rows and
+342 logical states pass the original zero-error policy. This qualifies the
+changed seams for this short C1 case, not longer contexts or MTP/multislot graphs.
+
+The candidate binary is `e57fd9d43a673e54bf7c4c347a243b2028e83e50e3f246729fd984e67827ac4a`.
+Exact changed sources are pinned in
+`/home/staticduo/tmp/strata-tp3-20261031/optimization/source-snapshot-v3/manifest.json`;
+the comparison receipt is
+`/home/staticduo/tmp/strata-tp3-20261031/optimization/combined-service-v3/parity/result/comparison.json`.
+The usable opt-in C1 flags are in the
+[experimental runtime guide](../packaging/experimental/strata-tp3/README.md#accelerated-c1-candidate).
+
+### Short GPU A/B
+
+Both profiles run on the same three GB10 hosts, original IQ3_S pack, context
+8192, C1, thinking off, no MTP, no prompt cache and no state capture. Each
+launch executes four identical 71-token prompts with 32 output tokens. The first
+request includes cold kernel setup and is excluded from the warm medians.
+
+| Native phase | Reference TP3, three warm requests | Accelerated TP3, three warm requests | Median speedup |
+| --- | --- | --- | --- |
+| Prefill seconds | 12.8662 / 13.5005 / 12.9606 | 9.0631 / 9.1888 / 8.8532 | 1.43x |
+| Decode seconds | 5.5604 / 6.0004 / 5.5443 | 3.7436 / 3.7945 / 3.7417 | 1.49x |
+
+The median time reduction is 30.1% for prefill and 32.7% for decode. Both use
+compact batched expert collectives and step agreement. The accelerated profile
+also enables GPU expert routing, prefill batch 8, batched experts, the fused
+kernel and decode graphs. This measures their combined effect. It does not
+attribute the gain to an individual kernel, establish long-prompt variability,
+or show that TP3 beats TP1 or vLLM. The raw measurements and exact settings are in
+`/home/staticduo/tmp/strata-tp3-20261031/optimization/short-ab-final.json`.
+
+The final accelerated execution also completes a 923-token prompt with 128
+output tokens, then resets and reports all three ranks ready. Native prefill
+takes 120.2093 seconds and decode 13.3173 seconds; client wall time is 134.6547
+seconds. This is an execution check, not a paired long-prompt speed comparison.
+Fresh pinned C1 configs and recipe are staged on all three hosts at
+`/home/staticduo/tmp/strata-tp3-20261031/optimization/accelerated-ready/service.yaml`.
+They are opt-in and not running. Staticduo21 restoration is recorded separately.
+
+## Completed Reference Measurements
+
+The completed reference measurements use the original IQ3_S pack, context 65792,
 resident FP16 KV, thinking disabled, MTP off and graphs off. Three rotating
 paired rounds of the 4096-token C1 case have finished. Every request produces
 256 output tokens and passes the HTTP/usage checks.
@@ -98,7 +163,7 @@ between serialized slots; client wall time includes it. The small reported
 admission queue time is not total scheduler waiting. One C4 round does not
 establish its variability or a capacity advantage.
 
-The remaining C4/C8 cases and the 16K/64K rounds are in progress. TP2 and
+The remaining C4/C8 cases and the 16K/64K rounds are stopped. TP2 and
 TP1 C4/C8 are unsupported by this candidate and are explicitly not run. No
 aggregate C8 gain against TP1 can be claimed without that control. Raw partial
 records and the analysis are in

@@ -45,6 +45,8 @@ struct ModelWorkerConfig {
     bool prefill_expert_batch = false;
     // Borrowed approved NCCL API. Non-null enables experimental C1 decode capture.
     nccl::NcclApi* decode_graph_api = nullptr;
+    // When true, prefill runs eagerly and only one-token decode steps are captured.
+    bool decode_graph_only = false;
     std::function<Failure(const StepCommand&, uint64_t position, bool before)> memory_phase;
 };
 

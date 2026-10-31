@@ -647,6 +647,151 @@ void routed_indirection_probe() {
     std::puts("routed-device-indirection and 80-row unpack bounds passed");
 }
 
+void fused_routed_padding_probe(int gu_type) {
+    constexpr int width = 256, ff = 192, experts = 16, routes = 10;
+    constexpr int begin = 64, end = 128, owned = end - begin, wire_slots = 80;
+    std::mt19937 rng(0x6f31 + gu_type);
+    const auto layout = k::native_expert_layout(gu_type, 20, width, ff);
+    const std::size_t gu_row = layout.gu_row, gu_stride = std::size_t(owned) * gu_row;
+    std::vector<uint8_t> gu(std::size_t(experts) * gu_stride), up(gu.size());
+    for (int expert = 0; expert < experts; ++expert) {
+        auto g = random_plane(gu_type, ff, width, rng), u = random_plane(gu_type, ff, width, rng);
+        for (int row = begin; row < end; ++row) {
+            std::memcpy(gu.data() + std::size_t(expert) * gu_stride + std::size_t(row - begin) * gu_row,
+                        g.data() + std::size_t(row) * gu_row, gu_row);
+            std::memcpy(up.data() + std::size_t(expert) * gu_stride + std::size_t(row - begin) * gu_row,
+                        u.data() + std::size_t(row) * gu_row, gu_row);
+        }
+    }
+    Device<uint8_t> dgu(gu.size()), dup(up.size());
+    dgu.upload(gu); dup.upload(up);
+    const std::vector<int32_t> selected{0, 1, 15, 3, 7, 2, 11, 14, 8, 5};
+    Device<int32_t> ids(routes);
+    ids.upload(selected);
+    Device<int> status(1);
+    Device<float> input_f(std::size_t(routes) * width);
+    std::vector<float> x(input_f.size);
+    for (auto& value : x) value = float(int(rng() % 2001) - 1000) / 503.f;
+    input_f.upload(x);
+    Device<uint8_t> input_q(tp::global_q81_bytes(routes, width));
+    auto input_contract = contract(ff);
+    input_contract.gather = "none";
+    input_contract.consumer = "expert_gate_up";
+    Stream stream;
+    const auto input = tp::quantize_global(input_contract, input_f.p, routes, width,
+                                            input_q.p, input_q.size, stream.s);
+    auto gv = view(gu_type, width, ff, 1, begin, end, dgu.p, gu_row, gu_stride);
+    auto uv = view(gu_type, width, ff, 1, begin, end, dup.p, gu_row, gu_stride);
+    gv.bytes = dgu.size;
+    uv.bytes = dup.size;
+    Device<float> gate(std::size_t(routes) * owned), up_out(gate.size), legacy_hidden(gate.size);
+    Device<float> fused(std::size_t(routes) * wire_slots);
+    ck(cudaMemsetAsync(status.p, 0, sizeof(int), stream.s));
+    tp::gate_up_routed(gv, uv, input_contract, input, ids.p, experts, gu_stride, gu_stride,
+                       routes, false, gate.p, up_out.p, legacy_hidden.p, status.p, stream.s);
+    tp::gate_up_swiglu_routed_padded(gv, uv, input_contract, input, ids.p, experts, gu_stride, gu_stride,
+                                     routes, false, wire_slots, fused.p, status.p, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    require(status.read()[0] == 0, "fused routed gate/up flagged valid IDs");
+    const auto legacy_values = legacy_hidden.read();
+    const auto fused_values = fused.read();
+    for (int route = 0; route < routes; ++route) {
+        for (int column = 0; column < owned; ++column)
+            require(fused_values[std::size_t(route) * wire_slots + column] ==
+                        legacy_values[std::size_t(route) * owned + column],
+                    "fused routed SwiGLU differs from legacy exact output");
+        for (int column = owned; column < wire_slots; ++column)
+            require(fused_values[std::size_t(route) * wire_slots + column] == 0.f,
+                    "fused routed output did not clear padded columns");
+    }
+
+    auto invalid = selected;
+    invalid[2] = -1;
+    invalid[7] = experts;
+    ids.upload(invalid);
+    ck(cudaMemsetAsync(status.p, 0, sizeof(int), stream.s));
+    tp::gate_up_swiglu_routed_padded(gv, uv, input_contract, input, ids.p, experts, gu_stride, gu_stride,
+                                     routes, false, wire_slots, fused.p, status.p, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    require(status.read()[0] == 1, "fused routed gate/up did not set sticky invalid-ID status");
+    const auto invalid_values = fused.read();
+    for (const int route : {2, 7})
+        require(std::all_of(invalid_values.begin() + std::size_t(route) * wire_slots,
+                            invalid_values.begin() + std::size_t(route + 1) * wire_slots,
+                            [](float value) { return value == 0.f; }),
+                "fused routed gate/up did not zero the complete invalid row");
+
+    ids.upload(selected);
+    constexpr int repeats = 100;
+    cudaEvent_t start{}, stop{};
+    ck(cudaEventCreate(&start)); ck(cudaEventCreate(&stop));
+    ck(cudaMemsetAsync(status.p, 0, sizeof(int), stream.s));
+    ck(cudaEventRecord(start, stream.s));
+    for (int i = 0; i < repeats; ++i)
+        tp::gate_up_routed(gv, uv, input_contract, input, ids.p, experts, gu_stride, gu_stride,
+                           routes, false, gate.p, up_out.p, legacy_hidden.p, status.p, stream.s);
+    ck(cudaEventRecord(stop, stream.s)); ck(cudaEventSynchronize(stop));
+    float legacy_ms = 0;
+    ck(cudaEventElapsedTime(&legacy_ms, start, stop));
+    ck(cudaMemsetAsync(status.p, 0, sizeof(int), stream.s));
+    ck(cudaEventRecord(start, stream.s));
+    for (int i = 0; i < repeats; ++i)
+        tp::gate_up_swiglu_routed_padded(gv, uv, input_contract, input, ids.p, experts,
+                                         gu_stride, gu_stride, routes, false, wire_slots,
+                                         fused.p, status.p, stream.s);
+    ck(cudaEventRecord(stop, stream.s)); ck(cudaEventSynchronize(stop));
+    float fused_ms = 0;
+    ck(cudaEventElapsedTime(&fused_ms, start, stop));
+    ck(cudaEventDestroy(start)); ck(cudaEventDestroy(stop));
+    require(status.read()[0] == 0, "fused timing loop flagged valid IDs");
+    std::printf("routed-gu-swiglu microbench gu=%s repeats=%d legacy_two_launches_ms=%.3f "
+                "fused_one_launch_ms=%.3f (local CUDA-event measurement)\n",
+                codec(gu_type), repeats, legacy_ms, fused_ms);
+}
+
+void q81_topk_expansion_probe() {
+    constexpr int tokens = 3, width = 256, top_k = 4;
+    std::mt19937 rng(0x4c91);
+    Device<float> input(std::size_t(tokens) * width);
+    std::vector<float> values(input.size);
+    for (int row = 0; row < tokens; ++row)
+        for (int col = 0; col < width; ++col)
+            values[std::size_t(row) * width + col] =
+                float(int(rng() % 2001) - 1000) / float(401 + row * 23 + col % 17);
+    input.upload(values);
+    Device<uint8_t> quantized(tp::global_q81_bytes(tokens, width));
+    Device<uint8_t> expanded(tp::global_q81_bytes(tokens * top_k, width));
+    Device<uint8_t> sequential(expanded.size);
+    auto input_contract = contract(192);
+    input_contract.gather = "none";
+    input_contract.consumer = "expert_gate_up";
+    Stream stream;
+    const auto q = tp::quantize_global(input_contract, input.p, tokens, width,
+                                       quantized.p, quantized.size, stream.s);
+    const auto expanded_q = tp::expand_global_q81_topk(q, top_k, expanded.p, expanded.size, stream.s);
+    for (int row = 0; row < tokens; ++row)
+        for (int route = 0; route < top_k; ++route)
+            tp::quantize_global(input_contract, input.p + std::size_t(row) * width, 1, width,
+                                sequential.p + std::size_t(row * top_k + route) * q.row_stride,
+                                q.row_stride, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    require(expanded_q.rows == tokens * top_k && expanded_q.row_stride == q.row_stride &&
+            expanded_q.bytes == expanded.size,
+            "Q8_1 top-k expansion metadata mismatch");
+    require(expanded.read() == sequential.read(),
+            "Q8_1 top-k expansion differs from per-token sequential quantization");
+
+    bool rejected = false;
+    try { (void)tp::expand_global_q81_topk(q, top_k, expanded.p, expanded.size - 1, stream.s); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "Q8_1 top-k expansion accepted a short destination");
+    rejected = false;
+    try { (void)tp::expand_global_q81_topk(q, top_k, quantized.p, quantized.size, stream.s); }
+    catch (const std::invalid_argument&) { rejected = true; }
+    require(rejected, "Q8_1 top-k expansion accepted overlapping source and destination");
+    std::puts("Q8_1 top-k expansion byte parity passed");
+}
+
 void run_expert_batch(const Sample& sample, int seed, Metrics& metrics) {
     constexpr int experts = 10;
     const int width = sample.input, ff = sample.ff;
@@ -995,6 +1140,8 @@ int main(int argc, char** argv) {
         k::native_moe_combine_set_enabled(true);
         tiny_scalar_probe();
         routed_indirection_probe();
+        q81_topk_expansion_probe();
+        for (const int gu : {16, 17, 18, 21, 22, 23}) fused_routed_padding_probe(gu);
         std::mt19937 rng(0x7a531);
         for (int gu : {16, 17, 18, 21, 22, 23}) for (int down : {20, 42}) {
             for (const auto dims : {std::pair{256, 192}, std::pair{2560, 640}}) {

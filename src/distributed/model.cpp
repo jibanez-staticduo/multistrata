@@ -1053,6 +1053,19 @@ bool ModelForward::token(int32_t token, int64_t pos, int32_t base,
     } catch (const std::exception& e) { p.failed = true; err = e.what(); return false; }
 }
 
+bool ModelForward::discard_prepared_graph(std::string& err) {
+    auto& p = *impl_;
+    if (!p.ready || p.failed || p.prepared_token_pending) {
+        err = "TP graph retirement requires ready model without a pending token";
+        return false;
+    }
+    p.prepared_graph_captured = false;
+    p.prepared_graph_base = 0;
+    p.prepared_graph_stream = nullptr;
+    p.prepared_token_enqueued = false;
+    return true;
+}
+
 bool ModelForward::prepare_token(int32_t token, int64_t pos, int32_t base,
                                  void* stream, std::string& err) {
     auto& p = *impl_;

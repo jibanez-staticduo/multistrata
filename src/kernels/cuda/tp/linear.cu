@@ -164,6 +164,16 @@ __global__ void routed_swiglu_kernel(const float* gate, const float* up, float* 
     const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) h[i] = (gate[i] / (1.0f + __expf(-gate[i]))) * up[i];
 }
+__global__ void expand_q81_topk_kernel(const uint8_t* input, uint8_t* output,
+                                       std::size_t input_stride, std::size_t output_row_bytes,
+                                       int top_k, std::size_t bytes) {
+    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < bytes) {
+        const auto row = i / output_row_bytes;
+        const auto token = row / std::size_t(top_k);
+        output[i] = input[token * input_stride + i % output_row_bytes];
+    }
+}
 __global__ void finish_lanes_compact_kernel(const float2* payload, float* output, int calls,
                                             int nout, int rows, int end0, int end1, int slots) {
     const int out = int(blockIdx.x) * 4 + int(threadIdx.y), lane = int(threadIdx.x);
@@ -207,6 +217,34 @@ GlobalQ81 quantize_global(const distributed::ActivationContract& c, const float*
                     "TP CUDA: unaligned global quantizer buffer");
     quantize_q8_1_rows(logical, rows, width, q81, stream);
     return {q81, width, rows, std::size_t(width / 32) * sizeof(block_q8_1), bytes};
+}
+
+GlobalQ81 expand_global_q81_topk(const GlobalQ81& input, int top_k, void* expanded_q81,
+                                 std::size_t capacity, void* stream) {
+    detail::image(input, input.width);
+    detail::require(top_k > 0 && input.rows <= std::numeric_limits<int>::max() / top_k &&
+                    expanded_q81 && stream,
+                    "TP CUDA: invalid Q8_1 top-k expansion arguments");
+    const int rows = input.rows * top_k;
+    const auto input_row_bytes = std::size_t(input.width / 32) * sizeof(block_q8_1);
+    const auto bytes = global_q81_bytes(rows, input.width);
+    const auto input_begin = reinterpret_cast<std::uintptr_t>(input.data);
+    const auto output_begin = reinterpret_cast<std::uintptr_t>(expanded_q81);
+    detail::require(capacity >= bytes &&
+                    reinterpret_cast<std::uintptr_t>(expanded_q81) % alignof(block_q8_1) == 0,
+                    "TP CUDA: Q8_1 top-k expansion output is too small or unaligned");
+    detail::require(input.bytes <= std::numeric_limits<std::uintptr_t>::max() - input_begin &&
+                    bytes <= std::numeric_limits<std::uintptr_t>::max() - output_begin &&
+                    (input_begin + input.bytes <= output_begin || output_begin + bytes <= input_begin),
+                    "TP CUDA: Q8_1 top-k expansion buffers overlap");
+    const auto total = bytes;
+    constexpr int threads = 256;
+    expand_q81_topk_kernel<<<unsigned((total + threads - 1) / threads), threads, 0,
+                             static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const uint8_t*>(input.data), static_cast<uint8_t*>(expanded_q81),
+        input.row_stride, input_row_bytes, top_k, total);
+    detail::check(cudaGetLastError());
+    return {expanded_q81, input.width, rows, input_row_bytes, bytes};
 }
 
 void down(const MatrixShard& w, const distributed::ActivationContract& c, const GlobalQ81& a,
@@ -269,6 +307,44 @@ void gate_up_routed(const MatrixShard& g, const MatrixShard& u, const distribute
     routed_swiglu_kernel<<<unsigned((count + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
         gate_out, up_out, h, count);
     detail::check(cudaGetLastError());
+}
+
+void gate_up_swiglu_routed_padded(const MatrixShard& g, const MatrixShard& u,
+                                  const distributed::ActivationContract& c, const GlobalQ81& a,
+                                  const int32_t* ids, int expert_count,
+                                  std::size_t gate_bytes_per_expert, std::size_t up_bytes_per_expert,
+                                  int routed_rows, bool broadcast_input, int output_stride,
+                                  float* h, int* status, void* stream) {
+    detail::contract(c);
+    detail::matrix(g, 1); detail::matrix(u, 1);
+    detail::require(g.ggml_type != 20 && g.ggml_type != 42 && g.ggml_type == u.ggml_type &&
+                    (g.ggml_type == 16 || g.ggml_type == 17 || g.ggml_type == 18 ||
+                     g.ggml_type == 21 || g.ggml_type == 22 || g.ggml_type == 23) &&
+                    g.slice.global_shape == u.slice.global_shape &&
+                    g.slice.range_start == u.slice.range_start && g.slice.range_end == u.slice.range_end,
+                    "TP routed fused gate/up: ownership or codec mismatch");
+    detail::image(a, int(g.slice.global_shape[0]));
+    const int nout = int(g.slice.range_end - g.slice.range_start);
+    const auto rb = iq_row_bytes(g.ggml_type, a.width);
+    detail::require(ids && expert_count > 0 && routed_rows > 0 &&
+                    (broadcast_input ? a.rows == 1 : a.rows == routed_rows) &&
+                    output_stride >= nout && h && status && stream &&
+                    output_stride <= std::numeric_limits<int>::max() / routed_rows &&
+                    gate_bytes_per_expert >= std::size_t(nout) * rb &&
+                    up_bytes_per_expert >= std::size_t(nout) * rb &&
+                    gate_bytes_per_expert <= std::numeric_limits<std::size_t>::max() / std::size_t(expert_count) &&
+                    up_bytes_per_expert <= std::numeric_limits<std::size_t>::max() / std::size_t(expert_count) &&
+                    g.bytes >= gate_bytes_per_expert * std::size_t(expert_count) &&
+                    u.bytes >= up_bytes_per_expert * std::size_t(expert_count) &&
+                    g.row_stride == rb && u.row_stride == rb &&
+                    reinterpret_cast<std::uintptr_t>(ids) % alignof(int32_t) == 0 &&
+                    reinterpret_cast<std::uintptr_t>(h) % alignof(float) == 0 &&
+                    reinterpret_cast<std::uintptr_t>(status) % alignof(int) == 0,
+                    "TP routed fused gate/up: invalid expert planes or buffers");
+    native_expert_gate_up_swiglu_routed_padded(g.ggml_type, g.data, u.data,
+                                               gate_bytes_per_expert, up_bytes_per_expert,
+                                               ids, expert_count, a.data, a.row_stride, routed_rows,
+                                               broadcast_input, a.width, nout, output_stride, h, status, stream);
 }
 
 void down_lanes(const MatrixShard& w, const distributed::ActivationContract& c, const GlobalQ81& a,

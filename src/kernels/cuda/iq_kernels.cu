@@ -1944,6 +1944,44 @@ __global__ void routed_mmvq_kernel(const uint8_t* gate_base, const uint8_t* up_b
     }
 }
 
+template<int TY>
+__global__ void routed_mmvq_swiglu_padded_kernel(const uint8_t* gate_base, const uint8_t* up_base,
+                                                  size_t gate_expert_stride, size_t up_expert_stride,
+                                                  const int32_t* expert_ids, int expert_count,
+                                                  const block_q8_1* x, size_t activation_stride,
+                                                  size_t row_bytes, int routed_rows, bool broadcast_input,
+                                                  int n_in, int n_out, int output_stride,
+                                                  float* h, int* status) {
+    const int row = blockIdx.x * 4 + threadIdx.y;
+    const int routed_row = int(blockIdx.y);
+    if (row >= n_out || routed_row >= routed_rows) return;
+    const int lane = threadIdx.x;
+    const std::size_t output_base = std::size_t(routed_row) * output_stride;
+    const int expert = expert_ids[routed_row];
+    if (expert < 0 || expert >= expert_count) {
+        if (blockIdx.x == 0 && threadIdx.y == 0) {
+            if (lane == 0) atomicExch(status, 1);
+            for (int col = lane; col < output_stride; col += 32)
+                h[output_base + col] = 0.f;
+        }
+        return;
+    }
+    const int input_row = broadcast_input ? 0 : routed_row;
+    const auto* xb = reinterpret_cast<const block_q8_1*>(
+        reinterpret_cast<const uint8_t*>(x) + std::size_t(input_row) * activation_stride);
+    const int nb = n_in / Fmt<TY>::qk;
+    const uint8_t* gate_row = gate_base + std::size_t(expert) * gate_expert_stride +
+                              std::size_t(row) * row_bytes;
+    const uint8_t* up_row = up_base + std::size_t(expert) * up_expert_stride +
+                            std::size_t(row) * row_bytes;
+    const float gv = row_dot<TY>(gate_row, xb, nb, lane);
+    const float uv = row_dot<TY>(up_row, xb, nb, lane);
+    if (lane == 0) h[output_base + row] = (gv / (1.0f + __expf(-gv))) * uv;
+    if (blockIdx.x == 0 && threadIdx.y == 0)
+        for (int col = n_out + lane; col < output_stride; col += 32)
+            h[output_base + col] = 0.f;
+}
+
 // ---------------------------------------------------------------- grouped native experts
 constexpr int GU_ROWS = 8;     // rows per block (one warp each)
 
@@ -5432,6 +5470,50 @@ void native_expert_gate_up_routed(int t, const void* gate_base, const void* up_b
     }
 #undef STRATA_ROUTED_GU
     check("routed native gate/up");
+}
+
+void native_expert_gate_up_swiglu_routed_padded(int t, const void* gate_base, const void* up_base,
+                                                size_t gate_bytes_per_expert, size_t up_bytes_per_expert,
+                                                const int32_t* expert_ids, int expert_count,
+                                                const void* x_q8_1, size_t activation_stride, int routed_rows,
+                                                bool broadcast_input, int n_in, int n_out, int output_stride,
+                                                float* h, int* status, void* stream) {
+    const size_t row_bytes = iq_row_bytes(t, n_in);
+    if (!(t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 23) ||
+        !gate_base || !up_base || !expert_ids || expert_count <= 0 || !x_q8_1 ||
+        routed_rows <= 0 || routed_rows > 65535 || n_in <= 0 || n_out <= 0 ||
+        output_stride < n_out || !row_bytes ||
+        gate_bytes_per_expert < row_bytes * std::size_t(n_out) ||
+        up_bytes_per_expert < row_bytes * std::size_t(n_out) ||
+        !h || !status || !stream ||
+        (reinterpret_cast<std::uintptr_t>(gate_base) & 1) || (reinterpret_cast<std::uintptr_t>(up_base) & 1) ||
+        (reinterpret_cast<std::uintptr_t>(x_q8_1) & 3) ||
+        (activation_stride < std::size_t(n_in / 32) * sizeof(block_q8_1)) ||
+        (activation_stride & 3) || (reinterpret_cast<std::uintptr_t>(h) & 3) ||
+        (reinterpret_cast<std::uintptr_t>(expert_ids) & 3) || (reinterpret_cast<std::uintptr_t>(status) & 3) ||
+        n_in % 32 != 0 ||
+        (t == 16 && n_in % Fmt<16>::qk != 0) ||
+        (t == 17 && n_in % Fmt<17>::qk != 0) || (t == 18 && n_in % Fmt<18>::qk != 0) ||
+        (t == 21 && n_in % Fmt<21>::qk != 0) || (t == 22 && n_in % Fmt<22>::qk != 0) ||
+        (t == 23 && n_in % Fmt<23>::qk != 0)) {
+        throw std::invalid_argument("routed native gate/up SwiGLU: invalid dimensions or buffers");
+    }
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    const dim3 grid((unsigned(n_out) + 3) / 4, unsigned(routed_rows));
+#define STRATA_ROUTED_GU_SWIGLU_PADDED(TY) case TY: \
+    routed_mmvq_swiglu_padded_kernel<TY><<<grid, dim3(32, 4), 0, s>>>( \
+        static_cast<const uint8_t*>(gate_base), static_cast<const uint8_t*>(up_base), \
+        gate_bytes_per_expert, up_bytes_per_expert, expert_ids, expert_count, \
+        static_cast<const block_q8_1*>(x_q8_1), activation_stride, row_bytes, routed_rows, \
+        broadcast_input, n_in, n_out, output_stride, h, status); break
+    switch (t) {
+        STRATA_ROUTED_GU_SWIGLU_PADDED(16); STRATA_ROUTED_GU_SWIGLU_PADDED(17);
+        STRATA_ROUTED_GU_SWIGLU_PADDED(18); STRATA_ROUTED_GU_SWIGLU_PADDED(21);
+        STRATA_ROUTED_GU_SWIGLU_PADDED(22); STRATA_ROUTED_GU_SWIGLU_PADDED(23);
+        default: throw std::invalid_argument("routed native gate/up SwiGLU: unsupported format");
+    }
+#undef STRATA_ROUTED_GU_SWIGLU_PADDED
+    check("routed native gate/up SwiGLU padded");
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {

@@ -151,6 +151,41 @@ def test_model_graph_requires_preagreed_device_routing_and_no_observers(config):
             runner.validated(dict(config, args=valid + extra))
 
 
+def test_decode_graph_mode_allows_grouped_prefill_and_expert_rows(config):
+    args = list(config["args"]) + [
+        "--expert-collectives", "batched", "--expert-operands", "compact",
+        "--device-expert-routing", "1", "--collective-agreement", "step",
+        "--model-graph", "1", "--model-graph-mode", "decode",
+        "--prefill-batch-size", "8", "--prefill-expert-batch", "1",
+    ]
+    options = runner.validated(dict(config, args=args, mode="autoregressive"))["options"]
+    assert options["model-graph-mode"] == "decode"
+    receipt = runner.run(dict(config, args=args, mode="autoregressive"))
+    assert "--model-graph-mode" in receipt["command"]
+
+    for flag, value in (
+        ("--mode", "teacher-forced"),
+        ("--model-graph-mode", "all"),
+    ):
+        invalid = list(args)
+        if flag == "--mode":
+            with pytest.raises(runner.RunnerError):
+                runner.validated(dict(config, args=invalid, mode=value))
+        else:
+            invalid[invalid.index(flag) + 1] = value
+            with pytest.raises(runner.RunnerError):
+                runner.validated(dict(config, args=invalid, mode="autoregressive"))
+
+
+def test_model_graph_mode_requires_graph_and_known_mode(config):
+    for extra, mode in (
+        (["--model-graph-mode", "decode"], "teacher-forced"),
+        (["--model-graph", "1", "--model-graph-mode", "capture"], "autoregressive"),
+    ):
+        with pytest.raises(runner.RunnerError):
+            runner.validated(dict(config, args=list(config["args"]) + extra, mode=mode))
+
+
 @pytest.mark.parametrize("value", ["2", "01", "true", "-1"])
 def test_model_graph_rejects_invalid_values(config, value):
     config["args"] += ["--model-graph", value]

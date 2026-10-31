@@ -4,7 +4,8 @@ This package uses the public SparkRun 0.4.1 plugin API. It launches three
 Strata ranks through SparkRun's native container lifecycle. The pinned image
 provides CUDA and Python; no vLLM process is launched. The transport smoke,
 teacher-forced model and autoregressive service have separate validation gates.
-No performance improvement has been established.
+The acceptance record distinguishes the slow reference measurements from the
+ongoing GPU acceleration candidate; it establishes no advantage over TP1 or vLLM.
 
 ## Isolated setup on DG1
 
@@ -155,3 +156,26 @@ when it saves canonical consumed IDs and internal state before reset/cancel.
 Capturing these files is diagnostic work, not a performance benchmark.
 See [the current acceptance record](../../../docs/TP3_EXPERIMENTAL_STATUS.md)
 for the exact hardware scope qualified so far.
+
+## Accelerated C1 Candidate
+
+The experimental candidate combines these explicit native flags:
+
+```text
+--expert-collectives batched --expert-operands compact
+--collective-agreement step --graph-finish 0
+--device-expert-routing 1 --prefill-batch-size 8 --prefill-expert-batch 1
+--model-graph 1 --model-graph-mode decode
+```
+
+Use `mode: autoregressive`, C1 and no MTP. Prompt chunks run eagerly; decode
+uses a full-model CUDA Graph. Reset and cancellation retire that graph before
+the next request captures a new one. The existing graph mode `all` remains the
+default when `--model-graph-mode` is omitted, and graphs remain off unless
+`--model-graph 1` is explicit. The runners reject unsupported combinations.
+
+Device routing uses the fused native gate/up, SwiGLU and padded-output kernel.
+It keeps original weight formats and Q8_1 activation arithmetic. This is an
+integration candidate: consult the acceptance record before treating a flag
+combination as qualified or faster. Keep state capture separate from speed
+measurements because writing diagnostics adds work.

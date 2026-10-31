@@ -35,6 +35,16 @@ void native_expert_gate_up_routed(int ggml_type, const void* gate_base, const vo
                                   bool broadcast_input, int n_in, int n_out,
                                   float* gate, float* up, int* status, void* stream);
 
+/// Routed gate/up plus SwiGLU in one launch, writing each row into a padded output stride.
+/// Values [0, n_out) match native_expert_gate_up_routed followed by SwiGLU; [n_out, output_stride) are zero.
+/// Invalid expert IDs set sticky status and zero the complete padded row.
+void native_expert_gate_up_swiglu_routed_padded(int ggml_type, const void* gate_base, const void* up_base,
+                                                size_t gate_bytes_per_expert, size_t up_bytes_per_expert,
+                                                const int32_t* expert_ids, int expert_count,
+                                                const void* x_q8_1, size_t activation_stride, int routed_rows,
+                                                bool broadcast_input, int n_in, int n_out, int output_stride,
+                                                float* h, int* status, void* stream);
+
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32; fp16 times `*scale` when given (device:
 /// an NVFP4 expert's s_down, read by the kernel itself so the source may be released right after it).
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale = nullptr);

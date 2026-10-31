@@ -155,6 +155,45 @@ def test_dry_run_hashes_without_reading_credential_or_launch(config, monkeypatch
     assert not Path(config["evidence_dir"]).exists()
 
 
+def test_decode_graph_mode_composes_batched_autoregressive_command(config):
+    config["args"] += [
+        "--expert-collectives", "batched", "--expert-operands", "compact",
+        "--device-expert-routing", "1", "--model-graph", "1",
+        "--model-graph-mode", "decode", "--prefill-batch-size", "8",
+        "--prefill-expert-batch", "1", "--collective-agreement", "step",
+    ]
+    result = runner.run(config)
+    command = result["native_command"]
+    assert command[:3] == [config["binary"], "--mode", "autoregressive"]
+    for pair in (
+        ("--prefill-batch-size", "8"),
+        ("--prefill-expert-batch", "1"),
+        ("--model-graph-mode", "decode"),
+        ("--model-graph", "1"),
+        ("--device-expert-routing", "1"),
+        ("--collective-agreement", "step"),
+    ):
+        start = command.index(pair[0])
+        assert command[start + 1] == pair[1]
+    assert runner.server_config(runner.validated(config))["distributed"]["command"] == command
+
+
+def test_decode_graph_mode_rejects_invalid_service_combinations(config, tmp_path):
+    original = list(config["args"])
+    valid_graph = ["--model-graph", "1", "--model-graph-mode", "decode", "--prefill-batch-size", "8"]
+    invalid_configs = [
+        dict(config, args=original + valid_graph + ["--parallel", "4"], mode="multislot", parallel=4),
+        dict(config, args=original + valid_graph + ["--model-graph", "0"]),
+        dict(config, args=original + valid_graph + ["--prefill-batch-size", "1"]),
+        dict(config, args=original + valid_graph + mtp_args(config, tmp_path)[len(original):],
+             mode="autoregressive"),
+        dict(config, args=original + ["--model-graph-mode", "capture"]),
+    ]
+    for invalid in invalid_configs:
+        with pytest.raises(runner.RunnerError):
+            runner.validated(invalid)
+
+
 @pytest.mark.parametrize("agreement", ["per-op", "step"])
 def test_collective_agreement_forwarded_exactly(config, agreement):
     config["args"] += ["--collective-agreement", agreement]

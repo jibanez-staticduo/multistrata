@@ -412,7 +412,8 @@ int main(int argc, char** argv) {
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
             "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel", "profile-dir",
             "collective-agreement", "service-state-dir", "timing-file", "expert-operands", "request-timing",
-            "prefill-batch-size", "prefill-expert-batch", "device-expert-routing", "model-graph", "memory-phase-file"};
+            "prefill-batch-size", "prefill-expert-batch", "device-expert-routing", "model-graph",
+            "model-graph-mode", "memory-phase-file"};
 #if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
         allowed.insert("gather-transport");
         allowed.insert("roce-hca-list");
@@ -487,6 +488,11 @@ int main(int argc, char** argv) {
         const auto model_graph_value = number("model-graph", 0);
         require(model_graph_value <= 1, "--model-graph must be 0 or 1");
         const bool model_graph = model_graph_value != 0;
+        const auto model_graph_mode = args.contains("model-graph-mode") ? args.at("model-graph-mode") : "all";
+        require(model_graph_mode == "all" || model_graph_mode == "decode",
+                "--model-graph-mode must be all or decode");
+        const bool decode_graph_only = model_graph && model_graph_mode == "decode";
+        require(model_graph || model_graph_mode == "all", "--model-graph-mode decode requires --model-graph 1");
         const auto mode = args.contains("mode") ? args.at("mode") : "teacher-forced";
         require(mode == "teacher-forced" || mode == "autoregressive" || mode == "multislot", "invalid distributed mode");
         const bool autoregressive = mode == "autoregressive";
@@ -505,8 +511,9 @@ int main(int argc, char** argv) {
         require(!prefill_expert_batch || (prefill_batch_size > 1 && batched_experts && compact_expert_operands),
                 "--prefill-expert-batch 1 requires multi-token prefill, batched collectives and compact operands");
         require(!device_expert_routing ||
-                    (batched_experts && compact_expert_operands && !graph_finish && !prefill_expert_batch),
-                "--device-expert-routing 1 requires batched compact experts, graph finish 0 and prefill expert batch 0");
+                    (batched_experts && compact_expert_operands && !graph_finish &&
+                     (!prefill_expert_batch || decode_graph_only)),
+                "--device-expert-routing 1 requires batched compact experts and graph finish 0; expert prefill requires decode graph mode");
         const auto request_timing_value = args.contains("request-timing") ? args.at("request-timing") : "0";
         require((request_timing_value == "0" || request_timing_value == "1") &&
                     (request_timing_value == "0" || autoregressive || multislot),
@@ -525,9 +532,11 @@ int main(int argc, char** argv) {
                 "--parallel 1,4,8 requires --mode multislot");
         const bool mtp_enabled = args.contains("mtp-path");
         require(!model_graph || (device_expert_routing && preagreed_collectives && !hybrid_roce &&
-                    !multislot && !mtp_enabled && prefill_batch_size == 1 &&
+                    !multislot && !mtp_enabled && (decode_graph_only || prefill_batch_size == 1) &&
                     !args.contains("trace-dir") && !args.contains("profile-dir")),
-                "--model-graph 1 requires NCCL C1 singleton preagreed device routing without MTP or observers");
+                "--model-graph requires NCCL C1 preagreed device routing without MTP or observers; all mode requires singleton prefill");
+        require(!decode_graph_only || autoregressive,
+                "--model-graph-mode decode requires autoregressive mode");
         require(prefill_batch_size == 1 || !mtp_enabled,
                 "batched prompt processing does not yet supply every target residual row required by MTP");
         const auto mtp_drafts = number("mtp-drafts", 4);
@@ -662,6 +671,7 @@ int main(int argc, char** argv) {
         if (prefill_expert_batch) join.config_fingerprint += ":prefill-expert-rows-v1";
         if (device_expert_routing) join.config_fingerprint += ":device-expert-routing-v1:1";
         if (model_graph) join.config_fingerprint += ":full-model-graph-v1:1";
+        if (decode_graph_only) join.config_fingerprint += ":full-model-graph-mode-v1:decode";
         join.backend_identity = hybrid_roce ? std::string(kHybridBackendIdentity) : "nccl";
         if (hybrid_roce) join.config_fingerprint += ":gather-transport=hybrid-roce-v1";
         join.nccl_version_expected = version; join.library_provenance = provenance;
@@ -916,6 +926,7 @@ int main(int argc, char** argv) {
             model_worker_config.prefill_batch_exactnative = prefill_batch_size > 1;
             model_worker_config.prefill_expert_batch = prefill_expert_batch;
             model_worker_config.decode_graph_api = graph_api;
+            model_worker_config.decode_graph_only = decode_graph_only;
             model_worker_config.memory_phase = memory_phase;
             ModelWorkerBackend execution(model_worker_config, model, collectives, session, transport);
             PendingDmaExitGuard graph_lifetime(execution);

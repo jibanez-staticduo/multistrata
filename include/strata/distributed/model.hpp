@@ -166,6 +166,8 @@ public:
                        void* stream, std::string& err);
     bool enqueue_prepared_token(float* logits, void* stream, std::string& err);
     bool complete_prepared_token(std::string& err);
+    // Caller destroys the executable graph and ends its transport session first.
+    bool discard_prepared_graph(std::string& err);
     // Layer-major exact-native prompt chunk. Writes logits for the final row.
     bool tokens(const std::vector<int32_t>& tokens, int64_t position, int32_t position_base,
                 float* logits, void* stream, std::string& err);

@@ -33,7 +33,8 @@ credential = _common.credential
 DISTRIBUTED_MAX_CONTEXT = _common.DISTRIBUTED_MAX_CONTEXT
 MAX_LOG = 32 << 20
 SERVICE_FLAGS = frozenset({"--mtp-path", "--mtp-drafts", "--mtp-hash", "--parallel"})
-SERVICE_CAPTURE_FLAGS = frozenset({"--collective-agreement", "--profile-dir", "--service-state-dir"})
+SERVICE_CAPTURE_FLAGS = frozenset({"--collective-agreement", "--profile-dir", "--service-state-dir",
+                                  "--model-graph-mode"})
 
 
 def absolute(value):
@@ -100,6 +101,15 @@ def validated(supplied):
     mtp = {flag for flag in SERVICE_FLAGS - {"--parallel", "--service-state-dir"} if flag in options}
     if batch_size != "1" and (mtp or mode != "autoregressive"):
         raise RunnerError("prefill batching requires C1 autoregressive mode with MTP disabled")
+    capture_options = {flag: options[flag] for flag in SERVICE_CAPTURE_FLAGS if flag in options}
+    graph_mode = options.get("--model-graph-mode", "all")
+    if graph_mode not in ("all", "decode"):
+        raise RunnerError("model-graph-mode must be all or decode")
+    model_graph = options.get("--model-graph", "0")
+    if model_graph not in ("0", "1"):
+        raise RunnerError("model-graph must be 0 or 1")
+    if graph_mode == "decode" and (model_graph != "1" or mode != "autoregressive" or batch_size == "1"):
+        raise RunnerError("model-graph-mode decode requires model-graph 1, C1 autoregressive mode and grouped prefill")
     if mtp:
         if mtp != SERVICE_FLAGS - {"--parallel"} or mode != "autoregressive":
             raise RunnerError("MTP requires autoregressive mode and path, drafts and hash together")
@@ -107,15 +117,23 @@ def validated(supplied):
             raise RunnerError("MTP requires an absolute path and drafts in 1..4")
         if not re.fullmatch(r"[0-9a-f]{64}", options["--mtp-hash"]):
             raise RunnerError("MTP hash must be exactly 64 lowercase hex characters")
-    capture_options = {flag: options[flag] for flag in SERVICE_CAPTURE_FLAGS if flag in options}
     common_args = [item for flag, value in zip(args[::2], args[1::2])
-                   if flag not in SERVICE_FLAGS | {"--service-state-dir", "--request-timing", "--prefill-batch-size"}
+                   if flag not in SERVICE_FLAGS |
+                   {"--service-state-dir", "--request-timing", "--prefill-batch-size"} |
+                   SERVICE_CAPTURE_FLAGS
                    for item in (flag, value)]
+    common_args += ["--prefill-batch-size", batch_size]
+    if "--model-graph-mode" in options:
+        common_args += ["--model-graph-mode", graph_mode]
+    if "--collective-agreement" in options:
+        common_args += ["--collective-agreement", options["--collective-agreement"]]
+    if "--profile-dir" in options:
+        common_args += ["--profile-dir", options["--profile-dir"]]
     # Reuse the pinned teacher-forced runner's common validation. Its mandatory
     # input/logits fields are placeholders here and never reach the native argv.
     normalized = dict(config, args=[*common_args, "--logits-dir", config["evidence_dir"]],
                       input_file=config.get("source_file"), input_sha256=config.get("source_sha256"),
-                      process_timeout_s=600)
+                      process_timeout_s=600, mode=mode)
     context = options.get("--context", "")
     if not isinstance(context, str) or not context.isdigit() or not 4 <= int(context) <= DISTRIBUTED_MAX_CONTEXT:
         raise RunnerError(f"service context must be in 4..{DISTRIBUTED_MAX_CONTEXT}")
@@ -127,6 +145,10 @@ def validated(supplied):
         if flag == "--collective-agreement":
             if value not in ("per-op", "step"):
                 raise RunnerError("invalid collective agreement policy")
+            config["options"][flag[2:]] = value
+        elif flag == "--model-graph-mode":
+            if value not in ("all", "decode"):
+                raise RunnerError("model-graph-mode must be all or decode")
             config["options"][flag[2:]] = value
         elif flag == "--profile-dir":
             if not absolute(value):

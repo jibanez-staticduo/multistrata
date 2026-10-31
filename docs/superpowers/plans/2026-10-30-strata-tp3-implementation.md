@@ -2,7 +2,69 @@
 
 > **For agentic workers:** Use superpowers:subagent-driven-development or superpowers:executing-plans task by task. Checkboxes describe future work, not completed implementation.
 
-**Goal:** Execute one Qwen3.8-Flash-Next model with Strata-native TP3/PP1 on DG1/DG2/DG3 over RoCE and measure correctness, capacity and speed separately.
+**Goal (revised by Jordi, 2026-10-31):** Accelerate native Strata TP3/PP1 on DG1/DG2/DG3 with fast GPU kernels, batched prefill, CUDA Graph replay and fewer host/network synchronization points. Deliver measured improvements over the current TP3 reference while preserving the original weights and qualified numerical behavior.
+
+## Current Execution Priority
+
+This section supersedes the original Task 10 execution order. Jordi explicitly
+requests GPU acceleration and fast TP3 kernels as the main work. The exhaustive
+4K/16K/64K C1/C4/C8 baseline matrix is stopped; retain completed measurements and
+mark unfinished cases as not run or interrupted. Do not spend days measuring
+the already demonstrated slow reference path.
+
+Existing acceptance evidence remains valid within its recorded scope: original
+64K prompt plus 256 continuation steps, state parity, short/extended sampled
+MTP, C4/C8 isolation, and C1 NCCL model graphs. Do not repeat those suites unless
+a changed path creates a concrete correctness risk.
+
+1. Measure a short TP3 workload with GPU/collective profiling. Separate active
+   GPU work, host routing/control, communication and launch overhead.
+2. Put the qualified fast paths into an explicit accelerated execution profile:
+   device-side expert routing, full-model graph decode and grouped prompt work.
+   Remove their current unnecessary mutual exclusions where correctness allows.
+3. Implement the dominant missing fast kernel or fusion identified by that
+   profile: grouped expert gate/up/down, exact-native multi-row projection or
+   quantized GEMM, GDN/QSA projections, or fused residual/normalization work.
+   Use original Strata fast kernels when compatible with the TP shard contract.
+4. Reduce per-layer host waits and redundant collective/control exchanges.
+   Use the existing NCCL/RoCE primitives with a fixed, agreed execution schedule;
+   retain bounded failure and no-output-before-commit behavior.
+5. For each change run only its component parity and a short model/state check,
+   then an A/B timing with the same pack, prompt and output budget. Keep a change
+   only when its measured benefit justifies it. A failed numerical gate is a bug
+   to diagnose, never a reason to widen the frozen policy automatically.
+6. Finish with an opt-in usable TP3 accelerated profile and a concise record of
+   prefill/decode gains, remaining limits and actual failures. Run a larger final
+   check once the fast candidate is stable, rather than restarting the full
+   matrix after every edit. Restore Staticduo21 once at the end and verify it.
+
+Acceptance: an actual three-host GPU execution uses the accelerated kernels,
+preserves the qualified model/state behavior on changed seams, and shows a
+repeatable prefill or decode improvement over the current TP3 reference. Report
+the comparison with TP1 separately; an improvement over slow TP3 alone is not a
+claim that TP3 beats TP1. No speed claim from compilation or flags alone.
+
+## Acceleration Execution Record
+
+Implemented and tested on 31 October 2026:
+
+- Fused routed gate/up, SwiGLU and padded output; original six native codecs.
+- GPU top-k Q8_1 expansion and device-routed batched prefill without CPU expert
+  grouping; batched hidden quantization and direct final output.
+- Decode-only full-model CUDA Graph mode with eager grouped prefill and graph
+  retirement/recapture across requests and reset.
+- ARM/GB10 build, GPU component parity, 126 launcher tests and 63 CPU worker
+  checks pass. Independent scoped reviews report no blocking findings.
+- Two short service requests pass TP1 comparison: two full vocabulary rows,
+  342 logical states, original zero-error policy; four requests exercise reset.
+- Short A/B with three warm requests per profile and diagnostics disabled:
+  prefill 1.43x and decode 1.49x faster than reference TP3. This is not a claim
+  against TP1/vLLM. Exact measurements and limits are in
+  [the acceptance record](../../TP3_EXPERIMENTAL_STATUS.md#short-gpu-ab).
+
+The final accelerated execution passes with 923 prompt tokens and 128 output
+tokens, reset and all three ranks ready. Once-only Staticduo21 restoration is the
+remaining operational closing step. The exhaustive old matrix remains stopped.
 
 **Architecture:** One CUDA process per host, a private control coordinator and NCCL tensor collectives. Preserve original GGUF geometry through explicit unequal tensor ownership; add RoCEnante only after a correct profiled baseline.
 
@@ -14,7 +76,8 @@
 
 ## Global Constraints
 
-- This delivery is planning only; no implementation or new GPU/network test ran.
+- The original document was planning only. Later implementation and hardware
+  evidence are recorded in `docs/TP3_EXPERIMENTAL_STATUS.md` and the execution ledger.
 - Start from Strata `870aedd9e1ebe1c91f94da93b59af17729f6c5c0` in an isolated branch/worktree.
 - One model, TP3/PP1, Qwen/CUDA/ARM64 first. DeepSeek, HIP, SYCL and app UI additions are outside the first feature.
 - Keep default execution/build off-path byte-identical; all distributed builds and options are opt-in.

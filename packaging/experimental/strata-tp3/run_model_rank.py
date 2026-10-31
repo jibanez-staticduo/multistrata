@@ -32,7 +32,8 @@ FLAGS = frozenset("rank rank0-address port session-uuid library-path nccl-versio
 STATE_FLAGS = frozenset({"state-dir", "state-positions", "state-max-bytes"})
 TRACE_FLAGS = frozenset({"trace-dir"})
 POLICY_FLAGS = frozenset({"expert-collectives", "poll-interval-ms", "graph-finish", "expert-operands",
-                          "device-expert-routing", "prefill-expert-batch", "model-graph"})
+                          "device-expert-routing", "prefill-expert-batch", "prefill-batch-size",
+                          "model-graph", "model-graph-mode"})
 CAPTURE_FLAGS = frozenset({"collective-agreement", "profile-dir", "memory-phase-file"})
 NETWORK_ENV = frozenset("NCCL_IB_HCA NCCL_SOCKET_IFNAME NCCL_IB_GID_INDEX NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE NCCL_IB_ROCE_VERSION_NUM NCCL_CROSS_NIC NCCL_IB_QPS_PER_CONNECTION NCCL_IB_TC NCCL_IB_SL NCCL_IB_TIMEOUT NCCL_IB_RETRY_CNT NCCL_NET_GDR_LEVEL NCCL_CUMEM_ENABLE NCCL_IB_MERGE_NICS NCCL_IB_SUBNET_AWARE_ROUTING NCCL_NET_MERGE_LEVEL NCCL_NVLS_ENABLE NCCL_IGNORE_CPU_AFFINITY".split())
 SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -73,23 +74,36 @@ def validated(config):
     prefill_expert_batch = options.get("prefill-expert-batch", "0")
     if prefill_expert_batch not in ("0", "1"):
         raise RunnerError("prefill-expert-batch must be 0 or 1")
-    if device_routing == "1" and (
-        options.get("expert-collectives") != "batched" or
-        options.get("expert-operands") != "compact" or
-        graph_finish != "0" or prefill_expert_batch != "0"
-    ):
-        raise RunnerError(
-            "device-expert-routing requires batched compact experts, graph-finish 0, "
-            "and prefill-expert-batch 0"
-        )
+    prefill_batch_size = options.get("prefill-batch-size", "1")
+    if prefill_batch_size not in tuple(str(n) for n in range(1, 9)):
+        raise RunnerError("prefill-batch-size must be in 1..8")
     model_graph = options.get("model-graph", "0")
     if model_graph not in ("0", "1"):
         raise RunnerError("model-graph must be 0 or 1")
+    model_graph_mode = options.get("model-graph-mode", "all")
+    if model_graph_mode not in ("all", "decode"):
+        raise RunnerError("model-graph-mode must be all or decode")
+    decode_graph_only = model_graph == "1" and model_graph_mode == "decode"
+    if model_graph == "0" and model_graph_mode != "all":
+        raise RunnerError("model-graph-mode decode requires model-graph 1")
+    if device_routing == "1" and (
+        options.get("expert-collectives") != "batched" or
+        options.get("expert-operands") != "compact" or
+        graph_finish != "0" or (prefill_expert_batch != "0" and not decode_graph_only)
+    ):
+        raise RunnerError(
+            "device-expert-routing requires batched compact experts and graph-finish 0; "
+            "prefill-expert-batch requires model-graph-mode decode"
+        )
     if model_graph == "1" and (
         device_routing != "1" or options.get("collective-agreement") != "step" or
         "trace-dir" in options or "profile-dir" in options
     ):
         raise RunnerError("model-graph requires preagreed device routing without trace or profile observers")
+    if decode_graph_only and config.get("mode", "teacher-forced") != "autoregressive":
+        raise RunnerError("model-graph-mode decode requires autoregressive mode")
+    if model_graph == "1" and model_graph_mode == "all" and prefill_batch_size != "1":
+        raise RunnerError("model-graph-mode all requires singleton prefill")
     poll = options.get("poll-interval-ms", "1")
     if not poll.isdigit() or not 0 <= int(poll) <= 1000:
         raise RunnerError("poll interval must be in 0..1000 ms")

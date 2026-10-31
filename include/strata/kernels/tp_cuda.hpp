@@ -37,6 +37,8 @@ std::size_t global_q81_bytes(int rows, int width);
 GlobalQ81 quantize_global(const distributed::ActivationContract& contract,
                          const float* logical, int rows, int width, void* q81,
                          std::size_t capacity, void* stream);
+GlobalQ81 expand_global_q81_topk(const GlobalQ81& input, int top_k, void* expanded_q81,
+                                std::size_t capacity, void* stream);
 
 // Original input quantization is shared by both projections. gate/up/h contain
 // rows * owned_output floats, token-major. Scales, when supplied, are device
@@ -53,6 +55,15 @@ void gate_up_routed(const MatrixShard& gate, const MatrixShard& up,
                     const int32_t* device_ids, int expert_count, std::size_t gate_bytes_per_expert,
                     std::size_t up_bytes_per_expert, int routed_rows, bool broadcast_input,
                     float* gate_out, float* up_out, float* h, int* device_status, void* stream);
+
+// Opt-in routed gate/up + SwiGLU path. Writes h[row * output_stride + column], zeroes
+// padded columns, and preserves the legacy route's sticky invalid-ID contract.
+void gate_up_swiglu_routed_padded(const MatrixShard& gate, const MatrixShard& up,
+                                 const distributed::ActivationContract& contract, const GlobalQ81& input,
+                                 const int32_t* device_ids, int expert_count,
+                                 std::size_t gate_bytes_per_expert, std::size_t up_bytes_per_expert,
+                                 int routed_rows, bool broadcast_input, int output_stride,
+                                 float* h, int* device_status, void* stream);
 
 // Input-sharded IQ4_NL / Q2_0. Reads owned blocks from a GLOBAL activation image
 // and writes rows * global_output floats. Sum rank partials before any bias,
