@@ -1,5 +1,6 @@
 // Independent, uncaptured C1 teacher-forcing oracle. No distributed model kernels.
 #include "strata/distributed/reference.hpp"
+#include "strata/distributed/parity_trace_writer.hpp"
 #include "strata/distributed/state_evidence.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/native_dense.hpp"
@@ -107,7 +108,7 @@ int main(int argc, char** argv) {
     try {
         std::map<std::string, std::string> args;
         const std::set<std::string> allowed = {"pack", "native", "ple", "context", "logits-dir",
-            "state-dir", "state-positions", "state-max-bytes"};
+            "state-dir", "state-positions", "state-max-bytes", "trace-dir"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) ||
@@ -217,6 +218,14 @@ int main(int argc, char** argv) {
         wire_ple(weights, state, table, ple_embedding, ple_scratch, ple_host);
         MonolithicReference model(weights, geometry, state, pack, native);
         model.native_head(&head);
+        std::unique_ptr<ParityTraceWriter> trace;
+        if (args.contains("trace-dir")) {
+            trace = std::make_unique<ParityTraceWriter>(args.at("trace-dir"));
+            require(trace->request("request-0", err), err);
+            model.parity_observer([&](const ParityTraceView& view, void* s, std::string& error) {
+                return view.position != 0 || trace->capture(view, s, error);
+            });
+        }
         require(model.initialize(err), err);
         require(model.reset(stream.value, err), err);
         logits.allocate(size_t(geometry.n_vocab) * sizeof(float));
@@ -257,7 +266,9 @@ int main(int argc, char** argv) {
             if (line == "RESET") {
                 if (state_last) dump_state(false);
                 require(model.reset(stream.value, err), err);
-                ++request_sequence; dumped_positions.clear(); dump_state(true);
+                ++request_sequence;
+                if (trace) require(trace->request("request-" + std::to_string(request_sequence), err), err);
+                dumped_positions.clear(); dump_state(true);
                 std::cout << "RESET_OK\n"; continue;
             }
             std::istringstream input(line);

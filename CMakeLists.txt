@@ -2836,7 +2836,7 @@ if(STRATA_BUILD_DISTRIBUTED)
                  src/distributed/expert_model.cpp src/distributed/qsa_model.cpp
                  src/distributed/model_worker.cpp src/distributed/worker.cpp
                  src/distributed/session.cpp src/distributed/control_tcp.cpp
-                 src/distributed/state_evidence.cpp)
+                 src/distributed/state_evidence.cpp src/distributed/parity_trace_writer.cpp)
   target_compile_definitions(strata-distributed PRIVATE STRATA_BUILD_DISTRIBUTED
                              STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE)
   target_include_directories(strata-distributed PRIVATE include src ${STRATA_NCCL_INCLUDE_DIR}
@@ -2844,12 +2844,18 @@ if(STRATA_BUILD_DISTRIBUTED)
   target_link_libraries(strata-distributed PRIVATE strata_engine strata_tp_cuda strata_kernels_cpu
                         ${CMAKE_DL_LIBS} Threads::Threads)
   add_executable(strata-tp-reference src/program/distributed_reference.cpp src/distributed/reference.cpp
-                                   src/distributed/state_evidence.cpp)
+                                   src/distributed/state_evidence.cpp src/distributed/parity_trace_writer.cpp)
   target_compile_definitions(strata-tp-reference PRIVATE STRATA_BUILD_DISTRIBUTED
                              STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE)
   target_include_directories(strata-tp-reference PRIVATE include src
                             ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata-tp-reference PRIVATE strata_engine strata_kernels_cpu Threads::Threads)
+  add_executable(parity_trace_writer_test tests/distributed/test_parity_trace_writer.cpp
+                                         src/distributed/parity_trace_writer.cpp)
+  target_include_directories(parity_trace_writer_test PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(parity_trace_writer_test PRIVATE Threads::Threads)
+  add_test(NAME distributed_parity_trace_writer COMMAND parity_trace_writer_test
+           ${CMAKE_CURRENT_BINARY_DIR}/parity-trace-writer-test-output)
 endif()
 
 if(STRATA_BUILD_DISTRIBUTED_TESTS)

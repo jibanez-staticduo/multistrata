@@ -5,6 +5,7 @@
 #include "strata/distributed/session.hpp"
 #include "strata/distributed/worker.hpp"
 #include "strata/distributed/state_evidence.hpp"
+#include "strata/distributed/parity_trace.hpp"
 
 #include <array>
 #include <memory>
@@ -71,6 +72,8 @@ public:
     ModelForward& operator=(const ModelForward&) = delete;
     bool initialize(std::string& err);
     void native_head(const core::NativeHead* head);
+    // Optional uncaptured diagnostics; an empty observer performs no copies.
+    void parity_observer(ParityObserver observer);
     bool reset(void* stream, std::string& err);
     bool token(int32_t token, int64_t position, int32_t position_base,
                float* logits, void* stream, std::string& err);

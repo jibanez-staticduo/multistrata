@@ -5,6 +5,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/distributed/expert_model.hpp"
 #include "strata/distributed/model_worker.hpp"
+#include "strata/distributed/parity_trace_writer.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -94,7 +95,7 @@ int main(int argc, char** argv) {
         const std::set<std::string> allowed = {"rank", "rank0-address", "port", "session-uuid",
             "library-path", "nccl-version", "library-provenance", "model-hash", "config-fingerprint",
             "pack", "native", "ple", "context", "logits-dir", "timeout-ms",
-            "state-dir", "state-positions", "state-max-bytes"};
+            "state-dir", "state-positions", "state-max-bytes", "trace-dir"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) || args.contains(key.substr(2)))
@@ -227,6 +228,14 @@ int main(int argc, char** argv) {
             std::cerr << "LOAD rank=" << rank << " stage=expert-shards-complete bytes=" << experts.owned_weight_bytes() << std::endl;
             ModelForward model(weights, geometry, state, int(rank), collectives, experts);
             model.native_head(&head);
+            std::unique_ptr<ParityTraceWriter> trace;
+            if (args.contains("trace-dir")) {
+                trace = std::make_unique<ParityTraceWriter>(args.at("trace-dir"), uint32_t(timeout));
+                require(trace->request("request-0", err), err);
+                model.parity_observer([&](const ParityTraceView& view, void* s, std::string& error) {
+                    return view.position != 0 || trace->capture(view, s, error);
+                });
+            }
             WorkerConfig worker_config{join.session_uuid, join.model_hash, uint32_t(rank)};
             ModelWorkerBackend execution({worker_config, stream.value, 0}, model, collectives, session, transport);
             Worker worker(worker_config, execution);
@@ -277,6 +286,7 @@ int main(int argc, char** argv) {
                 if (line == "RESET") {
                     if (state_last) dump_state(false);
                     execute(StepPhase::reset); ++request_sequence;
+                    if (trace) require(trace->request("request-" + std::to_string(request_sequence), err), err);
                     dumped_positions.clear(); dump_state(true);
                     std::cout << "RESET_OK\n"; continue;
                 }

@@ -43,7 +43,7 @@ struct HostBuffer {
 };
 } // namespace
 
-struct MonolithicReference::Impl {
+struct MonolithicReference::Impl : core::DistributedLayerHooks {
     struct Layer {
         kernels::NativeExpertLayout format;
         const uint8_t* role[3]{};
@@ -165,6 +165,19 @@ struct MonolithicReference::Impl {
         ready = true;
     }
 
+    ParityObserver observer;
+
+    bool mixer(int64_t layer, int64_t pos, int32_t base, const float* input,
+               float* output, void* stream, std::string& err) override {
+        if (!observer({"mixer_input", layer, pos, input, size_t(geometry.n_embd)}, stream, err)) return false;
+        const bool ok = core::is_qsa_layer(geometry, layer)
+            ? core::qsa_layer(weights, geometry, layer, pos, base,
+                              state.qsa_states[layer / geometry.qsa_interval], state.qsa_bufs,
+                              input, output, stream, err)
+            : core::gdn_layer(weights, geometry, layer, state.gdn, input, output, stream, err);
+        return ok && observer({"mixer_output", layer, pos, output, size_t(geometry.n_embd)}, stream, err);
+    }
+
     void experts(int64_t layer_index, void* stream) {
         const size_t k = size_t(state.k);
         const auto ids_offset = reinterpret_cast<uint8_t*>(ids) - metadata.bytes();
@@ -212,6 +225,7 @@ bool MonolithicReference::initialize(std::string& err) {
     catch (const std::exception& e) { err = e.what(); return false; }
 }
 void MonolithicReference::native_head(const core::NativeHead* h) { impl_->head = h; }
+void MonolithicReference::parity_observer(ParityObserver observer) { impl_->observer = std::move(observer); }
 int64_t MonolithicReference::next_position() const { return impl_->position; }
 bool MonolithicReference::reset(void* stream, std::string& err) {
     auto& p = *impl_;
@@ -249,17 +263,29 @@ bool MonolithicReference::token(int32_t token, int64_t pos, int32_t base, float*
                                   static_cast<cudaStream_t>(stream)));
         int64_t qsa_index = p.state.qsa_ord0;
         for (int64_t layer = 0; layer < p.geometry.n_layers; ++layer) {
+            if (p.observer && !p.observer({"residual_pre", layer, pos, p.state.R,
+                                          size_t(p.geometry.hc * p.geometry.n_embd)}, stream, err))
+                throw std::runtime_error(err);
             core::gdn_point_at(p.geometry, layer, p.state);
             const bool qsa = core::is_qsa_layer(p.geometry, layer);
             auto& qst = p.state.qsa_states[qsa ? qsa_index : p.state.qsa_primary()];
             if (!core::block_layer_pre(p.weights, p.geometry, layer, pos, base, p.state.gdn, qst,
                                        p.state.qsa_bufs, p.state.moe, p.state.k, p.state.block,
-                                       stream, err, nullptr, &p.state.ple))
+                                       stream, err, nullptr, &p.state.ple, 0, 0, p.observer ? &p : nullptr))
                 throw std::runtime_error("layer " + std::to_string(layer) + " pre: " + err);
+            if (p.observer && !p.observer({"expert_input", layer, pos, p.state.block.mixed,
+                                          size_t(p.geometry.n_embd)}, stream, err))
+                throw std::runtime_error(err);
             p.experts(layer, stream);
+            if (p.observer && !p.observer({"expert_output", layer, pos, p.parts.floats(),
+                                          size_t(p.state.k * p.geometry.n_embd)}, stream, err))
+                throw std::runtime_error(err);
             if (!core::block_layer_post(p.weights, p.geometry, layer, p.state.k, p.state.moe,
                                         p.state.block, p.parts.floats(), stream, err))
                 throw std::runtime_error("layer " + std::to_string(layer) + " post: " + err);
+            if (p.observer && !p.observer({"residual_post", layer, pos, p.state.R,
+                                          size_t(p.geometry.hc * p.geometry.n_embd)}, stream, err))
+                throw std::runtime_error(err);
             if (qsa) ++qsa_index;
         }
         if (p.head ? (!core::lm_head_mix(p.weights, p.geometry, p.state.block, stream, err) ||

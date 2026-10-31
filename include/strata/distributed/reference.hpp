@@ -2,6 +2,7 @@
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/session.hpp"
+#include "strata/distributed/parity_trace.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -22,6 +23,7 @@ public:
     MonolithicReference& operator=(const MonolithicReference&) = delete;
     bool initialize(std::string& err);
     void native_head(const core::NativeHead* head);
+    void parity_observer(ParityObserver observer);
     bool reset(void* stream, std::string& err);
     // logits is device memory. Success includes bounded stream completion.
     bool token(int32_t token, int64_t position, int32_t position_base,

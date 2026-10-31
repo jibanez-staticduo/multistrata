@@ -125,6 +125,7 @@ struct ModelForward::Impl {
     float* qsa_partial = nullptr;
     float* qsa_global = nullptr;
     const core::NativeHead* head = nullptr;
+    ParityObserver observer;
     bool ready = false;
     bool failed = false;
     int64_t next_position = 0;
@@ -240,6 +241,7 @@ std::vector<GdnStateSource> ModelForward::state_sources() const {
 }
 void ModelForward::invalidate() noexcept { impl_->failed = true; }
 void ModelForward::native_head(const core::NativeHead* head) { impl_->head = head; }
+void ModelForward::parity_observer(ParityObserver observer) { impl_->observer = std::move(observer); }
 
 bool ModelForward::initialize(std::string& err) {
     auto& p = *impl_;
@@ -303,13 +305,16 @@ bool ModelForward::reset(void* stream, std::string& err) {
 bool ModelForward::mixer(int64_t layer, int64_t pos, int32_t base, const float* input,
                          float* output, void* stream, std::string& err) {
     auto& p = *impl_;
+    if (p.observer && !p.observer({"mixer_input", layer, pos, input, size_t(p.geometry.n_embd)}, stream, err))
+        return false;
+    bool ok;
     if (core::is_qsa_layer(p.geometry, layer)) {
-        return qsa_layer_tp(p.weights, p.geometry, layer, pos, base,
+        ok = qsa_layer_tp(p.weights, p.geometry, layer, pos, base,
                             p.state.qsa_states[layer / 4], p.state.qsa_bufs,
                             input, output, {p.rank, QsaAttentionPolicy::GatherReference, QsaOutputPolicy::RankZeroReference},
                             {p.qsa_global, 6144, p.qsa_partial, 2560}, p.collectives, stream, err);
-    }
-    return p.gdn(layer, input, output, stream, err);
+    } else ok = p.gdn(layer, input, output, stream, err);
+    return ok && (!p.observer || p.observer({"mixer_output", layer, pos, output, size_t(p.geometry.n_embd)}, stream, err));
 }
 
 bool ModelForward::token(int32_t token, int64_t pos, int32_t base,
@@ -337,14 +342,22 @@ bool ModelForward::token(int32_t token, int64_t pos, int32_t base,
                                     static_cast<cudaStream_t>(stream)));
         for (int64_t layer = 0; layer < p.geometry.n_layers; ++layer) {
             const auto& qs = p.state.qsa_states[layer / p.geometry.qsa_interval];
-            if (!core::block_layer_pre(p.weights, p.geometry, layer, pos, base, p.state.gdn,
+            if ((p.observer && !p.observer({"residual_pre", layer, pos, p.state.R,
+                                            size_t(p.geometry.hc * p.geometry.n_embd)}, stream, err)) ||
+                !core::block_layer_pre(p.weights, p.geometry, layer, pos, base, p.state.gdn,
                                        qs, p.state.qsa_bufs, p.state.moe, p.state.k, p.state.block,
                                        stream, err, nullptr, &p.state.ple, 0, 0, this) ||
+                (p.observer && !p.observer({"expert_input", layer, pos, p.state.block.mixed,
+                                            size_t(p.geometry.n_embd)}, stream, err)) ||
                 !p.collectives.agree_routes(layer, p.state.moe.ids, p.state.k, stream, err) ||
                 !p.experts.forward(layer, p.state.block.mixed, p.state.moe.ids,
                                    p.state.k, p.parts, stream, err) ||
+                (p.observer && !p.observer({"expert_output", layer, pos, p.parts,
+                                            size_t(p.state.k * p.geometry.n_embd)}, stream, err)) ||
                 !core::block_layer_post(p.weights, p.geometry, layer, p.state.k, p.state.moe,
-                                        p.state.block, p.parts, stream, err, this)) {
+                                        p.state.block, p.parts, stream, err, this) ||
+                (p.observer && !p.observer({"residual_post", layer, pos, p.state.R,
+                                            size_t(p.geometry.hc * p.geometry.n_embd)}, stream, err))) {
                 p.failed = true; err = "layer " + std::to_string(layer) + ": " + err; return false;
             }
         }
