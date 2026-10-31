@@ -71,6 +71,28 @@ bool has_populated_gid(const std::filesystem::path& path) {
     return gid.find_first_not_of("0: \t\r\n") != std::string::npos;
 }
 
+bool is_ipv4_mapped_gid(const std::string& gid) {
+    constexpr char kPrefix[] = "0000:0000:0000:0000:0000:ffff:";
+    if (gid.size() != 39) return false;
+    for (size_t i = 0; i < sizeof(kPrefix) - 1; ++i) {
+        const char a = gid[i] >= 'A' && gid[i] <= 'F' ? static_cast<char>(gid[i] - 'A' + 'a') : gid[i];
+        const char b = kPrefix[i] >= 'A' && kPrefix[i] <= 'F'
+                           ? static_cast<char>(kPrefix[i] - 'A' + 'a')
+                           : kPrefix[i];
+        if (a != b) return false;
+    }
+    for (size_t i = sizeof(kPrefix) - 1; i < gid.size(); ++i) {
+        if (i == 34) {
+            if (gid[i] != ':') return false;
+        } else if (!((gid[i] >= '0' && gid[i] <= '9') ||
+                     (gid[i] >= 'a' && gid[i] <= 'f') ||
+                     (gid[i] >= 'A' && gid[i] <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::filesystem::path infiniband_sysfs_root() {
 #ifdef STRATA_ROCE_TEST_SYSFS_ROOT_ENV
     if (const char* root = std::getenv("STRATA_ROCE_TEST_SYSFS_ROOT"); root && root[0] != '\0') {
@@ -80,18 +102,54 @@ std::filesystem::path infiniband_sysfs_root() {
     return "/sys/class/infiniband";
 }
 
+int find_ipv4_rocev2_gid(const std::filesystem::path& hca) {
+    const auto types = hca / "ports/1/gid_attrs/types";
+    std::error_code error;
+    int selected = -1;
+    for (std::filesystem::directory_iterator it(types, error), end; !error && it != end;
+         it.increment(error)) {
+        const std::string index = it->path().filename().string();
+        if (index.empty() || !std::all_of(index.begin(), index.end(), [](char c) {
+                return c >= '0' && c <= '9';
+            })) {
+            continue;
+        }
+        std::ifstream type_file(it->path());
+        std::string type;
+        if (!std::getline(type_file, type) || type != "RoCE v2") continue;
+        if (!type.empty() && type.back() == '\r') type.pop_back();
+        std::ifstream gid_file(hca / "ports/1/gids" / index);
+        std::string gid;
+        if (std::getline(gid_file, gid) && is_ipv4_mapped_gid(gid)) {
+            try {
+                const unsigned long parsed = std::stoul(index);
+                if (parsed <= UINT8_MAX && (selected < 0 || parsed < static_cast<unsigned long>(selected))) {
+                    selected = static_cast<int>(parsed);
+                }
+            } catch (...) {
+                continue;
+            }
+        }
+    }
+    return selected;
+}
+
 }  // namespace
 
 std::vector<std::string> discover_hcas(int gid_index, size_t maximum) {
     std::vector<std::string> found;
-    if (gid_index < 0 || maximum == 0) return found;
+    if (gid_index < -1 || maximum == 0) return found;
     const std::filesystem::path root = infiniband_sysfs_root();
     std::error_code error;
     for (std::filesystem::directory_iterator it(root, error), end; !error && it != end; it.increment(error)) {
         std::ifstream state(it->path() / "ports/1/state");
         std::string state_value;
         if (!std::getline(state, state_value) || state_value.find("ACTIVE") == std::string::npos) continue;
-        if (!has_populated_gid(it->path() / "ports/1/gids" / std::to_string(gid_index))) continue;
+        if (gid_index == -1) {
+            if (find_ipv4_rocev2_gid(it->path()) < 0) continue;
+        } else if (!has_populated_gid(it->path() / "ports/1/gids" / std::to_string(gid_index))) {
+            continue;
+        }
         found.push_back(it->path().filename().string());
         if (found.size() == maximum) break;
     }
@@ -112,7 +170,8 @@ Failure RoceBackend::create() {
     if (config_.world != kTpWorld || config_.rank >= kTpWorld || config_.stripes != 1 ||
         config_.hca_names.empty() || config_.hca_names.size() > 4 ||
         config_.route_hca.size() != size_t(kTpWorld) * config_.stripes ||
-        config_.gid_index < 0 || config_.traffic_class < 0 || config_.traffic_class > 255 ||
+        config_.gid_index < -1 || config_.gid_index > UINT8_MAX ||
+        config_.traffic_class < 0 || config_.traffic_class > 255 ||
         config_.timeout_ms == 0 || config_.timeout_ms > (INT32_MAX / 1000u) ||
         config_.blocks != 1 || config_.threads < 2 || config_.threads > 1024 ||
         config_.slot_bytes == 0 || config_.slot_bytes % 4096 != 0) {
@@ -137,7 +196,7 @@ Failure RoceBackend::create() {
     for (const auto& hca : config_.hca_names) {
         if (std::find(discovered.begin(), discovered.end(), hca) == discovered.end()) {
             return Failure::fail(FailureCode::invalid_config,
-                                 "configured HCA is inactive or has an empty selected GID: " + hca);
+                                 "configured HCA is inactive or lacks the selected port-1 GID: " + hca);
         }
     }
     if (!cuda::layout(config_.world, config_.slot_bytes, layout_)) {

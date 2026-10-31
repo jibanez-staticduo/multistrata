@@ -29,7 +29,7 @@ struct Options {
     uint32_t rank = 0;
     uint32_t timeout_ms = 30000;
     uint32_t stripes = 1;
-    int gid_index = 3;
+    int gid_index = -1;
     uint16_t port = 0;
     std::string rank0_address;
     std::string session_uuid;
@@ -101,7 +101,10 @@ Options parse(int argc, char** argv) {
     if (args.contains("credential-env")) o.credential_env = get("credential-env");
     if (args.contains("timeout-ms")) o.timeout_ms = static_cast<uint32_t>(number(args.at("timeout-ms"), UINT32_MAX));
     if (args.contains("stripes")) o.stripes = static_cast<uint32_t>(number(args.at("stripes"), UINT32_MAX));
-    if (args.contains("gid-index")) o.gid_index = static_cast<int>(number(args.at("gid-index"), INT32_MAX));
+    if (args.contains("gid-index")) {
+        if (args.at("gid-index") == "-1") o.gid_index = -1;
+        else o.gid_index = static_cast<int>(number(args.at("gid-index"), UINT8_MAX));
+    }
     if (args.contains("fault")) o.fault = args.at("fault");
     if (args.contains("fault-rank")) o.fault_rank = static_cast<uint32_t>(number(args.at("fault-rank"), UINT32_MAX));
     if (args.contains("slot-bytes")) o.slot_bytes = number(args.at("slot-bytes"), UINT64_MAX);

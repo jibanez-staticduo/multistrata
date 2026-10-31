@@ -26,7 +26,8 @@ struct Config {
     // Peer-major route table: world * stripes entries; local-rank entries are -1.
     std::vector<int> route_hca;
     uint32_t stripes = 1;
-    int gid_index = 3;
+    // -1 selects the IPv4-mapped RoCEv2 GID independently for each HCA.
+    int gid_index = -1;
     int traffic_class = 0;
     uint64_t slot_bytes = 4 * 1024 * 1024;
     uint32_t timeout_ms = 10000;
@@ -36,7 +37,8 @@ struct Config {
     std::string approved_proxy_sha256;
 };
 
-// Discover active local HCAs whose selected port-1 GID is populated.
+// With a nonnegative index, discover HCAs whose selected port-1 GID is populated.
+// With -1, select HCAs with an IPv4-mapped RoCEv2 GID, independently per HCA.
 std::vector<std::string> discover_hcas(int gid_index, size_t maximum = 4);
 
 class RoceBackend final : public Backend {

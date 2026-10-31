@@ -30,6 +30,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <infiniband/verbs.h>
 #include <pthread.h>
@@ -39,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -90,6 +92,7 @@ typedef struct {
     union ibv_gid gid;
     uint16_t lid;
     enum ibv_mtu mtu;
+    int gid_index;
 } roce_hca_t;
 
 typedef struct roce_ctx_t {
@@ -99,7 +102,6 @@ typedef struct roce_ctx_t {
     int mesh_rotate;
     int n_hca;
     int n_stripes;
-    int gid_index;
     int traffic_class;
     roce_hca_t hca[ROCE_MAX_LOCAL_HCAS];
     uint8_t route_hca[ROCE_MAX_PEERS][ROCE_MAX_STRIPES];
@@ -140,6 +142,7 @@ typedef struct roce_ctx_t {
 } roce_ctx_t;
 
 void roce_destroy(roce_ctx_t *c);
+static int find_ipv4_rocev2_gid(const char *hca, char *err, size_t err_len);
 
 static void set_err(roce_ctx_t *c, const char *what, int e) {
     snprintf(c->err, sizeof(c->err), "%s: %s", what, e ? strerror(e) : "failed");
@@ -346,7 +349,7 @@ static int open_hca(roce_ctx_t *c, int h, const char *name) {
     }
     hca->lid = port.lid;
     hca->mtu = port.active_mtu;
-    if (ibv_query_gid(hca->ctx, ROCE_PORT, c->gid_index, &hca->gid) != 0) {
+    if (ibv_query_gid(hca->ctx, ROCE_PORT, hca->gid_index, &hca->gid) != 0) {
         set_err(c, "ibv_query_gid", errno);
         return -1;
     }
@@ -401,6 +404,53 @@ static int open_hca(roce_ctx_t *c, int h, const char *name) {
     return 0;
 }
 
+static int find_ipv4_rocev2_gid(const char *hca, char *err, size_t err_len) {
+    char path[512];
+    snprintf(path, sizeof(path), "/sys/class/infiniband/%s/ports/1/gid_attrs/types", hca);
+    DIR *types = opendir(path);
+    if (types == NULL) {
+        snprintf(err, err_len, "cannot inspect GID types for RDMA device %s", hca);
+        return -1;
+    }
+    int selected = -1;
+    struct dirent *entry;
+    while ((entry = readdir(types)) != NULL) {
+        char *end = NULL;
+        errno = 0;
+        long index = strtol(entry->d_name, &end, 10);
+        if (errno != 0 || end == entry->d_name || *end != '\0' || index < 0 || index > UINT8_MAX) continue;
+        char type_path[640], gid_path[640];
+        snprintf(type_path, sizeof(type_path), "%s/%s", path, entry->d_name);
+        snprintf(gid_path, sizeof(gid_path), "/sys/class/infiniband/%s/ports/1/gids/%s", hca, entry->d_name);
+        FILE *type_file = fopen(type_path, "r");
+        if (type_file == NULL) continue;
+        char type[64] = {0};
+        int has_type = fgets(type, sizeof(type), type_file) != NULL;
+        fclose(type_file);
+        if (has_type) {
+            type[strcspn(type, "\r\n")] = '\0';
+        }
+        if (!has_type || strcmp(type, "RoCE v2") != 0) continue;
+        FILE *gid_file = fopen(gid_path, "r");
+        if (gid_file == NULL) continue;
+        char gid[64] = {0};
+        int has_gid = fgets(gid, sizeof(gid), gid_file) != NULL;
+        fclose(gid_file);
+        if (has_gid) gid[strcspn(gid, "\r\n")] = '\0';
+        if (has_gid && strncasecmp(gid, "0000:0000:0000:0000:0000:ffff:", 30) == 0 &&
+            strlen(gid) == 39 && gid[34] == ':' &&
+            strspn(gid + 35, "0123456789abcdefABCDEF") == 4 &&
+            (selected < 0 || index < selected)) {
+            selected = (int)index;
+        }
+    }
+    closedir(types);
+    if (selected < 0) {
+        snprintf(err, err_len, "RDMA device %s has no IPv4 RoCEv2 GID on port 1", hca);
+    }
+    return selected;
+}
+
 static int peer_width(int world, int rank, int peer, int stripes) {
     return stripes == 4 && peer != (rank + 2) % world ? 2 : stripes;
 }
@@ -414,6 +464,7 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
     if (roce_layout(world, slot_bytes, layout) != 0 || layout[4] > region_bytes ||
         rank < 0 || rank >= world || n_hca < 1 || n_hca > ROCE_MAX_LOCAL_HCAS ||
         n_stripes < 1 || n_stripes > ROCE_MAX_STRIPES || route_hca == NULL ||
+        gid_index < -1 || gid_index > UINT8_MAX ||
         traffic_class < 0 || traffic_class > 255 ||
         ring4 != 0 ||
         (n_stripes > 2 && (n_stripes != 4 || ring4 != 2 || n_hca != 4))) {
@@ -488,7 +539,6 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
     c->ring4 = ring4;
     c->n_hca = n_hca;
     c->n_stripes = n_stripes;
-    c->gid_index = gid_index;
     c->traffic_class = traffic_class;
     c->region = region;
     c->region_bytes = region_bytes;
@@ -503,6 +553,14 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
         }
     }
     for (int h = 0; h < n_hca; h++) {
+        c->hca[h].gid_index = gid_index;
+        if (gid_index == -1) {
+            c->hca[h].gid_index = find_ipv4_rocev2_gid(hca_names[h], err, err_len);
+            if (c->hca[h].gid_index < 0) {
+                roce_destroy(c);
+                return NULL;
+            }
+        }
         if (open_hca(c, h, hca_names[h]) != 0) {
             snprintf(err, err_len, "%s", c->err);
             roce_destroy(c);
@@ -560,7 +618,7 @@ static int connect_qp(roce_ctx_t *c, int local_h, int remote_h, int p,
     rtr.ah_attr.src_path_bits = 0;
     rtr.ah_attr.port_num = ROCE_PORT;
     memcpy(rtr.ah_attr.grh.dgid.raw, peer->gid[remote_h], 16);
-    rtr.ah_attr.grh.sgid_index = (uint8_t)c->gid_index;
+    rtr.ah_attr.grh.sgid_index = (uint8_t)hca->gid_index;
     rtr.ah_attr.grh.hop_limit = 64;
     rtr.ah_attr.grh.traffic_class = (uint8_t)c->traffic_class;
     // mlx5 maps flow label 16383 to UDP source 65535. The host fabric

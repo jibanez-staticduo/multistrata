@@ -32,4 +32,8 @@ atomic. The wire layout is unchanged; this does not claim binary equivalence wit
 the source snapshot. CMake records the adapted proxy source SHA-256 and rebuilds
 that identity when the source changes.
 
-Adapted proxy SHA-256: `df3b2e3225877cf4c70e18b72c9233b470d60d2e5ace2105ac343069cf0ae4c8`.
+Adapted proxy SHA-256: `79a30ce8d342777099e65f725ca2251dd9b66e14720c24db65a29cca9367d07f`.
+
+GID selection accepts the existing scalar ABI-10 argument: `-1` selects an
+IPv4-mapped RoCEv2 GID independently on each HCA. An explicit nonnegative
+index retains uniform selection. No wire layout or C signature changes.

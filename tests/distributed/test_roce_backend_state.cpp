@@ -36,6 +36,7 @@ struct FakeState {
     bool capturing = false;
     uint32_t captured_launches = 0;
     uint32_t state_sequence = 0;
+    int proxy_gid_index = INT32_MIN;
     uint8_t* region = nullptr;
     uint64_t ctrl_off = 0;
     void* device_state = nullptr;
@@ -66,10 +67,19 @@ Config valid_config() {
 }
 
 void setup_fake_sysfs(const std::filesystem::path& root) {
-    const auto hca = root / "fake0";
-    std::filesystem::create_directories(hca / "ports/1/gids");
-    std::ofstream(hca / "ports/1/state") << "4: ACTIVE\n";
-    std::ofstream(hca / "ports/1/gids/3") << "fe80::1\n";
+    auto add_hca = [&](const char* name, int gid_index, const char* gid, const char* type) {
+        const auto hca = root / name;
+        std::filesystem::create_directories(hca / "ports/1/gids");
+        std::filesystem::create_directories(hca / "ports/1/gid_attrs/types");
+        std::ofstream(hca / "ports/1/state") << "4: ACTIVE\n";
+        std::ofstream(hca / "ports/1/gids" / std::to_string(gid_index)) << gid << '\n';
+        std::ofstream(hca / "ports/1/gid_attrs/types" / std::to_string(gid_index)) << type << '\n';
+    };
+    add_hca("fake0", 3, "0000:0000:0000:0000:0000:ffff:c0a8:0101", "RoCE v2");
+    add_hca("fake1", 4, "0000:0000:0000:0000:0000:ffff:c0a8:0102", "RoCE v2");
+    add_hca("fake2", 3, "fe80:0000:0000:0000:0000:0000:0000:0001", "RoCE v2");
+    add_hca("fake3", 5, "0000:0000:0000:0000:0000:ffff:c0a8:01zz", "RoCE v2");
+    add_hca("fake4", 6, "0000:0000:0000:0000:0000:ffff:c0a8:0104", "RoCE v1");
     setenv("STRATA_ROCE_TEST_SYSFS_ROOT", root.c_str(), 1);
 }
 
@@ -94,6 +104,10 @@ struct BackendFixture {
 };
 
 void test_config_and_setup_failures(const std::filesystem::path& sysfs) {
+    check(discover_hcas(-1) == std::vector<std::string>({"fake0", "fake1"}),
+          "automatic discovery did not select per-HCA IPv4 RoCEv2 entries");
+    check(discover_hcas(3) == std::vector<std::string>({"fake0", "fake2"}),
+          "explicit GID index no longer selects populated entries");
     {
         Config config = valid_config();
         config.blocks = 2;
@@ -128,6 +142,22 @@ void test_config_and_setup_failures(const std::filesystem::path& sysfs) {
         fake.proxy->connect_fails = false;
         fake.proxy->start_fails = true;
         check(backend.connect(blobs).code == FailureCode::comm_failed, "proxy start failure was not reported");
+    }
+    {
+        Config config = valid_config();
+        config.hca_names = {"fake0", "fake1"};
+        config.route_hca = {-1, 0, 1};
+        config.gid_index = -1;
+        RoceBackend backend(config);
+        check(!backend.create(), "automatic per-HCA GID selection failed");
+        check(fake.proxy_gid_index == -1, "automatic selection sentinel was not passed to the ABI-10 proxy");
+    }
+    {
+        Config config = valid_config();
+        config.gid_index = 3;
+        RoceBackend backend(config);
+        check(!backend.create(), "explicit GID selection failed");
+        check(fake.proxy_gid_index == 3, "explicit GID index changed before proxy creation");
     }
     (void)sysfs;
 }
@@ -280,8 +310,9 @@ int roce_layout(int world, uint64_t slot_bytes, uint64_t* out) {
     return 0;
 }
 uint64_t roce_blob_bytes(void) { return 16; }
-roce_ctx_t* roce_create(int, int, const char* const*, int, const int*, int, int, int, int,
+roce_ctx_t* roce_create(int, int, const char* const*, int, const int*, int, int gid_index, int, int,
                         void* region, uint64_t, uint64_t, char* error, uint64_t error_size) {
+    fake.proxy_gid_index = gid_index;
     if (fake.create_fails) {
         std::snprintf(error, static_cast<size_t>(error_size), "injected create failure");
         return nullptr;
