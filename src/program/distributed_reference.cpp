@@ -1,6 +1,7 @@
 // Independent, uncaptured C1 teacher-forcing oracle. No distributed model kernels.
 #include "strata/distributed/reference.hpp"
 #include "strata/distributed/reference_service.hpp"
+#include "strata/distributed/token_timing.hpp"
 #include "strata/distributed/capture_positions.hpp"
 #include "strata/distributed/parity_trace_writer.hpp"
 #include "strata/distributed/state_evidence.hpp"
@@ -110,7 +111,7 @@ int main(int argc, char** argv) {
     try {
         std::map<std::string, std::string> args;
         const std::set<std::string> allowed = {"pack", "native", "ple", "context", "logits-dir", "logits-positions",
-            "state-dir", "state-positions", "state-max-bytes", "trace-dir", "expert-residency", "mode"};
+            "state-dir", "state-positions", "state-max-bytes", "trace-dir", "expert-residency", "mode", "timing-file"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) ||
@@ -135,12 +136,14 @@ int main(int argc, char** argv) {
         const auto mode = args.contains("mode") ? args.at("mode") : "teacher-forced";
         require(mode == "teacher-forced" || mode == "autoregressive", "--mode must be teacher-forced or autoregressive");
         const bool autoregressive = mode == "autoregressive";
+        require(!args.contains("timing-file") || !args.contains("trace-dir"),
+                "--timing-file cannot be combined with --trace-dir: trace writes run inside model forward");
         if (autoregressive) {
             require(residency == ExpertResidency::AllResident,
                     "autoregressive reference requires --expert-residency all");
             require(context <= 65536, "autoregressive reference context must not exceed 65536");
             for (const char* key : {"logits-dir", "logits-positions", "state-dir", "state-positions",
-                                    "state-max-bytes", "trace-dir"})
+                                    "state-max-bytes", "trace-dir", "timing-file"})
                 require(!args.contains(key), std::string("autoregressive reference does not support --") + key);
         }
         const bool selected_logits = args.contains("logits-positions");
@@ -179,6 +182,8 @@ int main(int argc, char** argv) {
             require(!value || value[0] != '1', std::string("oracle requires ") + name + " disabled");
         }
         const auto pack = get("pack"), native = get("native"), ple = get("ple");
+        std::unique_ptr<TokenTimingWriter> timing;
+        if (args.contains("timing-file")) timing = std::make_unique<TokenTimingWriter>(args.at("timing-file"));
         if (autoregressive) prepare_reference_service();
         const auto shards = gguf_split_paths(native);
         const GgufFile metadata(shards.front());
@@ -260,7 +265,7 @@ int main(int argc, char** argv) {
         uint64_t request_sequence = 0;
         std::set<uint64_t> dumped_positions;
         auto request_id = [&] { return "request-" + std::to_string(request_sequence); };
-        auto dump_state = [&](bool reset) {
+        auto dump_state = [&](bool reset, std::string* deferred_message = nullptr) {
             if (!args.contains("state-dir")) return;
             const auto count = uint64_t(model.next_position());
             if (!reset && (count == 0 || !dumped_positions.insert(count - 1).second)) return;
@@ -279,8 +284,13 @@ int main(int argc, char** argv) {
             const auto directory = std::filesystem::path(args.at("state-dir")) / request_id() /
                 (reset ? "reset" : "position-" + std::to_string(count - 1));
             require(write_state_evidence(directory.string(), request, arrays, err), err);
-            std::cout << "STATE request=" << request_id() << " tokens=" << count
-                      << " directory=" << directory.string() << '\n';
+            if (deferred_message) {
+                *deferred_message = "STATE request=" + request_id() + " tokens=" + std::to_string(count) +
+                    " directory=" + directory.string() + '\n';
+            } else {
+                std::cout << "STATE request=" << request_id() << " tokens=" << count
+                          << " directory=" << directory.string() << '\n';
+            }
         };
         dump_state(true);
         std::cout << "READY rank=0 tp=1 pp=1 layers=48 c=1 oracle=monolithic staging="
@@ -291,6 +301,7 @@ int main(int argc, char** argv) {
                      " benchmark=" << (residency == ExpertResidency::AllResident ? "matched-policy-candidate" : "unsupported");
         if (selected_logits) std::cout << " logits_positions=" << args.at("logits-positions")
                                        << " logits_last=gen-segment";
+        if (timing) std::cout << " timing_excludes=stdout,csv,reset-state,terminal-state";
         std::cout << '\n';
         std::string line;
         while (std::getline(std::cin, line)) {
@@ -323,13 +334,16 @@ int main(int argc, char** argv) {
             for (const auto id : tokens) {
                 ++token_index;
                 const auto pos = model.next_position();
+                TokenRowTimer row_timer{bool(timing)};
                 require(model.token(id, pos, 0, static_cast<float*>(logits.pointer), stream.value, err), err);
+                row_timer.forward_done();
                 // token() has completed its bounded event; this copy has no pending device producers.
                 cuda_check(cudaMemcpy(host_logits.data(), logits.pointer, host_logits.size() * sizeof(float),
                                       cudaMemcpyDeviceToHost));
                 require(std::all_of(host_logits.begin(), host_logits.end(), [](float x) { return std::isfinite(x); }),
                         "oracle produced non-finite logits");
                 const auto top = std::max_element(host_logits.begin(), host_logits.end()) - host_logits.begin();
+                row_timer.readback_done();
                 if (args.contains("logits-dir") && logits_positions.contains(uint64_t(pos), token_index == tokens.size())) {
                     const auto directory = std::filesystem::path(args.at("logits-dir")) / request_id();
                     std::filesystem::create_directories(directory);
@@ -340,11 +354,18 @@ int main(int argc, char** argv) {
                     file.close();
                     require(bool(file), "cannot write logits artifact");
                 }
-                if (state_positions.contains(uint64_t(pos))) dump_state(false);
+                std::string state_message;
+                if (state_positions.contains(uint64_t(pos))) dump_state(false, timing ? &state_message : nullptr);
+                if (timing) {
+                    const auto measured = row_timer.finish();
+                    timing->write(request_id(), uint64_t(pos), id, "teacher-forced", measured);
+                }
+                if (!state_message.empty()) std::cout << state_message;
                 std::cout << "TOKEN position=" << pos << " input=" << id << " argmax=" << top << '\n';
             }
         }
         if (state_last) dump_state(false);
+        if (timing) timing->close();
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "distributed reference: " << e.what() << '\n';

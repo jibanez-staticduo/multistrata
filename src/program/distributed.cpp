@@ -10,6 +10,8 @@
 #include "strata/distributed/mtp_service.hpp"
 #include "strata/distributed/multislot_service.hpp"
 #include "strata/distributed/slot_pool.hpp"
+#include "strata/distributed/service_evidence.hpp"
+#include "strata/distributed/token_timing.hpp"
 #include "strata/distributed/parity_trace_writer.hpp"
 #include "strata/distributed/process_exit_guard.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -81,6 +83,47 @@ struct Event {
     cudaEvent_t value = nullptr;
     Event() { cuda_check(cudaEventCreateWithFlags(&value, cudaEventDisableTiming)); }
     ~Event() { if (value) cudaEventDestroy(value); }
+};
+
+class ServiceStateReadback final {
+public:
+    ServiceStateReadback(cudaStream_t stream, Session& session, GuardedTransport& transport)
+        : stream_(stream), session_(session), transport_(transport) { staging_.allocate(capacity_); }
+    bool requires_process_exit() const noexcept { return pending_; }
+    bool read(void* destination, const void* source, size_t bytes, std::string& error) {
+        PendingDmaExitGuard lifetime(*this);
+        Deadline deadline;
+        if (auto f = session_.operation_deadline(deadline)) { error = f.detail; return false; }
+        for (size_t offset = 0; offset < bytes;) {
+            const auto n = std::min(capacity_, bytes - offset);
+            pending_ = true;
+            cuda_check(cudaMemcpyAsync(staging_.pointer, static_cast<const uint8_t*>(source) + offset,
+                                       n, cudaMemcpyDeviceToHost, stream_));
+            cuda_check(cudaEventRecord(event_.value, stream_));
+            for (;;) {
+                const auto status = cudaEventQuery(event_.value);
+                if (status == cudaSuccess) break;
+                if (status != cudaErrorNotReady) { error = cudaGetErrorString(status); return false; }
+                if (auto f = transport_.check_health()) { error = f.detail; return false; }
+                if (std::chrono::steady_clock::now() >= deadline.end) {
+                    error = "service state readback deadline expired"; return false;
+                }
+                std::this_thread::yield();
+            }
+            pending_ = false;
+            std::memcpy(static_cast<uint8_t*>(destination) + offset, staging_.pointer, n);
+            offset += n;
+        }
+        return true;
+    }
+private:
+    static constexpr size_t capacity_ = size_t(1) << 20;
+    cudaStream_t stream_;
+    Session& session_;
+    GuardedTransport& transport_;
+    PinnedAllocation staging_;
+    Event event_;
+    bool pending_ = false;
 };
 
 void write_profile(const SessionCollectives& collectives, const std::string& directory, uint32_t rank) {
@@ -333,7 +376,7 @@ int main(int argc, char** argv) {
             "pack", "native", "ple", "context", "logits-dir", "logits-positions", "timeout-ms",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
             "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel", "profile-dir",
-            "collective-agreement"};
+            "collective-agreement", "service-state-dir", "timing-file"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) || args.contains(key.substr(2)))
@@ -382,6 +425,14 @@ int main(int argc, char** argv) {
         require(mode == "teacher-forced" || mode == "autoregressive" || mode == "multislot", "invalid distributed mode");
         const bool autoregressive = mode == "autoregressive";
         const bool multislot = mode == "multislot";
+        require(!args.contains("timing-file") || (!autoregressive && !multislot),
+                "--timing-file requires teacher-forced mode");
+        require(!args.contains("timing-file") || !args.contains("trace-dir"),
+                "--timing-file cannot include trace artifact work inside model forward");
+        const bool service_evidence = args.contains("service-state-dir");
+        require(!service_evidence || ((autoregressive || multislot) &&
+                std::filesystem::path(get("service-state-dir")).is_absolute()),
+                "--service-state-dir requires an absolute path and autoregressive or multislot mode");
         const auto parallel = number("parallel", 1);
         require((parallel == 1 || parallel == 4 || parallel == 8) && (multislot || !args.contains("parallel")),
                 "--parallel 1,4,8 requires --mode multislot");
@@ -547,6 +598,33 @@ int main(int argc, char** argv) {
                 std::cerr << "LOAD rank=" << rank << " stage=expert-finish-graphs count=" << stats.graph_count << '\n';
             }
             std::cerr << "LOAD rank=" << rank << " stage=expert-shards-complete bytes=" << experts.owned_weight_bytes() << std::endl;
+            std::unique_ptr<ServiceStateReadback> service_readback;
+            if (service_evidence) {
+                std::cerr << "LOAD rank=" << rank << " stage=service-state-readback external-watchdog-required=1\n";
+                service_readback = std::make_unique<ServiceStateReadback>(stream.value, session, transport);
+            }
+            auto capture_service = [&](StepPhase phase, std::string_view request_id,
+                                       const ServiceTranscript& transcript, const ModelForward& model,
+                                       const core::SessionState& model_state, const float* logits, size_t logits_count) {
+                const auto count = uint64_t(model.next_position());
+                require(request_id == transcript.request_id() && transcript.ids().size() == count,
+                        "service state and canonical input transcript disagree");
+                const StateReadback readback = [&](void* dst, const void* src, size_t n, std::string& error) {
+                    return service_readback->read(dst, src, n, error);
+                };
+                std::vector<StateEvidenceArray> arrays;
+                require(describe_session_state(model_state, geometry, count, readback, model.state_sources(), arrays, err), err);
+                StateEvidenceRequest evidence;
+                evidence.request_id = std::string(request_id);
+                evidence.position = count ? count - 1 : 0;
+                evidence.token_count = count;
+                evidence.max_bytes = uint64_t(4) << 30;
+                evidence.reset = count == 0;
+                evidence.required = state_evidence_inventory(arrays);
+                require(write_service_evidence(args.at("service-state-dir"), uint32_t(rank), phase == StepPhase::cancel,
+                        transcript, evidence, arrays, rank == 0 ? logits : nullptr,
+                        rank == 0 && logits ? logits_count : 0, err), err);
+            };
             if (multislot) {
                 SlotPoolConfig pool_config{uint32_t(parallel), uint32_t(context), uint32_t(timeout),
                                             join.session_uuid, join.model_hash, uint32_t(rank), batched_experts, 0,
@@ -566,6 +644,7 @@ int main(int argc, char** argv) {
                                              stream.value, session, transport, pool.execution(slot)));
                 }
                 PendingDmaExitGuard sampler_lifetime(pool);
+                std::vector<ServiceTranscript> transcripts(service_evidence ? size_t(parallel) : 0);
                 MultiSlotServiceCallbacks callbacks;
                 callbacks.poll = [&](uint32_t wait, std::string& line, bool& eof) { return input->poll(wait, line, eof); };
                 callbacks.health = [&] { return transport.check_health(); };
@@ -576,8 +655,14 @@ int main(int argc, char** argv) {
                 };
                 callbacks.scheduler.execute = [&](uint32_t slot, StepPhase phase, std::string_view request,
                                                      int32_t token, uint64_t position) {
+                    if (service_evidence && (phase == StepPhase::reset || phase == StepPhase::cancel))
+                        capture_service(phase, request, transcripts.at(slot), pool.model(slot), pool.session_state(slot),
+                                        pool.committed_logits(slot), pool.logits_size(slot));
                     const auto result = pool.execute(slot, phase, request, token, position);
                     if (pool.requires_process_exit()) std::_Exit(2);
+                    if (service_evidence && (result.status == StepStatus::completed || result.status == StepStatus::cancelled))
+                        require(transcripts.at(slot).record_success(phase, request, token, position,
+                                uint64_t(pool.model(slot).next_position()), err), err);
                     return result.status == StepStatus::completed || result.status == StepStatus::cancelled ?
                         Failure{} : result.failure ? result.failure : Failure::fail(FailureCode::comm_failed, "slot command failed");
                 };
@@ -651,6 +736,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 AutoregressiveCallbacks callbacks;
+                ServiceTranscript transcript;
                 callbacks.poll = [&](uint32_t wait, std::string& line, bool& eof) {
                     return input->poll(wait, line, eof);
                 };
@@ -661,6 +747,9 @@ int main(int argc, char** argv) {
                 };
                 callbacks.health = [&] { return transport.check_health(); };
                 callbacks.execute = [&](StepPhase phase, std::string_view request, int32_t token, uint64_t position) {
+                    if (service_evidence && (phase == StepPhase::reset || phase == StepPhase::cancel))
+                        capture_service(phase, request, transcript, model, state,
+                                        execution.committed_logits(), execution.logits_size());
                     StepCommand command{join.session_uuid, std::string(request), 0, step++, phase,
                                         {}, {}, join.model_hash, {}};
                     if (phase == StepPhase::prefill || phase == StepPhase::decode) {
@@ -672,6 +761,8 @@ int main(int argc, char** argv) {
                     if (model.requires_process_exit() || experts.requires_process_exit()) std::_Exit(2);
                     if (result.status != StepStatus::completed && result.status != StepStatus::cancelled)
                         return result.failure ? result.failure : Failure::fail(FailureCode::bad_operation, "worker did not complete serve step");
+                    if (service_evidence) require(transcript.record_success(phase, request, token, position,
+                                                 uint64_t(model.next_position()), err), err);
                     return Failure{};
                 };
                 callbacks.sample = [&](const ServeRequest& request, const std::vector<int32_t>& history,
@@ -697,6 +788,8 @@ int main(int argc, char** argv) {
                 if (model.requires_process_exit() || experts.requires_process_exit()) std::_Exit(2);
                 require(service_result);
             } else {
+            std::unique_ptr<TokenTimingWriter> timing;
+            if (args.contains("timing-file")) timing = std::make_unique<TokenTimingWriter>(args.at("timing-file"));
             std::set<uint64_t> dumped_positions;
             auto dump_state = [&](bool reset) {
                 if (!args.contains("state-dir")) return;
@@ -782,9 +875,13 @@ int main(int argc, char** argv) {
                     if (id < 0 || id >= geometry.n_vocab) throw std::runtime_error("invalid token ID");
                     any = true;
                     const auto pos = model.next_position();
+                    TokenRowTimer row_timer{bool(timing)};
                     require(uint64_t(pos) < context, "GEN exceeds remaining context");
                     execute(StepPhase::prefill, {int32_t(id)}, {uint64_t(pos)});
                     const auto result = execute(StepPhase::commit);
+                    row_timer.forward_done();
+                    // Forward includes finite readback and the all-rank commit.
+                    row_timer.readback_done();
                     if (state_positions.contains(uint64_t(pos))) dump_state(false);
                     if (rank == 0 && result.output_ready) {
                         const auto* logits = execution.committed_logits();
@@ -800,11 +897,17 @@ int main(int argc, char** argv) {
                             file.write(reinterpret_cast<const char*>(logits), geometry.n_vocab * sizeof(float));
                             require(bool(file), "cannot write logits artifact");
                         }
+                        if (timing) timing->write("teacher-forcing-" + std::to_string(request_sequence), uint64_t(pos),
+                                                  int32_t(id), "teacher-forced", row_timer.finish());
                         std::cout << "TOKEN position=" << pos << " input=" << id << " argmax=" << top << '\n';
                     }
+                    if (rank != 0 && timing)
+                        timing->write("teacher-forcing-" + std::to_string(request_sequence), uint64_t(pos), int32_t(id),
+                                      "teacher-forced", row_timer.finish());
                 }
                 require(any && (selected_logits || input.eof()), "GEN needs valid integer token IDs");
             }
+            if (timing) timing->close();
             }
             }
             if (args.contains("profile-dir")) write_profile(collectives, args.at("profile-dir"), uint32_t(rank));

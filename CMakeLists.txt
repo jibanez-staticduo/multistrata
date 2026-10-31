@@ -2841,7 +2841,7 @@ if(STRATA_BUILD_DISTRIBUTED)
                  src/distributed/model_checkpoint.cpp src/distributed/model_state.cpp
                  src/distributed/speculative.cpp src/distributed/cuda_segment_graph.cpp
                  src/distributed/mtp_service.cpp src/distributed/slot_pool.cpp src/distributed/multislot.cpp
-                 src/distributed/multislot_service.cpp)
+                 src/distributed/multislot_service.cpp src/distributed/service_evidence.cpp)
   target_compile_definitions(strata-distributed PRIVATE STRATA_BUILD_DISTRIBUTED
                              STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS STRATA_STATE_EVIDENCE_WITH_CORE
                              STRATA_MODEL_CHECKPOINT_WITH_CUDA)
@@ -2980,6 +2980,17 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_include_directories(test_reference_service PRIVATE include)
   target_link_libraries(test_reference_service PRIVATE strata_warnings)
   add_test(NAME test_reference_service COMMAND test_reference_service)
+
+  add_executable(test_token_timing tests/distributed/test_token_timing.cpp)
+  target_include_directories(test_token_timing PRIVATE include)
+  target_link_libraries(test_token_timing PRIVATE strata_warnings)
+  add_test(NAME test_token_timing COMMAND test_token_timing)
+
+  add_executable(test_service_evidence tests/distributed/test_service_evidence.cpp
+                 src/distributed/service_evidence.cpp src/distributed/state_evidence.cpp src/distributed/speculative.cpp)
+  target_include_directories(test_service_evidence PRIVATE include)
+  target_link_libraries(test_service_evidence PRIVATE strata_warnings)
+  add_test(NAME test_service_evidence COMMAND test_service_evidence)
 
   add_executable(test_model_worker_command tests/distributed/test_model_worker_command.cpp
                                           src/distributed/model_worker.cpp)
