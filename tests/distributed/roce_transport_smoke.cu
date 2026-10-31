@@ -432,7 +432,7 @@ int main(int argc, char** argv) {
         TcpChannelConfig tcp;
         tcp.rank = options.rank;
         tcp.world = kTpWorld;
-        tcp.self = options.rank == 0 ? TcpEndpoint{options.rank0_address, options.port} : TcpEndpoint{};
+        tcp.self = {options.rank0_address, options.port};
         tcp.rank0 = tcp.self;
         tcp.credential = credential.secret();
         std::string channel_error;
