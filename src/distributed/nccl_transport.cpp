@@ -325,6 +325,7 @@ struct CudaCalls {
     decltype(&cudaEventRecord) event_record = &cudaEventRecord;
     decltype(&cudaEventQuery) event_query = &cudaEventQuery;
     decltype(&cudaEventDestroy) event_destroy = &cudaEventDestroy;
+    decltype(&cudaStreamIsCapturing) stream_is_capturing = &cudaStreamIsCapturing;
 };
 
 constexpr const char* kSymbolNames[10] = {"ncclGetVersion",
@@ -515,9 +516,12 @@ class ProductionNcclApi final : public NcclApi {
 
     Failure enqueue_all_reduce_sum(const void* send, void* recv, uint64_t elements, ScalarType type,
                                    cudaStream_t stream) override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         ncclDataType_t dtype = ncclNumTypes;
         if (auto f = ready_locked(stream, elements, type, dtype)) return f;
+        if (graph_state_ != GraphState::inactive) {
+            return enqueue_graph_locked(lock, send, recv, elements, type, stream, dtype, false);
+        }
         const ncclResult_t rc = symbols_.all_reduce(send, recv, static_cast<size_t>(elements), dtype,
                                                    ncclSum, comm_, stream);
         if (!accepted(rc)) {
@@ -529,9 +533,12 @@ class ProductionNcclApi final : public NcclApi {
 
     Failure enqueue_all_gather(const void* send, void* recv, uint64_t slot_elements, ScalarType type,
                                cudaStream_t stream) override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         ncclDataType_t dtype = ncclNumTypes;
         if (auto f = ready_locked(stream, slot_elements, type, dtype)) return f;
+        if (graph_state_ != GraphState::inactive) {
+            return enqueue_graph_locked(lock, send, recv, slot_elements, type, stream, dtype, true);
+        }
         // NCCL's `sendcount` is one rank's slot; the receive buffer must hold `nranks * sendcount`, which is
         // the wire size `GuardedTransport` already checked.  The padding travels and is read by nobody.
         const ncclResult_t rc = symbols_.all_gather(send, recv, static_cast<size_t>(slot_elements), dtype,
@@ -543,9 +550,157 @@ class ProductionNcclApi final : public NcclApi {
         return begin_completion_locked(stream, rc);
     }
 
+    Failure prepare_graph_session(cudaStream_t stream, uint64_t expected_collectives) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (auto f = graph_ready_locked()) return f;
+        if (stream == nullptr) return Failure::fail(FailureCode::bad_pointer, "a graph session needs a CUDA stream");
+        if (expected_collectives == 0) {
+            return Failure::fail(FailureCode::bad_extent, "a graph session must contain at least one collective");
+        }
+        if (graph_state_ != GraphState::inactive || in_flight_) {
+            return Failure::fail(FailureCode::in_flight, "NCCL is not idle for graph preparation");
+        }
+        graph_state_ = GraphState::prepared;
+        graph_stream_ = stream;
+        graph_expected_ = expected_collectives;
+        graph_enqueued_ = 0;
+        return ok_failure();
+    }
+
+    Failure check_graph_capture() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (auto f = graph_active_locked()) return f;
+        if (graph_state_ != GraphState::prepared && graph_state_ != GraphState::capturing) {
+            return Failure::fail(FailureCode::not_ready, "NCCL graph capture is not active");
+        }
+        if (auto f = await_nccl_success_locked(lock, "graph capture check")) return f;
+        if (graph_enqueued_ > graph_expected_) {
+            return graph_fail_locked(FailureCode::bad_extent, "graph capture enqueued too many NCCL collectives");
+        }
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        const cudaError_t ce = cuda_.stream_is_capturing(graph_stream_, &status);
+        if (ce != cudaSuccess) {
+            return graph_fail_locked(FailureCode::async_error,
+                                     std::string("cudaStreamIsCapturing: ") + cudaGetErrorString(ce));
+        }
+        if (status != cudaStreamCaptureStatusActive) {
+            return graph_fail_locked(FailureCode::bad_operation, "the prepared NCCL stream is not being captured");
+        }
+        graph_state_ = GraphState::capturing;
+        return ok_failure();
+    }
+
+    Failure finish_graph_capture() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (auto f = graph_active_locked()) return f;
+        if (graph_state_ != GraphState::capturing) {
+            return Failure::fail(FailureCode::not_ready, "NCCL graph capture is not active");
+        }
+        if (auto f = await_nccl_success_locked(lock, "graph capture finish")) return f;
+        if (graph_enqueued_ != graph_expected_) {
+            return graph_fail_locked(FailureCode::bad_extent,
+                                     "graph capture enqueued " + std::to_string(graph_enqueued_) +
+                                         " collectives, expected " + std::to_string(graph_expected_));
+        }
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        const cudaError_t ce = cuda_.stream_is_capturing(graph_stream_, &status);
+        if (ce != cudaSuccess) {
+            return graph_fail_locked(FailureCode::async_error,
+                                     std::string("cudaStreamIsCapturing: ") + cudaGetErrorString(ce));
+        }
+        if (status != cudaStreamCaptureStatusNone) {
+            return graph_fail_locked(FailureCode::bad_operation, "NCCL stream capture has not ended");
+        }
+        graph_state_ = GraphState::captured;
+        return ok_failure();
+    }
+
+    Failure begin_captured_replay() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (auto f = graph_active_locked()) return f;
+        if (graph_state_ != GraphState::captured || graph_replay_pending_ || in_flight_) {
+            return Failure::fail(FailureCode::bad_operation,
+                                 "NCCL graph is not ready for another replay");
+        }
+        graph_replay_pending_ = true;
+        return ok_failure();
+    }
+
+    Failure wait_captured_replay(Deadline deadline) override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (auto f = graph_active_locked()) return f;
+        if (graph_state_ != GraphState::captured || !graph_replay_pending_) {
+            return Failure::fail(FailureCode::not_ready, "no captured NCCL replay is pending");
+        }
+        for (;;) {
+            ncclResult_t state = ncclInProgress;
+            if (auto f = async_error_unlocked(state)) return graph_fail_locked(f.code, f.detail);
+            if (state == ncclSuccess) break;
+            if (std::chrono::steady_clock::now() >= deadline.end) {
+                return graph_timeout_locked("NCCL did not complete before the graph replay deadline");
+            }
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(kInitPollMs));
+            lock.lock();
+            if (aborted_) return Failure::fail(FailureCode::aborted, "the communicator was abandoned");
+        }
+        if (auto f = record_after_locked(graph_stream_, "captured replay")) {
+            return graph_fail_locked(f.code, f.detail);
+        }
+        for (;;) {
+            ncclResult_t state = ncclInProgress;
+            if (auto f = async_error_unlocked(state)) return graph_fail_locked(f.code, f.detail);
+            if (state == ncclInProgress) {
+                if (std::chrono::steady_clock::now() >= deadline.end) {
+                    return graph_timeout_locked("NCCL became active while completing a graph replay");
+                }
+            } else {
+                const cudaError_t q = cuda_.event_query(event_);
+                if (q == cudaSuccess) {
+                    graph_replay_pending_ = false;
+                    return ok_failure();
+                }
+                if (q != cudaErrorNotReady) {
+                    return graph_fail_locked(FailureCode::async_error,
+                                             std::string("cudaEventQuery: ") + cudaGetErrorString(q));
+                }
+                if (std::chrono::steady_clock::now() >= deadline.end) {
+                    return graph_timeout_locked("the device had not finished the graph replay before its deadline");
+                }
+            }
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(kInitPollMs));
+            lock.lock();
+            if (aborted_) return Failure::fail(FailureCode::aborted, "the communicator was abandoned");
+        }
+    }
+
+    Failure end_graph_session() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (auto f = graph_active_locked()) return f;
+        if ((graph_state_ != GraphState::captured && graph_state_ != GraphState::prepared) ||
+            graph_replay_pending_) {
+            return Failure::fail(FailureCode::in_flight, "NCCL graph session has pending work");
+        }
+        graph_state_ = GraphState::inactive;
+        graph_stream_ = nullptr;
+        graph_expected_ = 0;
+        graph_enqueued_ = 0;
+        return ok_failure();
+    }
+
+    bool requires_process_exit() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return requires_process_exit_;
+    }
+
     Failure poll_completion(Deadline deadline) override {
         std::lock_guard<std::mutex> lock(mutex_);
         if (aborted_) return Failure::fail(FailureCode::aborted, "the communicator was abandoned");
+        if (graph_state_ != GraphState::inactive) {
+            return Failure::fail(FailureCode::bad_operation,
+                                 "eager completion polling is unavailable during an NCCL graph session");
+        }
         if (comm_ == nullptr) return Failure::fail(FailureCode::not_ready, "no communicator");
         if (!in_flight_ || event_ == nullptr) {
             return Failure::fail(FailureCode::not_ready, "nothing was enqueued to poll");
@@ -596,9 +751,12 @@ class ProductionNcclApi final : public NcclApi {
     void comm_abort() noexcept override {
         cudaEvent_t event = nullptr;
         ncclComm_t comm = nullptr;
+        bool preserve_event = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            event = event_;
+            preserve_event = graph_replay_pending_;
+            if (preserve_event) requires_process_exit_ = true;
+            else event = event_;
             comm = comm_;
             event_ = nullptr;
             comm_ = nullptr;
@@ -616,6 +774,95 @@ class ProductionNcclApi final : public NcclApi {
     }
 
  private:
+    enum class GraphState { inactive, prepared, capturing, captured, failed };
+
+    Failure graph_ready_locked() const {
+        if (aborted_) return Failure::fail(FailureCode::aborted, "the communicator was abandoned");
+        if (comm_ == nullptr) return Failure::fail(FailureCode::not_ready, "no communicator");
+        if (sticky_) return sticky_failure_;
+        return ok_failure();
+    }
+
+    Failure graph_active_locked() const {
+        if (graph_state_ == GraphState::failed) {
+            return sticky_ ? sticky_failure_ : Failure::fail(FailureCode::aborted, "NCCL graph session failed");
+        }
+        return graph_ready_locked();
+    }
+
+    Failure graph_fail_locked(FailureCode code, std::string_view detail) {
+        if (code == FailureCode::none) code = FailureCode::async_error;
+        if (graph_replay_pending_) requires_process_exit_ = true;
+        graph_state_ = GraphState::failed;
+        sticky_ = true;
+        sticky_failure_ = Failure::fail(code, detail);
+        return sticky_failure_;
+    }
+
+    Failure graph_timeout_locked(std::string_view detail) {
+        requires_process_exit_ = true;
+        graph_state_ = GraphState::failed;
+        sticky_ = true;
+        sticky_failure_ = Failure::fail(FailureCode::deadline_expired, detail);
+        return sticky_failure_;
+    }
+
+    Failure enqueue_graph_locked(std::unique_lock<std::mutex>& lock, const void* send, void* recv,
+                                 uint64_t elements, ScalarType type, cudaStream_t stream,
+                                 ncclDataType_t dtype, bool gather) {
+        if (graph_state_ != GraphState::capturing) {
+            return Failure::fail(FailureCode::bad_operation,
+                                 "NCCL graph collectives require an active prepared capture");
+        }
+        if (stream != graph_stream_) {
+            return graph_fail_locked(FailureCode::bad_pointer, "a captured NCCL collective used another stream");
+        }
+        if (auto f = await_nccl_success_locked(lock, "captured collective pre-enqueue")) return f;
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        const cudaError_t ce = cuda_.stream_is_capturing(stream, &status);
+        if (ce != cudaSuccess) {
+            return graph_fail_locked(FailureCode::async_error,
+                                     std::string("cudaStreamIsCapturing: ") + cudaGetErrorString(ce));
+        }
+        if (status != cudaStreamCaptureStatusActive) {
+            return graph_fail_locked(FailureCode::bad_operation, "prepared NCCL stream is not capturing");
+        }
+        if (graph_enqueued_ >= graph_expected_) {
+            return graph_fail_locked(FailureCode::bad_extent, "graph capture contains too many NCCL collectives");
+        }
+        const ncclResult_t rc =
+            gather ? symbols_.all_gather(send, recv, static_cast<size_t>(elements), dtype, comm_, stream)
+                   : symbols_.all_reduce(send, recv, static_cast<size_t>(elements), dtype, ncclSum, comm_, stream);
+        if (!accepted(rc)) {
+            return graph_fail_locked(FailureCode::enqueue_failed,
+                                     std::string(gather ? "ncclAllGather returned " : "ncclAllReduce returned ") +
+                                         describe(rc));
+        }
+        if (rc == ncclInProgress) {
+            if (auto f = await_nccl_success_locked(lock, "captured collective enqueue")) return f;
+        }
+        graph_state_ = GraphState::capturing;
+        ++graph_enqueued_;
+        return ok_failure();
+    }
+
+    Failure await_nccl_success_locked(std::unique_lock<std::mutex>& lock, const char* phase) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.initialize_ms);
+        for (;;) {
+            ncclResult_t state = ncclInProgress;
+            if (auto f = async_error_unlocked(state)) return graph_fail_locked(f.code, f.detail);
+            if (state == ncclSuccess) return ok_failure();
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return graph_fail_locked(FailureCode::deadline_expired,
+                                         std::string("NCCL did not reach success during ") + phase);
+            }
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(kInitPollMs));
+            lock.lock();
+            if (aborted_) return Failure::fail(FailureCode::aborted, "the communicator was abandoned");
+        }
+    }
+
     // Everything an enqueue needs before it touches the library.  The caller holds `mutex_`: checking the
     // handle and using it are one step, not two, or an abort between them would be a call on a dead comm.
     Failure ready_locked(cudaStream_t stream, uint64_t elements, ScalarType type,
@@ -635,6 +882,9 @@ class ProductionNcclApi final : public NcclApi {
         }
         if (aborted_) return Failure::fail(FailureCode::aborted, "the communicator was abandoned");
         if (comm_ == nullptr) return Failure::fail(FailureCode::not_ready, "no communicator");
+        if (graph_state_ == GraphState::failed) {
+            return sticky_ ? sticky_failure_ : Failure::fail(FailureCode::aborted, "NCCL graph session failed");
+        }
         if (in_flight_) return Failure::fail(FailureCode::in_flight, "a collective is already in flight");
         return ok_failure();
     }
@@ -711,6 +961,12 @@ class ProductionNcclApi final : public NcclApi {
     ncclComm_t comm_ = nullptr;
     cudaEvent_t event_ = nullptr;
     cudaStream_t pending_stream_ = nullptr;
+    cudaStream_t graph_stream_ = nullptr;
+    uint64_t graph_expected_ = 0;
+    uint64_t graph_enqueued_ = 0;
+    GraphState graph_state_ = GraphState::inactive;
+    bool graph_replay_pending_ = false;
+    bool requires_process_exit_ = false;
     bool in_flight_ = false;
     bool event_recorded_ = false;
     bool aborted_ = false;

@@ -68,6 +68,33 @@ class NcclApi {
     // anything else when it failed.
     virtual Failure poll_completion(Deadline deadline) = 0;
 
+    // Opt-in graph session. Prepare before beginning CUDA stream capture. Captured enqueues must all use
+    // `stream` and exactly `expected_collectives`; they do not record or poll a CUDA event. Check and finish
+    // perform NCCL host-side health queries only. After each graph launch, wait_captured_replay() records and
+    // polls the completion event on the prepared stream. The owner must destroy every captured graph before
+    // end_graph_session(), since a live graph may still reference this communicator. After begin_captured_replay,
+    // any graph-launch failure must abort the communicator; abort reports process-exit when completion is unknown.
+    // Implementations without graph support refuse these calls, leaving the eager interface unchanged.
+    virtual Failure prepare_graph_session(cudaStream_t, uint64_t) {
+        return Failure::fail(FailureCode::not_supported, "NCCL graph sessions are not supported");
+    }
+    virtual Failure check_graph_capture() {
+        return Failure::fail(FailureCode::not_supported, "NCCL graph sessions are not supported");
+    }
+    virtual Failure finish_graph_capture() {
+        return Failure::fail(FailureCode::not_supported, "NCCL graph sessions are not supported");
+    }
+    virtual Failure begin_captured_replay() {
+        return Failure::fail(FailureCode::not_supported, "NCCL graph sessions are not supported");
+    }
+    virtual Failure wait_captured_replay(Deadline) {
+        return Failure::fail(FailureCode::not_supported, "NCCL graph sessions are not supported");
+    }
+    virtual Failure end_graph_session() {
+        return Failure::fail(FailureCode::not_supported, "NCCL graph sessions are not supported");
+    }
+    virtual bool requires_process_exit() const { return false; }
+
     // A late error the library knows about.  Sticky: reporting it must not clear it.
     virtual bool async_failure(Failure& out) const = 0;
 
@@ -155,6 +182,42 @@ class NcclBackend final : public Backend {
     Failure raw_poll(Deadline deadline) override {
         if (auto f = usable()) return f;
         return api_->poll_completion(deadline);
+    }
+
+    Failure prepare_graph_session(cudaStream_t stream, uint64_t expected_collectives) {
+        if (auto f = usable()) return f;
+        return api_->prepare_graph_session(stream, expected_collectives);
+    }
+
+    Failure check_graph_capture() {
+        if (auto f = usable()) return f;
+        return api_->check_graph_capture();
+    }
+
+    Failure finish_graph_capture() {
+        if (auto f = usable()) return f;
+        return api_->finish_graph_capture();
+    }
+
+    Failure begin_captured_replay() {
+        if (auto f = usable()) return f;
+        return api_->begin_captured_replay();
+    }
+
+    Failure wait_captured_replay(Deadline deadline) {
+        if (auto f = usable()) return f;
+        return api_->wait_captured_replay(deadline);
+    }
+
+    Failure end_graph_session() {
+        if (api_ == nullptr) return Failure::fail(FailureCode::invalid_config, "no NCCL API");
+        if (aborted_) return Failure::fail(FailureCode::aborted, "the communicator was abandoned");
+        if (!ready_) return Failure::fail(FailureCode::not_ready, "the communicator was never formed");
+        return api_->end_graph_session();
+    }
+
+    bool requires_process_exit() const {
+        return api_ != nullptr && api_->requires_process_exit();
     }
 
     bool raw_async_failure(Failure& out) const override {

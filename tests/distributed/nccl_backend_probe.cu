@@ -58,6 +58,12 @@ static_assert(std::is_same_v<decltype(&NcclApi::enqueue_all_reduce_sum),
 static_assert(std::is_same_v<decltype(&NcclApi::enqueue_all_gather),
                              Failure (NcclApi::*)(const void*, void*, uint64_t, ScalarType, cudaStream_t)>,
               "all_gather does not take a real cudaStream_t");
+static_assert(std::is_same_v<decltype(&NcclApi::begin_captured_replay),
+                             Failure (NcclApi::*)()>,
+              "captured replay must be explicitly declared before launch");
+static_assert(std::is_same_v<decltype(&NcclApi::wait_captured_replay),
+                             Failure (NcclApi::*)(Deadline)>,
+              "captured replay completion must carry a deadline");
 
 // The contract's one-in-flight rule reaches the library through `Backend`, so the adapter must be a `Backend`
 // whose raw calls carry a real stream.
@@ -74,13 +80,17 @@ void check(bool ok, const char* what) {
 }
 
 namespace fake {
-std::atomic<int> init_calls{0}, polls{0}, aborts{0}, records{0};
+std::atomic<int> init_calls{0}, polls{0}, aborts{0}, records{0}, reduces{0}, gathers{0}, stream_checks{0};
 std::atomic<ncclResult_t> state{ncclSuccess};
+std::atomic<int> enqueue_pending_polls{0};
 int pending_polls = 0;
 cudaError_t event_state = cudaErrorNotReady;
+cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusActive;
+cudaError_t capture_query = cudaSuccess;
 void reset() {
-    init_calls = 0; polls = 0; aborts = 0; records = 0;
-    state = ncclSuccess; pending_polls = 0; event_state = cudaErrorNotReady;
+    init_calls = 0; polls = 0; aborts = 0; records = 0; reduces = 0; gathers = 0; stream_checks = 0;
+    state = ncclSuccess; pending_polls = 0; enqueue_pending_polls = 0; event_state = cudaErrorNotReady;
+    capture_status = cudaStreamCaptureStatusActive; capture_query = cudaSuccess;
 }
 ncclResult_t init(ncclComm_t* comm, int, ncclUniqueId, int, ncclConfig_t* cfg) {
     ++init_calls;
@@ -89,15 +99,21 @@ ncclResult_t init(ncclComm_t* comm, int, ncclUniqueId, int, ncclConfig_t* cfg) {
 }
 ncclResult_t async(ncclComm_t, ncclResult_t* out) {
     const int n = ++polls;
-    *out = n <= pending_polls ? ncclInProgress : state.load();
+    int remaining = enqueue_pending_polls.load();
+    while (remaining > 0 && !enqueue_pending_polls.compare_exchange_weak(remaining, remaining - 1)) {}
+    *out = remaining > 0 || n <= pending_polls ? ncclInProgress : state.load();
     return ncclSuccess;
 }
 ncclResult_t count(ncclComm_t, int* out) { *out = 3; return ncclSuccess; }
 ncclResult_t abort(ncclComm_t) { ++aborts; return ncclSuccess; }
 ncclResult_t reduce(const void*, void*, size_t, ncclDataType_t, ncclRedOp_t, ncclComm_t, cudaStream_t) {
+    ++reduces;
+    enqueue_pending_polls = 2;
     return ncclInProgress;
 }
 ncclResult_t gather(const void*, void*, size_t, ncclDataType_t, ncclComm_t, cudaStream_t) {
+    ++gathers;
+    enqueue_pending_polls = 2;
     return ncclInProgress;
 }
 cudaError_t create(cudaEvent_t* event, unsigned) {
@@ -105,10 +121,15 @@ cudaError_t create(cudaEvent_t* event, unsigned) {
 }
 cudaError_t record(cudaEvent_t, cudaStream_t) {
     ++records;
-    return state == ncclInProgress ? cudaErrorInvalidValue : cudaSuccess;
+    return cudaSuccess;
 }
 cudaError_t query(cudaEvent_t) { return event_state; }
 cudaError_t destroy(cudaEvent_t) { return cudaSuccess; }
+cudaError_t is_capturing(cudaStream_t, cudaStreamCaptureStatus* out) {
+    ++stream_checks;
+    *out = capture_status;
+    return capture_query;
+}
 detail::NcclSymbols symbols() {
     detail::NcclSymbols out;
     out.comm_init_rank_config = &init; out.comm_get_async_error = &async;
@@ -116,7 +137,7 @@ detail::NcclSymbols symbols() {
     out.all_reduce = &reduce; out.all_gather = &gather;
     return out;
 }
-detail::CudaCalls cuda() { return {&create, &record, &query, &destroy}; }
+detail::CudaCalls cuda() { return {&create, &record, &query, &destroy, &is_capturing}; }
 NcclConfig config() {
     NcclConfig out;
     out.bootstrap_id.assign(NCCL_UNIQUE_ID_BYTES * 2, 'a');
@@ -184,6 +205,91 @@ void check_nonblocking_lifecycle() {
         check(outcome.code == FailureCode::aborted && fake::init_calls == 1 && fake::aborts == 1,
               "watchdog abort reaches the published init handle without double abort or reinit");
     }
+}
+
+void check_graph_lifecycle() {
+    fake::reset();
+    auto config = fake::config();
+    ProductionNcclApi api(config, nullptr, fake::symbols(), "fake", "sha256:fake", fake::cuda());
+    check(!api.comm_init(config), "graph test communicator initializes");
+    const auto stream = reinterpret_cast<cudaStream_t>(uintptr_t{0x30});
+    float input = 1, output = 0;
+
+    check(!api.prepare_graph_session(stream, 3), "graph session prepares with an exact collective count");
+    check(api.begin_captured_replay().code == FailureCode::not_ready,
+          "replay cannot begin until graph capture is finalized");
+    check(!api.check_graph_capture(), "an explicitly prepared stream can be validated during capture");
+    check(!api.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream) &&
+              !api.enqueue_all_gather(&input, &output, 1, ScalarType::fp32, stream) &&
+              !api.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream),
+          "three collectives enqueue in order without host completion polling");
+    check(fake::records == 0 && fake::polls == 15,
+          "capture enqueues record no CUDA event and only query NCCL async health");
+    check(api.enqueue_all_gather(&input, &output, 1, ScalarType::fp32, stream).code == FailureCode::bad_extent,
+          "a capture cannot enqueue beyond its prepared collective count");
+    check(fake::gathers == 1, "the over-count collective never reaches NCCL");
+
+    fake::reset();
+    // A fresh instance below covers successful capture because over-counting is terminal by contract.
+    ProductionNcclApi good(config, nullptr, fake::symbols(), "fake", "sha256:fake", fake::cuda());
+    check(!good.comm_init(config) && !good.prepare_graph_session(stream, 3) && !good.check_graph_capture(),
+          "fresh graph session begins capture");
+    check(!good.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream) &&
+              !good.enqueue_all_gather(&input, &output, 1, ScalarType::fp32, stream) &&
+              !good.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream),
+          "three graph operations enqueue successfully");
+    fake::capture_status = cudaStreamCaptureStatusNone;
+    check(!good.finish_graph_capture(), "capture finalizes only after the exact ordered sequence");
+    check(!good.begin_captured_replay(), "a finalized graph begins an explicit replay");
+    fake::event_state = cudaSuccess;
+    const Deadline at{std::chrono::steady_clock::now() + std::chrono::seconds(1)};
+    bool replay_ok = true;
+    for (int i = 0; i < 100; ++i) {
+        if (i != 0 && good.begin_captured_replay()) replay_ok = false;
+        if (good.wait_captured_replay(at)) replay_ok = false;
+        if (fake::records != i + 1) replay_ok = false;
+    }
+    check(replay_ok, "100 graph replays each record and observe one completion event");
+    check(fake::polls == 215, "every replay checks NCCL async state before event query");
+    check(!good.end_graph_session(), "a drained graph session closes cleanly");
+
+    fake::reset();
+    ProductionNcclApi unknown(config, nullptr, fake::symbols(), "fake", "sha256:fake", fake::cuda());
+    check(!unknown.comm_init(config) && !unknown.prepare_graph_session(stream, 1) && !unknown.check_graph_capture() &&
+              !unknown.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream),
+          "unknown-query case has a captured operation");
+    fake::capture_status = cudaStreamCaptureStatusNone;
+    check(!unknown.finish_graph_capture() && !unknown.begin_captured_replay(), "unknown-query graph is finalized");
+    fake::event_state = cudaErrorUnknown;
+    check(unknown.wait_captured_replay(at).code == FailureCode::async_error &&
+              unknown.requires_process_exit(),
+          "an unknown CUDA event result poisons the graph and requests process exit for uncertain DMA");
+
+    fake::reset();
+    ProductionNcclApi timeout(config, nullptr, fake::symbols(), "fake", "sha256:fake", fake::cuda());
+    check(!timeout.comm_init(config) && !timeout.prepare_graph_session(stream, 1) && !timeout.check_graph_capture() &&
+              !timeout.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream),
+          "timeout case has a captured operation");
+    fake::capture_status = cudaStreamCaptureStatusNone;
+    check(!timeout.finish_graph_capture() && !timeout.begin_captured_replay(), "timeout graph is finalized");
+    fake::event_state = cudaErrorNotReady;
+    const Deadline expired{std::chrono::steady_clock::now()};
+    check(timeout.wait_captured_replay(expired).code == FailureCode::deadline_expired &&
+              timeout.requires_process_exit(),
+          "an unfinished replay deadline requests owner process exit");
+
+    fake::reset();
+    ProductionNcclApi launch_failed(config, nullptr, fake::symbols(), "fake", "sha256:fake", fake::cuda());
+    check(!launch_failed.comm_init(config) && !launch_failed.prepare_graph_session(stream, 1) &&
+              !launch_failed.check_graph_capture() &&
+              !launch_failed.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream),
+          "launch-failure case has a captured operation");
+    fake::capture_status = cudaStreamCaptureStatusNone;
+    check(!launch_failed.finish_graph_capture() && !launch_failed.begin_captured_replay(),
+          "launch-failure graph declares a pending replay");
+    launch_failed.comm_abort();
+    check(launch_failed.requires_process_exit() && fake::aborts == 1,
+          "abort after a failed graph launch requests process exit and preserves pending DMA resources");
 }
 
 void check_mapped_provenance() {
@@ -300,6 +406,7 @@ int main(int argc, char** argv) {
     check_bootstrap_encoding();
     check_version_decoder();
     check_nonblocking_lifecycle();
+    check_graph_lifecycle();
     check_mapped_provenance();
     if (host_only) return g_failed == 0 ? 0 : 1;
 

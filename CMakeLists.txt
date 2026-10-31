@@ -2815,6 +2815,15 @@ if(STRATA_BUILD_DISTRIBUTED)
   find_package(Threads REQUIRED)
   target_link_libraries(strata-tp3-transport-smoke PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
 
+  # Opt-in NCCL stream-capture/replay qualification. Runtime launch still requires three coordinated hosts.
+  add_executable(strata-tp3-nccl-graph-smoke tests/distributed/nccl_graph_smoke.cu
+                 src/distributed/session.cpp src/distributed/control_tcp.cpp)
+  target_compile_definitions(strata-tp3-nccl-graph-smoke PRIVATE STRATA_DISTRIBUTED_CUDA)
+  target_include_directories(strata-tp3-nccl-graph-smoke PRIVATE include src ${STRATA_NCCL_INCLUDE_DIR}
+                            ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(strata-tp3-nccl-graph-smoke PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  set_target_properties(strata-tp3-nccl-graph-smoke PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
   if(STRATA_BUILD_ROCE_EXPERIMENTAL)
     enable_language(C)
     find_path(STRATA_IBVERBS_INCLUDE_DIR infiniband/verbs.h REQUIRED)
@@ -2962,6 +2971,11 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_include_directories(test_transport_contract PRIVATE include src)
   target_link_libraries(test_transport_contract PRIVATE strata_warnings Threads::Threads)
   add_test(NAME test_transport_contract COMMAND test_transport_contract)
+
+  add_executable(test_nccl_graph_api tests/distributed/test_nccl_graph_api.cpp)
+  target_include_directories(test_nccl_graph_api PRIVATE include src)
+  target_link_libraries(test_nccl_graph_api PRIVATE strata_warnings)
+  add_test(NAME test_nccl_graph_api COMMAND test_nccl_graph_api)
 
   # three ranks forming one session: the join protocol on a scripted channel, framing and sockets over real TCP
   add_executable(test_session tests/distributed/test_session.cpp
