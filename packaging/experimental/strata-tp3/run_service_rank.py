@@ -33,6 +33,7 @@ credential = _common.credential
 DISTRIBUTED_MAX_CONTEXT = _common.DISTRIBUTED_MAX_CONTEXT
 MAX_LOG = 32 << 20
 SERVICE_FLAGS = frozenset({"--mtp-path", "--mtp-drafts", "--mtp-hash", "--parallel"})
+SERVICE_CAPTURE_FLAGS = frozenset({"--collective-agreement", "--profile-dir", "--service-state-dir"})
 
 
 def absolute(value):
@@ -91,7 +92,7 @@ def validated(supplied):
         parallel = int(options["--parallel"])
     if mode != "multislot" and (parallel != 1 or "--parallel" in options):
         raise RunnerError("parallel requires multislot mode")
-    mtp = {flag for flag in SERVICE_FLAGS - {"--parallel"} if flag in options}
+    mtp = {flag for flag in SERVICE_FLAGS - {"--parallel", "--service-state-dir"} if flag in options}
     if mtp:
         if mtp != SERVICE_FLAGS - {"--parallel"} or mode != "autoregressive":
             raise RunnerError("MTP requires autoregressive mode and path, drafts and hash together")
@@ -99,8 +100,9 @@ def validated(supplied):
             raise RunnerError("MTP requires an absolute path and drafts in 1..4")
         if not re.fullmatch(r"[0-9a-f]{64}", options["--mtp-hash"]):
             raise RunnerError("MTP hash must be exactly 64 lowercase hex characters")
+    capture_options = {flag: options[flag] for flag in SERVICE_CAPTURE_FLAGS if flag in options}
     common_args = [item for flag, value in zip(args[::2], args[1::2])
-                   if flag not in SERVICE_FLAGS for item in (flag, value)]
+                   if flag not in SERVICE_FLAGS | {"--service-state-dir"} for item in (flag, value)]
     # Reuse the pinned teacher-forced runner's common validation. Its mandatory
     # input/logits fields are placeholders here and never reach the native argv.
     normalized = dict(config, args=[*common_args, "--logits-dir", config["evidence_dir"]],
@@ -113,8 +115,38 @@ def validated(supplied):
                           for i, x in enumerate(normalized["args"])]
     checked = _common.validated(normalized)
     config["options"] = checked["options"]
+    for flag, value in capture_options.items():
+        if flag == "--collective-agreement":
+            if value not in ("per-op", "step"):
+                raise RunnerError("invalid collective agreement policy")
+            config["options"][flag[2:]] = value
+        elif flag == "--profile-dir":
+            if not absolute(value):
+                raise RunnerError("profile-dir must be absolute")
+            config["options"][flag[2:]] = value
+        else:
+            if not absolute(value):
+                raise RunnerError("service-state-dir must be absolute")
+            config["options"][flag[2:]] = value
+    if "profile-dir" in config["options"] and "service-state-dir" in config["options"]:
+        profile = Path(config["options"]["profile-dir"])
+        state = Path(config["options"]["service-state-dir"])
+        if profile == state or profile in state.parents or state in profile.parents:
+            raise RunnerError("profile-dir and service-state-dir must be separate")
+    if "service-state-dir" in config["options"]:
+        state = Path(config["options"]["service-state-dir"])
+        log_root = Path(config["evidence_dir"])
+        if state == log_root or state in log_root.parents or log_root in state.parents:
+            raise RunnerError("service-state-dir and evidence-dir must be separate")
+    if "profile-dir" in config["options"] and "trace-dir" in config["options"]:
+        profile = Path(config["options"]["profile-dir"])
+        trace = Path(config["options"]["trace-dir"])
+        if profile == trace or profile in trace.parents or trace in profile.parents:
+            raise RunnerError("profile-dir and trace-dir must be separate")
     config["options"]["context"] = context
     config["options"].update({flag[2:]: options[flag] for flag in SERVICE_FLAGS if flag in options})
+    if "--service-state-dir" in options:
+        config["options"]["service-state-dir"] = options["--service-state-dir"]
     config.update(mode=mode, parallel=parallel)
     if mode == "multislot" and "--parallel" not in options:
         config["args"] = [*args, "--parallel", str(parallel)]
@@ -225,6 +257,9 @@ def run(supplied, execute=False):
                "source_manifest": config["source_manifest"], "tokenizer_manifest": config["tokenizer_manifest"]}
     if not execute:
         return receipt
+    if ("service-state-dir" in options and
+            Path(options["service-state-dir"]).exists()):
+        raise RunnerError("service-state-dir must be fresh; driver creates it")
     secret = credential(config["credential_file"])
     if secret in json.dumps(receipt) or secret in json.dumps(config.get("env", {})):
         raise RunnerError("credential appears in command, identity or network settings")

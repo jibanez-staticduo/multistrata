@@ -155,6 +155,64 @@ def test_dry_run_hashes_without_reading_credential_or_launch(config, monkeypatch
     assert not Path(config["evidence_dir"]).exists()
 
 
+@pytest.mark.parametrize("agreement", ["per-op", "step"])
+def test_collective_agreement_forwarded_exactly(config, agreement):
+    config["args"] += ["--collective-agreement", agreement]
+    result = runner.run(config)
+    assert result["native_command"][-2:] == ["--collective-agreement", agreement]
+
+
+@pytest.mark.parametrize("agreement", ["", "operation", "STEP"])
+def test_collective_agreement_rejects_unknown_values(config, agreement):
+    config["args"] += ["--collective-agreement", agreement or " "]
+    with pytest.raises(runner.RunnerError):
+        runner.validated(config)
+
+
+def test_absolute_profile_dir_forwarded_exactly_and_default_unchanged(config, tmp_path):
+    default = runner.run(config)
+    profile = str(tmp_path / "profile")
+    config["args"] += ["--profile-dir", profile]
+    explicit = runner.run(config)
+    assert "--profile-dir" not in default["native_command"]
+    assert explicit["native_command"][-2:] == ["--profile-dir", profile]
+
+
+@pytest.mark.parametrize("flag,value", [("--profile-dir", "relative"), ("--service-state-dir", "relative")])
+def test_service_capture_paths_require_absolute_path(config, flag, value):
+    config["args"] += [flag, value]
+    with pytest.raises(runner.RunnerError):
+        runner.validated(config)
+
+
+def test_service_state_dir_must_be_fresh_but_not_precreated(config, tmp_path, monkeypatch):
+    state = tmp_path / "service-state"
+    config["args"] += ["--service-state-dir", str(state)]
+    cfg = runner.validated(config)
+    assert cfg["options"]["service-state-dir"] == str(state)
+    assert "--service-state-dir" in runner.run(config)["native_command"]
+    assert not state.exists()
+    state.mkdir()
+    monkeypatch.setattr(runner, "credential", lambda *_: "private testing credential")
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *_a, **_kw: pytest.fail("launched"))
+    with pytest.raises(runner.RunnerError, match="service-state-dir must be fresh"):
+        runner.run(config, execute=True)
+
+
+def test_profile_and_service_state_paths_must_not_overlap(config, tmp_path):
+    state = tmp_path / "captures"
+    profile = state / "profile"
+    config["args"] += ["--service-state-dir", str(state), "--profile-dir", str(profile)]
+    with pytest.raises(runner.RunnerError):
+        runner.validated(config)
+
+
+def test_service_state_dir_must_not_overlap_launcher_evidence(config, tmp_path):
+    config["args"] += ["--service-state-dir", str(tmp_path / "evidence" / "captures")]
+    with pytest.raises(runner.RunnerError, match="evidence-dir"):
+        runner.validated(config)
+
+
 @pytest.mark.parametrize("key", ["binary", "source_file", "library", "server", "tokenizer"])
 def test_hash_mismatch_before_launch(config, key, monkeypatch):
     paths = {"binary": config["binary"], "source_file": config["source_file"],

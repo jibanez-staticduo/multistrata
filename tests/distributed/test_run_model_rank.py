@@ -93,6 +93,57 @@ def test_graph_finish_policy(config, policy, value, allowed):
             runner.validated(config)
 
 
+@pytest.mark.parametrize("value", ["full", "compact"])
+def test_explicit_expert_operand_policy(config, value):
+    config["args"] += ["--expert-operands", value]
+    assert runner.validated(config)["options"]["expert-operands"] == value
+
+
+@pytest.mark.parametrize("value", ["compressed", "", "COMPACT"])
+def test_expert_operand_policy_rejects_unknown(config, value):
+    config["args"] += ["--expert-operands", value]
+    with pytest.raises(runner.RunnerError):
+        runner.validated(config)
+
+
+@pytest.mark.parametrize("agreement", ["per-op", "step"])
+def test_collective_agreement_forwarded_exactly(config, agreement):
+    config["args"] += ["--collective-agreement", agreement]
+    assert runner.run(config)["command"][-2:] == ["--collective-agreement", agreement]
+
+
+@pytest.mark.parametrize("agreement", ["", "operation", "STEP"])
+def test_collective_agreement_rejects_unknown_values(config, agreement):
+    config["args"] += ["--collective-agreement", agreement or " "]
+    with pytest.raises(runner.RunnerError):
+        runner.validated(config)
+
+
+def test_absolute_profile_dir_forwarded_without_default_changes(config, tmp_path):
+    default = runner.run(config)
+    profile = str(tmp_path / "profile")
+    config["args"] += ["--profile-dir", profile]
+    explicit = runner.run(config)
+    assert "--profile-dir" not in default["command"]
+    assert explicit["command"][-2:] == ["--profile-dir", profile]
+    assert runner.validated(config)["options"]["profile-dir"] == profile
+
+
+def test_profile_dir_must_be_absolute_and_separate_from_trace(config, tmp_path):
+    for profile in ("relative", str(tmp_path / "profile")):
+        args = config["args"] + ["--profile-dir", profile]
+        if profile != "relative":
+            args += ["--trace-dir", str(tmp_path / "profile" / "trace")]
+        with pytest.raises(runner.RunnerError):
+            runner.validated(dict(config, args=args))
+
+
+def test_service_state_flag_is_service_runner_only(config, tmp_path):
+    config["args"] += ["--service-state-dir", str(tmp_path / "service-state")]
+    with pytest.raises(runner.RunnerError, match="unknown"):
+        runner.validated(config)
+
+
 @pytest.mark.parametrize("flag", ["--mtp-path", "--mtp-drafts", "--mtp-hash", "--parallel"])
 def test_teacher_parser_refuses_service_flags(config, flag):
     config["args"] += [flag, "1"]

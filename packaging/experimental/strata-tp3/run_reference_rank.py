@@ -57,6 +57,10 @@ def validated(supplied):
     if not isinstance(supplied, dict):
         raise RunnerError("config must be an object")
     config = dict(supplied)
+    if type(config.get("release_verified_cache", False)) is not bool:
+        raise RunnerError("release_verified_cache must be a boolean")
+    if config.get("release_verified_cache") and not hasattr(os, "posix_fadvise"):
+        raise RunnerError("release_verified_cache requires POSIX file cache advice")
     if config.get("env") or config.get("mode", "autoregressive") != "autoregressive" or \
             config.get("expert_residency", "all") != "all" or \
             type(config.get("parallel", 1)) is not int or config.get("parallel", 1) != 1:
@@ -168,6 +172,16 @@ def run(supplied, execute=False):
                "source_manifest": config["source_manifest"], "tokenizer_manifest": config["tokenizer_manifest"]}
     if not execute:
         return receipt
+    if config.get("release_verified_cache"):
+        # Hashing the full pack can fill Spark unified memory with clean file pages.
+        # Advise only the verified model files; the driver still enforces its budget.
+        for name in config["model_manifest"]:
+            fd = os.open(name, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        receipt["released_verified_cache_files"] = len(config["model_manifest"])
     evidence.mkdir(parents=True, exist_ok=False, mode=0o700)
     environment = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "PYTHONNOUSERSITE": "1",
                    "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1", "CUDA_VISIBLE_DEVICES": "0",

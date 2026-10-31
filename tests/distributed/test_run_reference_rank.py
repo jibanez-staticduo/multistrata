@@ -82,6 +82,27 @@ def test_dry_run_has_no_side_effects_or_credentials(config, monkeypatch):
     assert server["tokenizer"] == config["tokenizer_dir"]
 
 
+def test_release_verified_model_cache_is_explicit_and_after_validation(config, monkeypatch):
+    calls = []
+    monkeypatch.setattr(runner.os, "posix_fadvise", lambda fd, start, count, advice:
+                        calls.append((os.readlink(f"/proc/self/fd/{fd}"), start, count, advice)))
+    runner.run(config)
+    assert calls == []
+    enabled = dict(config, release_verified_cache=True)
+    runner.run(enabled)
+    assert calls == []  # Dry runs never alter cache residency.
+    receipt = runner.run(enabled, True)
+    assert receipt["status"] == "completed"
+    assert {row[0] for row in calls} == set(config["model_manifest"])
+    assert all(row[1:] == (0, 0, os.POSIX_FADV_DONTNEED) for row in calls)
+    assert receipt["released_verified_cache_files"] == len(calls)
+
+
+def test_release_verified_cache_rejects_nonboolean(config):
+    with pytest.raises(runner.RunnerError):
+        runner.validated(dict(config, release_verified_cache="yes"))
+
+
 @pytest.mark.parametrize("flag", ["--mtp-path", "--mode", "--expert-residency", "--parallel", "--logits-dir",
                                   "--state-dir", "--trace-dir", "--timing-file", "--context"])
 def test_extra_and_duplicate_flags_refused(config, flag):
