@@ -114,6 +114,40 @@ __global__ void finish_lanes_kernel(const float2* payload, float* output, int qk
     for (int o = 16; o > 0; o >>= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, o));
     if (lane == 0) output[std::size_t(blockIdx.y) * nout + out] = sum;
 }
+template<int T>
+__global__ void down_lanes_compact_kernel(const uint8_t* weights, std::size_t stride, const uint8_t* q81,
+                                          std::size_t activation_stride, float2* payload, int nout,
+                                          int begin, int owned_calls, int slots) {
+    constexpr int qk = T == 20 ? 32 : 64;
+    const int out = int(blockIdx.x) * 4 + int(threadIdx.y);
+    if (out >= nout) return;
+    const auto* a = reinterpret_cast<const block_q8_1*>(q81 + blockIdx.y * activation_stride);
+    const auto* row = weights + std::size_t(out) * stride;
+    for (int local_call = int(threadIdx.x); local_call < slots; local_call += 32) {
+        float2 op = make_float2(0.f, 0.f);
+        if (local_call < owned_calls) {
+            const int call = begin / qk * 2 + local_call, global_block = call / 2;
+            op = operands<T>(row, a + global_block * (qk / 32), local_call / 2, call % 2);
+        }
+        payload[(std::size_t(blockIdx.y) * nout + out) * slots + local_call] = op;
+    }
+}
+__global__ void finish_lanes_compact_kernel(const float2* payload, float* output, int calls,
+                                            int nout, int rows, int end0, int end1, int slots) {
+    const int out = int(blockIdx.x) * 4 + int(threadIdx.y), lane = int(threadIdx.x);
+    if (out >= nout) return;
+    float sum = 0.f;
+    for (int call = lane; call < calls; call += 32) {
+        const int rank = call < end0 ? 0 : call < end1 ? 1 : 2;
+        const int local_call = call - (rank == 0 ? 0 : rank == 1 ? end0 : end1);
+        const auto i = ((std::size_t(rank) * rows + blockIdx.y) * nout + out) * slots + local_call;
+        const auto op = payload[i];
+        sum = __fmaf_rn(op.x, op.y, sum);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffffu, sum, o));
+    if (lane == 0) output[std::size_t(blockIdx.y) * nout + out] = sum;
+}
 }  // namespace
 
 std::size_t global_q81_bytes(int rows, int width) {
@@ -203,6 +237,77 @@ void finish_down_lanes(const float* payload, int type, int width, int nout, int 
     detail::require(sum == uint64_t(width), "TP exact lanes: incomplete ownership");
     finish_lanes_kernel<<<dim3((nout + 3) / 4, rows), dim3(32, 4), 0, static_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<const float2*>(payload), output, qk, width, nout, rows, int(valid[0]), int(valid[0] + valid[1]));
+    detail::check(cudaGetLastError());
+}
+
+int compact_down_payload_width(int type, int width, std::array<uint64_t, 3> valid) {
+    detail::require(type == 20 || type == 42, "TP compact exact v2: unsupported codec");
+    const int qk = detail::block(type);
+    detail::require(width > 0 && width <= 1024 && width % qk == 0 && width / qk * 2 <= 64,
+                    "TP compact exact v2: unsupported call geometry");
+    uint64_t sum = 0, largest = 0;
+    for (const auto count : valid) {
+        detail::require(count > 0 && count % qk == 0 && count <= uint64_t(width) - sum,
+                        "TP compact exact v2: invalid ownership cuts");
+        sum += count;
+        if (count > largest) largest = count;
+    }
+    detail::require(sum == uint64_t(width), "TP compact exact v2: incomplete ownership");
+    return int(largest / qk) * 4;
+}
+
+void down_lanes_compact(const MatrixShard& w, const distributed::ActivationContract& c, const GlobalQ81& a,
+                        float* payload, int slot_width, void* stream) {
+    detail::contract(c); detail::matrix(w, 0);
+    detail::image(a, int(w.slice.global_shape[0]));
+    detail::require(c.valid_counts.size() == 3, "TP compact exact v2: three ownership counts required");
+    std::array<uint64_t, 3> valid{};
+    bool owned_cut = false;
+    int64_t begin = 0;
+    for (int rank = 0; rank < 3; ++rank) {
+        detail::require(c.valid_counts[rank] > 0 && c.valid_counts[rank] <= a.width - begin,
+                        "TP compact exact v2: invalid activation ownership");
+        valid[rank] = uint64_t(c.valid_counts[rank]);
+        owned_cut |= w.slice.range_start == begin && w.slice.range_end == begin + c.valid_counts[rank];
+        begin += c.valid_counts[rank];
+    }
+    detail::require(slot_width == compact_down_payload_width(w.ggml_type, a.width, valid) && owned_cut &&
+                    payload && stream && reinterpret_cast<std::uintptr_t>(payload) % alignof(float2) == 0,
+                    "TP compact exact v2: wrong payload width, shard cut or buffers");
+    const int qk = detail::block(w.ggml_type), nout = int(w.slice.global_shape[1]);
+    const int calls = int(w.slice.range_end - w.slice.range_start) / qk * 2;
+    const dim3 grid((nout + 3) / 4, a.rows), threads(32, 4);
+    if (w.ggml_type == 20)
+        down_lanes_compact_kernel<20><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const uint8_t*>(w.data), w.row_stride, static_cast<const uint8_t*>(a.data),
+            a.row_stride, reinterpret_cast<float2*>(payload), nout, int(w.slice.range_start), calls, slot_width / 2);
+    else
+        down_lanes_compact_kernel<42><<<grid, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const uint8_t*>(w.data), w.row_stride, static_cast<const uint8_t*>(a.data),
+            a.row_stride, reinterpret_cast<float2*>(payload), nout, int(w.slice.range_start), calls, slot_width / 2);
+    detail::check(cudaGetLastError());
+}
+
+void finish_down_lanes_compact(const float* payload, int type, int width, int nout, int rows,
+                               std::array<uint64_t, 3> valid, int slot_width, float* output, void* stream) {
+    detail::require(slot_width == compact_down_payload_width(type, width, valid),
+                    "TP compact exact v2: wrong uniform payload width");
+    detail::require(nout > 0 && nout <= std::numeric_limits<int>::max() - 3 && rows > 0 && rows <= 65535 &&
+                    payload && output && stream && reinterpret_cast<std::uintptr_t>(payload) % alignof(float2) == 0 &&
+                    reinterpret_cast<std::uintptr_t>(output) % alignof(float) == 0,
+                    "TP compact exact v2: invalid finish geometry/buffers");
+    const auto payload_begin = reinterpret_cast<std::uintptr_t>(payload);
+    const auto output_begin = reinterpret_cast<std::uintptr_t>(output);
+    const auto payload_bytes = std::size_t(3) * rows * nout * slot_width * sizeof(float);
+    const auto output_bytes = std::size_t(rows) * nout * sizeof(float);
+    detail::require(payload_begin <= std::numeric_limits<std::uintptr_t>::max() - payload_bytes &&
+                    output_begin <= std::numeric_limits<std::uintptr_t>::max() - output_bytes &&
+                    (payload_begin + payload_bytes <= output_begin || output_begin + output_bytes <= payload_begin),
+                    "TP compact exact v2: overlapping finish buffers");
+    const int qk = detail::block(type);
+    finish_lanes_compact_kernel<<<dim3((nout + 3) / 4, rows), dim3(32, 4), 0, static_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<const float2*>(payload), output, width / qk * 2, nout, rows,
+        int(valid[0]) / qk * 2, int(valid[0] + valid[1]) / qk * 2, slot_width / 2);
     detail::check(cudaGetLastError());
 }
 }  // namespace strata::kernels::tp::cuda

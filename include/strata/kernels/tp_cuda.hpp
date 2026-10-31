@@ -66,6 +66,22 @@ void finish_down_lanes(const float* rank_major_operands, int ggml_type,
                        int input_width, int output_width, int rows,
                        std::array<uint64_t, 3> valid_input, float* output, void* stream);
 
+// Opt-in exact operand representation v2. Each rank stores only its owned
+// calls, in original global-call order, then zero padding to the largest rank.
+// Layout [rank][rows][nout][slot_width floats], each call = [scale,integer_dot].
+// slot_width MUST equal this helper's result (2 * max(valid_input / block * 2)).
+// FF640 with cuts 256/192/192 uses 32 floats for IQ4_NL, 16 for Q2_0.
+// Gather bytes = 3 * rows * nout * slot_width * sizeof(float); global Q8_1
+// and hidden-state wire bytes are unchanged. No rounded products are sent.
+int compact_down_payload_width(int ggml_type, int input_width,
+                               std::array<uint64_t, 3> valid_input);
+void down_lanes_compact(const MatrixShard&, const distributed::ActivationContract&,
+                        const GlobalQ81&, float* operands, int slot_width, void* stream);
+void finish_down_lanes_compact(const float* rank_major_operands, int ggml_type,
+                               int input_width, int output_width, int rows,
+                               std::array<uint64_t, 3> valid_input, int slot_width,
+                               float* output, void* stream);
+
 // Gathered wire has [token][rank][wire_slots], h [token][sum(valid_counts)].
 // Padding is discarded before the global quantizer; buffers must not overlap.
 void unpack_gathered(const distributed::ActivationContract& contract, const float* wire,

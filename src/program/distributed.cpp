@@ -377,7 +377,7 @@ int main(int argc, char** argv) {
             "pack", "native", "ple", "context", "logits-dir", "logits-positions", "timeout-ms",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
             "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel", "profile-dir",
-            "collective-agreement", "service-state-dir", "timing-file"};
+            "collective-agreement", "service-state-dir", "timing-file", "expert-operands"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) || args.contains(key.substr(2)))
@@ -415,6 +415,10 @@ int main(int argc, char** argv) {
         const auto expert_collectives = args.contains("expert-collectives") ? args.at("expert-collectives") : "sequential";
         require(expert_collectives == "sequential" || expert_collectives == "batched", "invalid expert collective policy");
         const bool batched_experts = expert_collectives == "batched";
+        const auto expert_operands_value = args.contains("expert-operands") ? args.at("expert-operands") : "full";
+        require(expert_operands_value == "full" || expert_operands_value == "compact",
+                "invalid expert operand policy");
+        const bool compact_expert_operands = expert_operands_value == "compact";
         const auto agreement = args.contains("collective-agreement") ? args.at("collective-agreement") : "per-op";
         require(agreement == "per-op" || agreement == "step", "invalid collective agreement policy");
         const bool preagreed_collectives = agreement == "step";
@@ -563,6 +567,7 @@ int main(int argc, char** argv) {
         }
         if (multislot) join.config_fingerprint += ":multislot-v1:slots=" + std::to_string(parallel) +
                                                   ":context=" + std::to_string(context);
+        if (compact_expert_operands) join.config_fingerprint += ":expert-operands-v1:compact";
         join.backend_identity = "nccl"; join.nccl_version_expected = version; join.library_provenance = provenance;
         join.nccl_bootstrap_id = std::string(256, '0');
         if (rank == 0) require(make_nccl_bootstrap_id(nccl_config.library_path, join.nccl_bootstrap_id, err), err);
@@ -590,7 +595,7 @@ int main(int argc, char** argv) {
             NativeRoutedExperts experts(pack, native, geometry, int(rank), collectives,
                                          {256, 192, 192}, uint32_t(timeout), ExpertDownPolicy::ExactLaneReference,
                                          batched_experts ? ExpertCollectivePolicy::Batched : ExpertCollectivePolicy::Sequential,
-                                         graph_finish);
+                                         graph_finish, compact_expert_operands);
             PendingDmaExitGuard expert_lifetime(experts);
             std::cerr << "LOAD rank=" << rank << " stage=expert-shards" << std::endl;
             require(experts.initialize(err), err);
@@ -630,6 +635,7 @@ int main(int argc, char** argv) {
                 SlotPoolConfig pool_config{uint32_t(parallel), uint32_t(context), uint32_t(timeout),
                                             join.session_uuid, join.model_hash, uint32_t(rank), batched_experts, 0,
                                             preagreed_collectives};
+                pool_config.expert_operands = {compact_expert_operands, experts.valid_counts(), experts.down_codecs()};
                 SlotPool pool(pool_config, {weights, geometry, head, table, collectives, experts, session, transport,
                                             stream.value, [&] { return experts.requires_process_exit(); }});
                 PendingDmaExitGuard pool_lifetime(pool);
@@ -700,6 +706,8 @@ int main(int argc, char** argv) {
             }
             WorkerConfig worker_config{join.session_uuid, join.model_hash, uint32_t(rank)};
             ModelWorkerConfig model_worker_config{worker_config, stream.value, 0, batched_experts};
+            model_worker_config.expert_operands = {compact_expert_operands, experts.valid_counts(),
+                                                   experts.down_codecs()};
             model_worker_config.checkpoint_max_context = uint64_t(state.max_cells);
             model_worker_config.preagreed_collectives = preagreed_collectives;
             ModelWorkerBackend execution(model_worker_config, model, collectives, session, transport);

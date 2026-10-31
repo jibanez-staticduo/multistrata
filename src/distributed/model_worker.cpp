@@ -1,4 +1,5 @@
 #include "strata/distributed/model_worker.hpp"
+#include "strata/distributed/expert_operands.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -54,7 +55,8 @@ Failure canonical_step_command(const StepCommand& command, std::string& out) {
 }
 
 Failure model_forward_schedule(const StepCommand& command, const core::ModelGeometry& g, uint64_t sequence,
-                               std::vector<ScheduledCollective>& out, bool batched_expert_collectives) {
+                               std::vector<ScheduledCollective>& out, bool batched_expert_collectives,
+                               const ExpertOperandSchedule& expert_operands) {
     out.clear();
     if (static_cast<uint32_t>(command.phase) > static_cast<uint32_t>(StepPhase::rollback))
         return bad("unknown model step phase");
@@ -63,6 +65,17 @@ Failure model_forward_schedule(const StepCommand& command, const core::ModelGeom
         g.n_head != 24 || g.head_dim != 256) return bad("unsupported C1 model schedule geometry");
     if (command.phase != StepPhase::prefill && command.phase != StepPhase::decode) return {};
     if (command.tokens.empty() || command.tokens.size() > 8) return bad("model command supports one to eight tokens");
+    if (expert_operands.compact && expert_operands.down_codecs.size() != size_t(g.n_layers))
+        return bad("compact expert schedule requires per-rank ownership and one down codec per layer");
+    if (expert_operands.compact) {
+        for (const int type : expert_operands.down_codecs) {
+            try {
+                (void)compact_down_payload_width(type, int(g.n_ff), expert_operands.valid_counts);
+            } catch (...) {
+                return bad("invalid codec or ownership in compact expert schedule");
+            }
+        }
+    }
     const uint64_t count = uint64_t(command.tokens.size()) * uint64_t(g.n_layers) *
                            uint64_t(batched_expert_collectives ? 4 : 2 + 2 * g.n_expert_used);
     if (sequence == 0 || count > std::numeric_limits<uint64_t>::max() - sequence) return bad("model schedule sequence exhausted");
@@ -86,12 +99,29 @@ Failure model_forward_schedule(const StepCommand& command, const core::ModelGeom
             if (batched_expert_collectives) {
                 // Transport includes each row's padding; logical valid counts remain 256/192/192.
                 const uint64_t hidden = uint64_t(g.n_expert_used) * 256;
-                const uint64_t lanes = uint64_t(g.n_expert_used) * uint64_t(g.n_embd) * 128;
+                uint64_t lane_width = 128;
+                if (expert_operands.compact) {
+                    try {
+                        lane_width = uint64_t(compact_down_payload_width(expert_operands.down_codecs[size_t(layer)],
+                                                                        int(g.n_ff), expert_operands.valid_counts));
+                    } catch (...) { return bad("invalid compact expert schedule"); }
+                }
+                const uint64_t lanes = uint64_t(g.n_expert_used) * uint64_t(g.n_embd) * lane_width;
                 append(layer, "expert_hidden_batch", {hidden, hidden, hidden});
                 append(layer, "expert_lane_terms_batch", {lanes, lanes, lanes});
             } else for (int64_t slot = 0; slot < g.n_expert_used; ++slot) {
-                append(layer, "expert_hidden_" + std::to_string(slot), {256, 192, 192});
-                const uint64_t lanes = uint64_t(g.n_embd) * 128;
+                append(layer, "expert_hidden_" + std::to_string(slot),
+                       expert_operands.compact ?
+                           std::vector<uint64_t>(expert_operands.valid_counts.begin(), expert_operands.valid_counts.end()) :
+                           std::vector<uint64_t>{256, 192, 192});
+                uint64_t lane_width = 128;
+                if (expert_operands.compact) {
+                    try {
+                        lane_width = uint64_t(compact_down_payload_width(expert_operands.down_codecs[size_t(layer)],
+                                                                        int(g.n_ff), expert_operands.valid_counts));
+                    } catch (...) { return bad("invalid compact expert schedule"); }
+                }
+                const uint64_t lanes = uint64_t(g.n_embd) * lane_width;
                 append(layer, "expert_lane_terms_" + std::to_string(slot), {lanes, lanes, lanes});
             }
         }
@@ -222,7 +252,7 @@ Failure ModelWorkerBackend::plan(const StepCommand& command, std::vector<Schedul
             return bad("model token or position outside supported range");
     }
     return model_forward_schedule(command, p.model.geometry(), p.collectives.sequence(), out,
-                                  p.config.batched_expert_collectives);
+                                  p.config.batched_expert_collectives, p.config.expert_operands);
 }
 
 Failure ModelWorkerBackend::agree(const StepCommand& command) {

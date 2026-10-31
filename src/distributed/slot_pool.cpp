@@ -167,7 +167,8 @@ Failure SlotPool::initialize() {
             slot.model->native_head(&p.resources.head);
             WorkerConfig worker{c.session_uuid, c.model_hash, c.rank, index, &p.cursor};
             ModelWorkerConfig backend{worker, p.resources.stream, 0, c.batched_expert_collectives,
-                                       c.checkpoint_max_bytes, c.context, c.preagreed_collectives};
+                                       c.checkpoint_max_bytes, c.context, c.preagreed_collectives,
+                                       c.expert_operands};
             slot.backend = std::make_unique<ModelWorkerBackend>(backend, *slot.model, p.resources.collectives,
                               p.resources.session, p.resources.transport);
             slot.worker = std::make_unique<Worker>(worker, *slot.backend);

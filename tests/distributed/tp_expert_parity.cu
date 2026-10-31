@@ -17,6 +17,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -99,6 +100,7 @@ struct Options {
     bool roundoff_selftest = false;
     bool exact_lane = false;
     bool exact_lane_selftest = false;
+    bool compact_lane_selftest = false;
     double atol = 0, rtol = 0;
     int layer = 0, expert = 0;
     std::vector<std::string> gguf;
@@ -114,6 +116,7 @@ Options options(int argc, char** argv) {
         if (arg == "--roundoff-selftest") { o.roundoff_selftest = true; continue; }
         if (arg == "--exact-lane-reference") { o.exact_lane = true; continue; }
         if (arg == "--exact-lane-selftest") { o.exact_lane_selftest = true; continue; }
+        if (arg == "--compact-lane-selftest") { o.compact_lane_selftest = true; continue; }
         require(i + 1 < argc, "missing argument value");
         const std::string v = argv[++i];
         if (arg == "--atol") { o.atol = std::stod(v); atol = true; }
@@ -359,6 +362,41 @@ void exact_lane_selftest() {
     std::puts("exact-lane-host-ownership-and-FMA-selftest passed GPU_NOT_RUN");
     std::puts("finish-host-separate-rounding-vs-FMA-selftest passed GPU_NOT_RUN");
 }
+void compact_lane_selftest() {
+    for (int type : {20, 42}) for (int width : {192, 640, 1024}) {
+        const std::array<uint64_t, 3> counts = width == 192 ? std::array<uint64_t, 3>{64, 64, 64} :
+                                                width == 640 ? std::array<uint64_t, 3>{256, 192, 192} :
+                                                               std::array<uint64_t, 3>{384, 320, 320};
+        const int qk = block(type);
+        const int calls = width / qk * 2;
+        const int expected_slots = int(*std::max_element(counts.begin(), counts.end()) / qk) * 4;
+        require(tp::compact_down_payload_width(type, width, counts) == expected_slots,
+                "compact payload width formula mismatch");
+        if (width == 640)
+            require(expected_slots == (type == 20 ? 32 : 16), "FF640 compact payload width regression");
+
+        int call = 0;
+        for (int rank = 0; rank < 3; ++rank) {
+            const int rank_calls = int(counts[rank] / qk * 2);
+            for (int local_call = 0; local_call < rank_calls; ++local_call, ++call) {
+                require(call / 2 * qk >= int(std::accumulate(counts.begin(), counts.begin() + rank, uint64_t{0})) &&
+                        call / 2 * qk < int(std::accumulate(counts.begin(), counts.begin() + rank + 1, uint64_t{0})),
+                        "compact rank call range mismatch");
+                require(local_call == call - int(std::accumulate(counts.begin(), counts.begin() + rank, uint64_t{0}) / qk * 2),
+                        "compact local call mapping changed global call order");
+            }
+        }
+        require(call == calls, "compact ownership does not cover all global calls");
+    }
+    for (const auto invalid : {std::array<uint64_t, 3>{256, 192, 128},
+                               std::array<uint64_t, 3>{255, 193, 192}}) {
+        bool rejected = false;
+        try { (void)tp::compact_down_payload_width(20, 640, invalid); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "compact payload helper accepted invalid cuts");
+    }
+    std::puts("compact-lane-host-width-and-call-order-selftest passed GPU_NOT_RUN");
+}
 Sample sample_real(const Options& o) {
     std::vector<Tensor> all;
     for (const auto& p : o.gguf) { const auto ts = tensors(p); all.insert(all.end(), ts.begin(), ts.end()); }
@@ -469,6 +507,12 @@ void run_expert_batch(const Sample& sample, int seed, Metrics& metrics) {
     const auto lane_count = std::size_t(width) * tp::down_lane_payload_width;
     Device<float> lanes(3 * experts * lane_count), output(experts * width), sequential(output.size), oracle(output.size);
     Device<float> sequential_wire(3 * lane_count), one_wire(3 * gather.wire_slots);
+    const std::array<uint64_t, 3> valid{uint64_t(gather.valid_counts[0]), uint64_t(gather.valid_counts[1]),
+                                       uint64_t(gather.valid_counts[2])};
+    const int compact_width = tp::compact_down_payload_width(sample.down, ff, valid);
+    const auto compact_lane_count = std::size_t(width) * compact_width;
+    Device<float> compact_lanes(3 * experts * compact_lane_count), compact_output(output.size),
+                  compact_sequential(output.size), compact_sequential_wire(3 * compact_lane_count);
     wire.upload(std::vector<float>(wire.size, std::numeric_limits<float>::quiet_NaN()));
     std::vector<std::unique_ptr<Device<uint8_t>>> weights;
     // Row permutations select distinct expert planes without altering any quantized block bytes.
@@ -528,19 +572,28 @@ void run_expert_batch(const Sample& sample, int seed, Metrics& metrics) {
                 layout.bytes - layout.down_off - offset);
             tp::down_lanes(down, gather, hq, lanes.p + (rank * experts + expert) * lane_count, stream.s);
             tp::down_lanes(down, gather, sq, sequential_wire.p + rank * lane_count, stream.s);
+            tp::down_lanes_compact(down, gather, hq,
+                compact_lanes.p + (rank * experts + expert) * compact_lane_count, compact_width, stream.s);
+            tp::down_lanes_compact(down, gather, sq,
+                compact_sequential_wire.p + rank * compact_lane_count, compact_width, stream.s);
             begin = end;
         }
         tp::finish_down_lanes(sequential_wire.p, sample.down, ff, width, 1,
-            {uint64_t(gather.valid_counts[0]), uint64_t(gather.valid_counts[1]), uint64_t(gather.valid_counts[2])},
-            sequential.p + expert * width, stream.s);
+            valid, sequential.p + expert * width, stream.s);
+        tp::finish_down_lanes_compact(compact_sequential_wire.p, sample.down, ff, width, 1,
+            valid, compact_width, compact_sequential.p + expert * width, stream.s);
     }
     tp::finish_down_lanes(lanes.p, sample.down, ff, width, experts,
-        {uint64_t(gather.valid_counts[0]), uint64_t(gather.valid_counts[1]), uint64_t(gather.valid_counts[2])},
-        output.p, stream.s);
+        valid, output.p, stream.s);
+    tp::finish_down_lanes_compact(compact_lanes.p, sample.down, ff, width, experts,
+        valid, compact_width, compact_output.p, stream.s);
     ck(cudaStreamSynchronize(stream.s));
     require(hidden_q.read() == reference_q.read(), "batch10 global hidden Q8_1 bytes differ");
     metrics.compare("batch10-exact-operands-vs-sequential", sequential.read(), output.read(), true);
     metrics.compare("batch10-exact-operands-vs-native-experts", oracle.read(), output.read(), true);
+    metrics.compare("batch10-compact-vs-full-exact-operands", output.read(), compact_output.read(), true);
+    metrics.compare("batch10-compact-vs-sequential", sequential.read(), compact_sequential.read(), true);
+    metrics.compare("batch10-compact-vs-native-experts", oracle.read(), compact_output.read(), true);
     bool rejected = false;
     try { tp::unpack_expert_batch(gather, wire.p, experts, wire.p, stream.s); }
     catch (const std::invalid_argument&) { rejected = true; }
@@ -581,6 +634,10 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
     std::vector<float> poison(wire.size, std::numeric_limits<float>::quiet_NaN()); wire.upload(poison);
     std::array<std::unique_ptr<Device<float>>, 3> partials;
     Device<float> gathered_lanes(3 * std::size_t(rows) * width * tp::down_lane_payload_width);
+    const std::array<uint64_t, 3> valid{uint64_t(gather.valid_counts[0]), uint64_t(gather.valid_counts[1]),
+                                       uint64_t(gather.valid_counts[2])};
+    const int compact_width = tp::compact_down_payload_width(sample.down, ff, valid);
+    Device<float> gathered_compact_lanes(3 * std::size_t(rows) * width * compact_width);
     int begin = 0;
     for (int rank = 0; rank < 3; ++rank) {
         const int count = int(gather.valid_counts[rank]), end = begin + count;
@@ -646,6 +703,8 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
                  gather, h_image, partials[rank]->p, stream.s);
         tp::down_lanes(w, gather, h_image,
             gathered_lanes.p + rank * std::size_t(rows) * width * tp::down_lane_payload_width, stream.s);
+        tp::down_lanes_compact(w, gather, h_image,
+            gathered_compact_lanes.p + rank * std::size_t(rows) * width * compact_width, compact_width, stream.s);
         ck(cudaStreamSynchronize(stream.s));
         begin = end;
     }
@@ -661,16 +720,22 @@ void run(const Sample& sample, int rows, Metrics& metrics) {
     metrics.compare("rank-sum-vs-native-expert", oracle.read(), reduced.read(), false, &roundoff.error, &roundoff.norm,
                     metrics.o.exact_lane);
     Device<float> exact_output(oracle.size);
-    const std::array<uint64_t, 3> valid{uint64_t(gather.valid_counts[0]), uint64_t(gather.valid_counts[1]),
-                                       uint64_t(gather.valid_counts[2])};
     tp::finish_down_lanes(gathered_lanes.p, sample.down, ff, width, rows, valid, exact_output.p, stream.s);
     ck(cudaStreamSynchronize(stream.s));
     metrics.compare("exact-lane-vs-native-expert", oracle.read(), exact_output.read(), true);
-    Device<uint8_t> oracle_q(tp::global_q81_bytes(rows, width)), exact_q(oracle_q.size);
+    Device<float> compact_output(oracle.size);
+    tp::finish_down_lanes_compact(gathered_compact_lanes.p, sample.down, ff, width, rows, valid,
+                                  compact_width, compact_output.p, stream.s);
+    ck(cudaStreamSynchronize(stream.s));
+    metrics.compare("compact-exact-lane-vs-full-exact-operands", exact_output.read(), compact_output.read(), true);
+    metrics.compare("compact-exact-lane-vs-native-expert", oracle.read(), compact_output.read(), true);
+    Device<uint8_t> oracle_q(tp::global_q81_bytes(rows, width)), exact_q(oracle_q.size), compact_q(oracle_q.size);
     k::quantize_q8_1_rows(oracle.p, rows, width, oracle_q.p, stream.s);
     k::quantize_q8_1_rows(exact_output.p, rows, width, exact_q.p, stream.s);
+    k::quantize_q8_1_rows(compact_output.p, rows, width, compact_q.p, stream.s);
     ck(cudaStreamSynchronize(stream.s));
     require(oracle_q.read() == exact_q.read(), "exact lane output Q8_1 codes mismatch");
+    require(oracle_q.read() == compact_q.read(), "compact exact lane output Q8_1 codes mismatch");
     if (metrics.o.exact_lane) {
         ck(cudaMemcpyAsync(reduced.p, exact_output.p, oracle.size * sizeof(float), cudaMemcpyDeviceToDevice, stream.s));
     }
@@ -744,6 +809,7 @@ int main(int argc, char** argv) {
         const Options o = options(argc, argv);
         if (o.roundoff_selftest) { roundoff_selftest(); return 0; }
         if (o.exact_lane_selftest) { exact_lane_selftest(); return 0; }
+        if (o.compact_lane_selftest) { compact_lane_selftest(); return 0; }
         // These environment-only experiments bypass the selected ordinary
         // grouped control before its public setters take effect.
         for (const char* name : {"STRATA_EXPERT_V2", "STRATA_EXPERT_V2K", "STRATA_DOWN_WS"}) {

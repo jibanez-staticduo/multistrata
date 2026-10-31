@@ -5,6 +5,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::distributed {
 
@@ -30,7 +31,7 @@ public:
                         uint32_t readback_timeout_ms = 60000,
                         ExpertDownPolicy down_policy = ExpertDownPolicy::ExactLaneReference,
                         ExpertCollectivePolicy collective_policy = ExpertCollectivePolicy::Sequential,
-                        bool graph_finish = false);
+                        bool graph_finish = false, bool compact_operands = false);
     ~NativeRoutedExperts();
     NativeRoutedExperts(const NativeRoutedExperts&) = delete;
     NativeRoutedExperts& operator=(const NativeRoutedExperts&) = delete;
@@ -38,6 +39,8 @@ public:
     bool forward(int64_t layer, const float* input, const int* ids,
                  int64_t k, float* parts, void* stream, std::string& err) override;
     uint64_t owned_weight_bytes() const;
+    std::array<uint64_t, 3> valid_counts() const;
+    std::vector<int> down_codecs() const;
     // Partial compute graphs only: exact batched finish after lane all-gather.
     ExpertFinishGraphStats finish_graph_stats() const;
     bool requires_process_exit() const noexcept;

@@ -3,19 +3,29 @@
 #include "strata/distributed/worker.hpp"
 #include "strata/core/geometry.hpp"
 
+#include <array>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::distributed {
 
 class ModelForward;
 class SessionCollectives;
 
+struct ExpertOperandSchedule {
+    bool compact = false;
+    std::array<uint64_t, 3> valid_counts{256, 192, 192};
+    // One GGML down codec per model layer. Required by compact scheduling.
+    std::vector<int> down_codecs;
+};
+
 // Canonical exact bytes, bounded to one MiB. This is an agreement payload, not a hash and not a wire
 // decoder. It covers every StepCommand field including route labels and complete collective shapes.
 Failure canonical_step_command(const StepCommand&, std::string& out);
 Failure model_forward_schedule(const StepCommand&, const core::ModelGeometry&, uint64_t first_sequence,
-                               std::vector<ScheduledCollective>& out, bool batched_expert_collectives = false);
+                               std::vector<ScheduledCollective>& out, bool batched_expert_collectives = false,
+                               const ExpertOperandSchedule& expert_operands = {});
 
 struct ModelWorkerConfig {
     WorkerConfig worker;
@@ -26,6 +36,7 @@ struct ModelWorkerConfig {
     uint64_t checkpoint_max_bytes = uint64_t(1) << 30;
     uint64_t checkpoint_max_context = 0;
     bool preagreed_collectives = false;
+    ExpertOperandSchedule expert_operands;
 };
 
 // CUDA single-slot uncaptured bridge. Every slot owns a model; serialized slots may share collectives.

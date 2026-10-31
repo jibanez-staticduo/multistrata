@@ -94,12 +94,50 @@ void model_schedule() {
     check(batched.front().descriptor.operation.sequence == 100 &&
           batched.back().descriptor.operation.sequence == 291 &&
           batched[3 * 4].route == "qsa_gated_reference", "batched layer order and sequences");
+    ExpertOperandSchedule compact;
+    compact.compact = true;
+    compact.valid_counts = {128, 256, 256};
+    compact.down_codecs.assign(48, 20);
+    compact.down_codecs[1] = 42;
+    std::vector<ScheduledCollective> compact_schedule;
+    check(!model_forward_schedule(command, g, 100, compact_schedule, false, compact) &&
+          compact_schedule.size() == out.size(), "compact schedule keeps the sequential collective count");
+    check(compact_schedule[2].descriptor.valid_counts == std::vector<uint64_t>{128, 256, 256} &&
+          compact_schedule[3].descriptor.valid_counts == std::vector<uint64_t>{81920, 81920, 81920} &&
+          compact_schedule[2 + 22].descriptor.valid_counts == std::vector<uint64_t>{128, 256, 256} &&
+          compact_schedule[3 + 22].descriptor.valid_counts == std::vector<uint64_t>{40960, 40960, 40960},
+          "compact sequential schedule uses rank counts and each layer's codec width");
+    auto compact_batched = std::vector<ScheduledCollective>{};
+    check(!model_forward_schedule(command, g, 100, compact_batched, true, compact) &&
+          compact_batched[3].descriptor.valid_counts == std::vector<uint64_t>{819200, 819200, 819200} &&
+          compact_batched[4 + 3].descriptor.valid_counts == std::vector<uint64_t>{409600, 409600, 409600},
+          "compact batched schedule scales per-layer widths by expert count");
+    auto full_with_codec_metadata = ExpertOperandSchedule{};
+    full_with_codec_metadata.down_codecs = compact.down_codecs;
+    std::vector<ScheduledCollective> unchanged_full;
+    check(!model_forward_schedule(command, g, 100, unchanged_full, false, full_with_codec_metadata) &&
+          unchanged_full.size() == out.size() &&
+          unchanged_full[3].descriptor.valid_counts == out[3].descriptor.valid_counts &&
+          unchanged_full[3].descriptor.valid_counts == std::vector<uint64_t>{327680, 327680, 327680},
+          "codec metadata does not alter the default full operand schedule");
+    auto invalid_compact = compact;
+    invalid_compact.down_codecs[2] = 0;
+    check(bool(model_forward_schedule(command, g, 100, unchanged_full, false, invalid_compact)),
+          "unsupported compact codec is rejected before scheduling");
+    invalid_compact = compact;
+    invalid_compact.valid_counts = {128, 256, 192};
+    check(bool(model_forward_schedule(command, g, 100, unchanged_full, false, invalid_compact)),
+          "incomplete compact ownership is rejected before scheduling");
     auto sequential_command = command; sequential_command.expected_collective_schedule = out;
     auto batched_command = command; batched_command.expected_collective_schedule = batched;
+    auto compact_command = command; compact_command.expected_collective_schedule = compact_schedule;
     std::string sequential_bytes, batched_bytes;
     check(!canonical_step_command(sequential_command, sequential_bytes) &&
           !canonical_step_command(batched_command, batched_bytes) && sequential_bytes != batched_bytes,
           "collective policy participates in exact command agreement");
+    std::string compact_bytes;
+    check(!canonical_step_command(compact_command, compact_bytes) && compact_bytes != sequential_bytes,
+          "compact payload shapes participate in exact whole-command agreement");
     command.tokens.push_back(5); command.positions.push_back(1);
     check(!model_forward_schedule(command, g, 1, out) && out.size() == 2 * 48 * 22 &&
           out[48 * 22].descriptor.operation.layer == 0, "multi token prefill restarts all layers without reset sequence");

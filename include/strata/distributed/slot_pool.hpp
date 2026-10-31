@@ -20,6 +20,7 @@ struct SlotPoolConfig {
     bool batched_expert_collectives = false;
     uint64_t checkpoint_max_bytes = 0;
     bool preagreed_collectives = false;
+    ExpertOperandSchedule expert_operands;
 };
 struct SlotPoolResources {
     const core::WeightTable& weights;

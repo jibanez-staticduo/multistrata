@@ -114,6 +114,7 @@ struct NativeRoutedExperts::Impl {
     std::unique_ptr<FinishGraphs> finish_graphs;
     ExpertDownPolicy down_policy;
     ExpertCollectivePolicy collective_policy;
+    bool compact_operands;
     bool graph_finish;
     bool graph_failed = false;
     ActivationContract input_contract, hidden_contract;
@@ -124,14 +125,17 @@ struct NativeRoutedExperts::Impl {
 
     Impl(std::string pack_dir, std::string gguf, const core::ModelGeometry& g, int r,
          LayerCollectives& c, std::array<uint64_t, 3> counts, uint32_t timeout_ms, ExpertDownPolicy policy,
-         ExpertCollectivePolicy collect_policy, bool enable_graph_finish)
+         ExpertCollectivePolicy collect_policy, bool enable_graph_finish, bool use_compact_operands)
         : pack(std::move(pack_dir)), native(std::move(gguf)), geometry(g), rank(r), collective(c), valid(counts),
-          down_policy(policy), collective_policy(collect_policy), graph_finish(enable_graph_finish),
+          down_policy(policy), collective_policy(collect_policy), compact_operands(use_compact_operands),
+          graph_finish(enable_graph_finish),
           readback_timeout_ms(timeout_ms) {
         require(timeout_ms > 0 && timeout_ms <= 3600000,
                 "TP expert model: readback timeout must be in [1,3600000] ms");
         require(policy == ExpertDownPolicy::ExactLaneReference || policy == ExpertDownPolicy::PartialReduce,
                 "TP expert model: unknown down arithmetic policy");
+        require(!use_compact_operands || policy == ExpertDownPolicy::ExactLaneReference,
+                "TP compact expert operands require exact lane arithmetic");
         require(collect_policy == ExpertCollectivePolicy::Sequential || collect_policy == ExpertCollectivePolicy::Batched,
                 "TP expert model: unknown collective policy");
         require(collect_policy != ExpertCollectivePolicy::Batched || policy == ExpertDownPolicy::ExactLaneReference,
@@ -169,6 +173,7 @@ struct NativeRoutedExperts::Impl {
                 layout.bytes.size() == std::size_t(geometry.n_layers), "TP expert model: incomplete native layer table");
         // Validate every codec and the aggregate before any large allocation.
         uint64_t planned = 0;
+        std::size_t compact_lane_width = 0;
         UploadBackend upload_backend;
         core::NativeUpload<UploadBackend> upload(upload_backend);
         std::vector<uint8_t> compact_down;
@@ -183,6 +188,9 @@ struct NativeRoutedExperts::Impl {
             (void)codec(fmt.gu_type); (void)codec(fmt.d_type);
             require(fmt.gu_type != 20 && fmt.gu_type != 42 && (fmt.d_type == 20 || fmt.d_type == 42),
                     "TP expert model: unsupported codec roles");
+            if (compact_operands)
+                compact_lane_width = std::max(compact_lane_width,
+                    std::size_t(tp::compact_down_payload_width(fmt.d_type, int(geometry.n_ff), valid)));
             const uint64_t gu = valid[rank] * fmt.gu_row;
             const uint64_t down = uint64_t(geometry.n_embd) * kernels::iq_row_bytes(fmt.d_type, int64_t(valid[rank]));
             require(gu <= UINT64_MAX / 2 && 2 * gu <= UINT64_MAX - down &&
@@ -275,7 +283,9 @@ struct NativeRoutedExperts::Impl {
         hidden_q = Buffer(scratch_experts * tp::global_q81_bytes(1, int(geometry.n_ff)));
         partial = Buffer(geometry.n_embd * sizeof(float));
         if (down_policy == ExpertDownPolicy::ExactLaneReference) {
-            lane_terms = Buffer(scratch_experts * geometry.n_embd * tp::down_lane_payload_width * sizeof(float));
+            const auto lane_width = compact_operands ? compact_lane_width :
+                                    std::size_t(tp::down_lane_payload_width);
+            lane_terms = Buffer(scratch_experts * geometry.n_embd * lane_width * sizeof(float));
             lane_wire = Buffer(3 * lane_terms.bytes);
         }
         readback.initialize(std::size_t(geometry.n_expert_used));
@@ -300,9 +310,16 @@ struct NativeRoutedExperts::Impl {
                                               static_cast<cudaStream_t>(capture_stream)));
                         warmup = false;
                     }
-                    tp::finish_down_lanes(lane_wire.floats(), type, int(geometry.n_ff),
-                                          int(geometry.n_embd), int(geometry.n_expert_used), valid,
-                                          finish_graphs->output.floats(), capture_stream);
+                    if (compact_operands) {
+                        const auto lane_width = tp::compact_down_payload_width(type, int(geometry.n_ff), valid);
+                        tp::finish_down_lanes_compact(lane_wire.floats(), type, int(geometry.n_ff),
+                                                      int(geometry.n_embd), int(geometry.n_expert_used), valid,
+                                                      lane_width, finish_graphs->output.floats(), capture_stream);
+                    } else {
+                        tp::finish_down_lanes(lane_wire.floats(), type, int(geometry.n_ff),
+                                              int(geometry.n_embd), int(geometry.n_expert_used), valid,
+                                              finish_graphs->output.floats(), capture_stream);
+                    }
                 };
                 if (!finish_graphs->codecs[c].initialize(enqueue, readback_timeout_ms, why))
                     throw std::runtime_error("TP expert finish graph: " + why);
@@ -341,7 +358,10 @@ struct NativeRoutedExperts::Impl {
         if (collective_policy == ExpertCollectivePolicy::Batched) {
             const auto slots = uint64_t(hidden_contract.wire_slots);
             const auto qbytes = tp::global_q81_bytes(1, int(geometry.n_ff));
-            const auto lane_count = uint64_t(geometry.n_embd) * tp::down_lane_payload_width;
+            const auto lane_width = compact_operands ?
+                tp::compact_down_payload_width(layer.layout.d_type, int(geometry.n_ff), valid) :
+                tp::down_lane_payload_width;
+            const auto lane_count = uint64_t(geometry.n_embd) * uint64_t(lane_width);
             check(cudaMemsetAsync(local_hidden.data, 0, local_hidden.bytes, static_cast<cudaStream_t>(stream)));
             for (int64_t i = 0; i < k; ++i) {
                 const auto expert = std::size_t(readback.ids[i]);
@@ -360,7 +380,12 @@ struct NativeRoutedExperts::Impl {
                 const auto hq = tp::quantize_global(hidden_contract, hidden.floats() + i * geometry.n_ff,
                     1, int(geometry.n_ff), hidden_q.byte() + i * qbytes, qbytes, stream);
                 layer.down_view.data = layer.down.byte() + std::size_t(readback.ids[i]) * layer.down_bytes;
-                tp::down_lanes(layer.down_view, hidden_contract, hq, lane_terms.floats() + i * lane_count, stream);
+                if (compact_operands)
+                    tp::down_lanes_compact(layer.down_view, hidden_contract, hq,
+                                           lane_terms.floats() + i * lane_count, lane_width, stream);
+                else
+                    tp::down_lanes(layer.down_view, hidden_contract, hq,
+                                   lane_terms.floats() + i * lane_count, stream);
             }
             const auto count = uint64_t(k) * lane_count;
             if (!collective.gather(index, "expert_lane_terms_batch", lane_terms.floats(), lane_wire.floats(),
@@ -372,8 +397,12 @@ struct NativeRoutedExperts::Impl {
                 check(cudaMemcpyAsync(parts, finish_graphs->output.data, finish_graphs->output.bytes,
                                       cudaMemcpyDeviceToDevice, static_cast<cudaStream_t>(stream)));
             } else {
-                tp::finish_down_lanes(lane_wire.floats(), layer.layout.d_type, int(geometry.n_ff),
-                                      int(geometry.n_embd), int(k), valid, parts, stream);
+                if (compact_operands)
+                    tp::finish_down_lanes_compact(lane_wire.floats(), layer.layout.d_type, int(geometry.n_ff),
+                                                  int(geometry.n_embd), int(k), valid, lane_width, parts, stream);
+                else
+                    tp::finish_down_lanes(lane_wire.floats(), layer.layout.d_type, int(geometry.n_ff),
+                                          int(geometry.n_embd), int(k), valid, parts, stream);
             }
             return true;
         }
@@ -391,13 +420,25 @@ struct NativeRoutedExperts::Impl {
             const auto hq = tp::quantize_global(hidden_contract, hidden.floats(), 1, int(geometry.n_ff),
                                                 hidden_q.data, hidden_q.bytes, stream);
             if (down_policy == ExpertDownPolicy::ExactLaneReference) {
-                tp::down_lanes(layer.down_view, hidden_contract, hq, lane_terms.floats(), stream);
-                const uint64_t count = uint64_t(geometry.n_embd) * tp::down_lane_payload_width;
+                const auto lane_width = compact_operands ?
+                    tp::compact_down_payload_width(layer.layout.d_type, int(geometry.n_ff), valid) :
+                    tp::down_lane_payload_width;
+                if (compact_operands)
+                    tp::down_lanes_compact(layer.down_view, hidden_contract, hq, lane_terms.floats(),
+                                           lane_width, stream);
+                else
+                    tp::down_lanes(layer.down_view, hidden_contract, hq, lane_terms.floats(), stream);
+                const uint64_t count = uint64_t(geometry.n_embd) * uint64_t(lane_width);
                 std::snprintf(stage, sizeof(stage), "expert_lane_terms_%lld", static_cast<long long>(i));
                 if (!collective.gather(index, stage, lane_terms.floats(), lane_wire.floats(),
                                        {count, count, count}, stream, err)) return false;
-                tp::finish_down_lanes(lane_wire.floats(), layer.layout.d_type, int(geometry.n_ff),
-                                      int(geometry.n_embd), 1, valid, parts + i * geometry.n_embd, stream);
+                if (compact_operands)
+                    tp::finish_down_lanes_compact(lane_wire.floats(), layer.layout.d_type, int(geometry.n_ff),
+                                                  int(geometry.n_embd), 1, valid, lane_width,
+                                                  parts + i * geometry.n_embd, stream);
+                else
+                    tp::finish_down_lanes(lane_wire.floats(), layer.layout.d_type, int(geometry.n_ff),
+                                          int(geometry.n_embd), 1, valid, parts + i * geometry.n_embd, stream);
             } else {
                 tp::down(layer.down_view, hidden_contract, hq, partial.floats(), stream);
                 std::snprintf(stage, sizeof(stage), "expert_output_%lld", static_cast<long long>(i));
@@ -418,9 +459,11 @@ struct NativeRoutedExperts::Impl {
 NativeRoutedExperts::NativeRoutedExperts(std::string pack, std::string native, const core::ModelGeometry& geometry,
                                        int rank, LayerCollectives& collective, std::array<uint64_t, 3> valid,
                                        uint32_t readback_timeout_ms, ExpertDownPolicy down_policy,
-                                       ExpertCollectivePolicy collective_policy, bool graph_finish)
+                                       ExpertCollectivePolicy collective_policy, bool graph_finish,
+                                       bool compact_operands)
     : impl_(std::make_unique<Impl>(std::move(pack), std::move(native), geometry, rank, collective, valid,
-                                   readback_timeout_ms, down_policy, collective_policy, graph_finish)) {}
+                                   readback_timeout_ms, down_policy, collective_policy, graph_finish,
+                                   compact_operands)) {}
 NativeRoutedExperts::~NativeRoutedExperts() {
     // A bounded CUDA failure cannot be followed by cudaFree on captured buffers
     // that the GPU may still use. The worker owner must _Exit in this state.
@@ -439,6 +482,13 @@ bool NativeRoutedExperts::forward(int64_t layer, const float* input, const int* 
     } catch (const std::exception& e) { impl_->poison_graphs(); err = e.what(); return false; }
 }
 uint64_t NativeRoutedExperts::owned_weight_bytes() const { return impl_->owned; }
+std::array<uint64_t, 3> NativeRoutedExperts::valid_counts() const { return impl_->valid; }
+std::vector<int> NativeRoutedExperts::down_codecs() const {
+    std::vector<int> result;
+    result.reserve(impl_->layers.size());
+    for (const auto& layer : impl_->layers) result.push_back(layer.layout.d_type);
+    return result;
+}
 ExpertFinishGraphStats NativeRoutedExperts::finish_graph_stats() const {
     ExpertFinishGraphStats stats;
     if (impl_->finish_graphs) {
