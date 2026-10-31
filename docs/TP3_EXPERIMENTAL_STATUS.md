@@ -159,6 +159,25 @@ succeeds with both methods, so the driver's underlying cause remains unknown.
 The successful launch also advises away clean verified model file-cache pages
 after hashing; CUDA's resident-expert budget check remains enforced.
 
+## Native RoCEnante transport checks
+
+The separate opt-in native CUDA/C proxy transport passes a three-host smoke:
+each rank checks 18 FP32/BF16 reductions, two padded gathers and 100 graph
+replays with three operation sizes, then exits 0. This uses the existing
+private authenticated roster and direct RoCE links with an IPv4 RoCEv2 GID
+selected independently for each HCA. [The smoke receipt][rocesmoke] records
+its limits: payload bytes must be divisible by 16, and these runs overlap a
+correctness run, so their timings do not establish performance.
+
+A missing-rank injection ends both joining ranks within 10.4 seconds. Killing
+a peer after operation agreement ends the other processes within 14.3 seconds,
+with no passing result. [Fault receipts][rocefaults] cover eager standalone
+failure; graph fault injection and model integration remain unqualified.
+The first attempts failed before payload execution because of GID selection,
+an old staged binary, or the follower coordinator address. They are retained.
+NCCL remains the default model transport. The hybrid model path is opt-in and
+keeps reductions on NCCL; it requires its own full-model comparison.
+
 ## Failed attempts retained
 
 Early component and whole-model runs failed numerical gates; their original
@@ -215,3 +234,6 @@ files with this report when sharing it; the links are not public downloads.
 
 [longreference]: /home/staticduo/tmp/strata-tp3-20261031/long-context/65792/reference-summary.json
 [compactmodel]: /home/staticduo/tmp/strata-tp3-20261031/compact-short/independent-qualification.json
+
+[rocesmoke]: /home/staticduo/tmp/strata-tp3-20261031/roce-qualified/retry4-autogid/summary.json
+[rocefaults]: /home/staticduo/tmp/strata-tp3-20261031/roce-qualified/fault-summary.json
