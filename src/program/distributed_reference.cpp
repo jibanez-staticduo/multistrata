@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
     try {
         std::map<std::string, std::string> args;
         const std::set<std::string> allowed = {"pack", "native", "ple", "context", "logits-dir", "logits-positions",
-            "state-dir", "state-positions", "state-max-bytes", "trace-dir"};
+            "state-dir", "state-positions", "state-max-bytes", "trace-dir", "expert-residency"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) ||
@@ -128,6 +128,9 @@ int main(int argc, char** argv) {
             require(status == std::errc{} && end == text.data() + text.size(), "invalid --context");
         }
         require(context >= 4 && context <= 1048576, "context must be in [4, 1048576]");
+        const auto residency_text = args.contains("expert-residency") ? args.at("expert-residency") : "selected";
+        require(residency_text == "all" || residency_text == "selected", "--expert-residency must be all or selected");
+        const auto residency = residency_text == "all" ? ExpertResidency::AllResident : ExpertResidency::SelectedStaging;
         const bool selected_logits = args.contains("logits-positions");
         require(!selected_logits || args.contains("logits-dir"), "--logits-positions requires --logits-dir");
         const auto logits_positions = selected_logits ?
@@ -221,7 +224,7 @@ int main(int argc, char** argv) {
         require(table.open(ple, err, ple_io), err);
         std::vector<float> ple_host;
         wire_ple(weights, state, table, ple_embedding, ple_scratch, ple_host);
-        MonolithicReference model(weights, geometry, state, pack, native);
+        MonolithicReference model(weights, geometry, state, pack, native, 60000, residency);
         model.native_head(&head);
         std::unique_ptr<ParityTraceWriter> trace;
         if (args.contains("trace-dir")) {
@@ -261,10 +264,12 @@ int main(int argc, char** argv) {
                       << " directory=" << directory.string() << '\n';
         };
         dump_state(true);
-        std::cout << "READY rank=0 tp=1 pp=1 layers=48 c=1 oracle=monolithic staging=selected-experts"
+        std::cout << "READY rank=0 tp=1 pp=1 layers=48 c=1 oracle=monolithic staging="
+                  << (residency == ExpertResidency::AllResident ? "resident-experts" : "selected-experts")
+                  << " residency=" << residency_text << " owned_weight_bytes=" << model.owned_weight_bytes() <<
                      " gdn=native-unfused qsa=gather-reference select=block gr=native-bf16-mmvf"
                      " expert-activation=Q8_1 grouped=v1 iq-kernels=old expert-mode=0 expdec=0"
-                     " benchmark=unsupported";
+                     " benchmark=" << (residency == ExpertResidency::AllResident ? "matched-policy-candidate" : "unsupported");
         if (selected_logits) std::cout << " logits_positions=" << args.at("logits-positions")
                                        << " logits_last=gen-segment";
         std::cout << '\n';

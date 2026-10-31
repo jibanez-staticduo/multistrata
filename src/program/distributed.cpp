@@ -83,6 +83,23 @@ struct Event {
     ~Event() { if (value) cudaEventDestroy(value); }
 };
 
+void write_profile(const SessionCollectives& collectives, const std::string& directory, uint32_t rank) {
+    std::filesystem::create_directories(directory);
+    const auto path = std::filesystem::path(directory) / ("rank" + std::to_string(rank) + ".csv");
+    require(!std::filesystem::exists(path), "profile output must be fresh");
+    std::ofstream file(path);
+    file << "layer,collective_calls,completed_collectives,route_calls,route_pending_polls,input_bytes,output_bytes,"
+            "stage_metadata_ns,operation_agreement_ns,enqueue_ns,wait_ns,route_readback_ns,route_agreement_ns\n";
+    for (size_t i = 0; i < collectives.profile().size(); ++i) {
+        const auto& row = collectives.profile()[i];
+        file << i << ',' << row.collective_calls << ',' << row.completed_collectives << ',' << row.route_calls << ','
+             << row.route_pending_polls << ',' << row.input_bytes << ',' << row.output_bytes << ','
+             << row.stage_metadata_ns << ',' << row.operation_agreement_ns << ',' << row.enqueue_ns << ','
+             << row.wait_ns << ',' << row.route_readback_ns << ',' << row.route_agreement_ns << '\n';
+    }
+    require(bool(file), "cannot publish profile output");
+}
+
 class JsonInput {
  public:
     JsonInput() {
@@ -315,7 +332,7 @@ int main(int argc, char** argv) {
             "library-path", "nccl-version", "library-provenance", "model-hash", "config-fingerprint",
             "pack", "native", "ple", "context", "logits-dir", "logits-positions", "timeout-ms",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
-            "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel"};
+            "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel", "profile-dir"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) || args.contains(key.substr(2)))
@@ -512,6 +529,7 @@ int main(int argc, char** argv) {
         require(nccl_backend.init());
         try {
             SessionCollectives collectives(session, transport, clock, uint32_t(timeout));
+            collectives.profile(args.contains("profile-dir"));
             NativeRoutedExperts experts(pack, native, geometry, int(rank), collectives,
                                          {256, 192, 192}, uint32_t(timeout), ExpertDownPolicy::ExactLaneReference,
                                          batched_experts ? ExpertCollectivePolicy::Batched : ExpertCollectivePolicy::Sequential,
@@ -782,6 +800,7 @@ int main(int argc, char** argv) {
             }
             }
             }
+            if (args.contains("profile-dir")) write_profile(collectives, args.at("profile-dir"), uint32_t(rank));
             transport.abort("driver finished");
             require(session.close());
         } catch (...) { transport.abort("model worker failed"); session.abort("model worker failed"); throw; }

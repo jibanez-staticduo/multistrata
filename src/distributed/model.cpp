@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 #include <vector>
 
@@ -20,6 +21,18 @@ struct DeviceMemory {
     void* data = nullptr;
     ~DeviceMemory() { if (data) cudaFree(data); }
     void allocate(size_t bytes) { checked(cudaMalloc(&data, bytes)); }
+};
+// A null counter takes no timestamps, keeping disabled profiling off the clock path.
+struct ProfileSpan {
+    uint64_t* counter;
+    std::chrono::steady_clock::time_point start{};
+    explicit ProfileSpan(uint64_t* value) : counter(value) {
+        if (counter) start = std::chrono::steady_clock::now();
+    }
+    ~ProfileSpan() {
+        if (counter) *counter += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count());
+    }
 };
 #ifdef STRATA_MODEL_CHECKPOINT_WITH_CUDA
 struct CheckpointIo {
@@ -72,18 +85,25 @@ bool SessionCollectives::agree_routes(int64_t layer, const int* ids, int64_t k,
     Deadline deadline;
     if (const auto f = session_.operation_deadline(deadline)) { err = f.detail; return false; }
     deadline.end = std::min(deadline.end, clock_.now() + std::chrono::milliseconds(timeout_ms_));
-    auto status = cudaMemcpyAsync(host.data(), ids, sizeof(host), cudaMemcpyDeviceToHost,
-                                   static_cast<cudaStream_t>(stream));
-    if (status != cudaSuccess) { err = cudaGetErrorString(status); return false; }
-    for (;;) {
-        status = cudaStreamQuery(static_cast<cudaStream_t>(stream));
-        if (status == cudaSuccess) break;
-        if (status != cudaErrorNotReady || deadline_passed(clock_, deadline)) {
-            err = "TP route readback failed or exceeded deadline";
-            session_.abort(err); transport_.abort(err); return false;
+    auto* stats = profiling_ && layer >= 0 && uint64_t(layer) < profile_.size() ? &profile_[size_t(layer)] : nullptr;
+    if (stats) ++stats->route_calls;
+    {
+        ProfileSpan timing(stats ? &stats->route_readback_ns : nullptr);
+        auto status = cudaMemcpyAsync(host.data(), ids, sizeof(host), cudaMemcpyDeviceToHost,
+                                       static_cast<cudaStream_t>(stream));
+        if (status != cudaSuccess) { err = cudaGetErrorString(status); return false; }
+        for (;;) {
+            status = cudaStreamQuery(static_cast<cudaStream_t>(stream));
+            if (status == cudaSuccess) break;
+            if (status != cudaErrorNotReady || deadline_passed(clock_, deadline)) {
+                err = "TP route readback failed or exceeded deadline";
+                session_.abort(err); transport_.abort(err); return false;
+            }
+            if (stats) ++stats->route_pending_polls;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    ProfileSpan timing(stats ? &stats->route_agreement_ns : nullptr);
     std::string payload = std::to_string(step_) + ":" + std::to_string(layer) + ":";
     for (const int id : host) payload += std::to_string(id) + ":";
     if (const auto f = session_.agree_control_payload("routes-v1", payload, deadline)) {
@@ -105,24 +125,44 @@ bool SessionCollectives::execute(CollectiveDescriptor d, const char* stage, cons
     Deadline deadline;
     if (const auto f = session_.operation_deadline(deadline)) { err = f.detail; return false; }
     deadline.end = std::min(deadline.end, clock_.now() + std::chrono::milliseconds(timeout_ms_));
-    const std::string stage_payload = actual + ":" + std::to_string(std::char_traits<char>::length(stage)) + ":" + stage;
-    if (const auto f = session_.agree_control_payload("model-stage-v1", stage_payload, deadline)) {
-        err = f.detail; transport_.abort(err); return false;
+    auto* stats = profiling_ && d.operation.layer < profile_.size() ? &profile_[size_t(d.operation.layer)] : nullptr;
+    if (stats) {
+        ++stats->collective_calls;
+        stats->input_bytes += d.elements * sizeof(float);
+        stats->output_bytes += d.elements * sizeof(float) *
+                               (d.kind == CollectiveKind::all_gather_padded ? 3 : 1);
     }
-    if (const auto f = session_.agree_operation(d, deadline)) { err = f.detail; return false; }
+    {
+        ProfileSpan timing(stats ? &stats->stage_metadata_ns : nullptr);
+        const std::string stage_payload = actual + ":" + std::to_string(std::char_traits<char>::length(stage)) + ":" + stage;
+        if (const auto f = session_.agree_control_payload("model-stage-v1", stage_payload, deadline)) {
+            err = f.detail; transport_.abort(err); return false;
+        }
+    }
+    {
+        ProfileSpan timing(stats ? &stats->operation_agreement_ns : nullptr);
+        if (const auto f = session_.agree_operation(d, deadline)) { err = f.detail; return false; }
+    }
     Failure f;
-    if (d.kind == CollectiveKind::all_reduce_sum)
-        f = transport_.all_reduce_sum({const_cast<float*>(in), d.elements, ScalarType::fp32},
-                                     {out, d.elements, ScalarType::fp32}, d.operation,
-                                     static_cast<cudaStream_t>(stream));
-    else
-        f = transport_.all_gather_padded({const_cast<float*>(in), d.elements, ScalarType::fp32},
-                                        {out, 3 * d.elements, ScalarType::fp32}, d.valid_counts,
-                                        d.operation, static_cast<cudaStream_t>(stream));
-    if (!f) f = transport_.wait(deadline);
+    {
+        ProfileSpan timing(stats ? &stats->enqueue_ns : nullptr);
+        if (d.kind == CollectiveKind::all_reduce_sum)
+            f = transport_.all_reduce_sum({const_cast<float*>(in), d.elements, ScalarType::fp32},
+                                         {out, d.elements, ScalarType::fp32}, d.operation,
+                                         static_cast<cudaStream_t>(stream));
+        else
+            f = transport_.all_gather_padded({const_cast<float*>(in), d.elements, ScalarType::fp32},
+                                            {out, 3 * d.elements, ScalarType::fp32}, d.valid_counts,
+                                            d.operation, static_cast<cudaStream_t>(stream));
+    }
+    if (!f) {
+        ProfileSpan timing(stats ? &stats->wait_ns : nullptr);
+        f = transport_.wait(deadline);
+    }
     if (f) { err = f.detail; session_.abort(f.detail); return false; }
     if (const auto complete = session_.complete_operation(d.operation)) { err = complete.detail; return false; }
     ++sequence_;
+    if (stats) ++stats->completed_collectives;
     return true;
 }
 

@@ -41,6 +41,15 @@ struct HostBuffer {
     void allocate(size_t bytes) { check(cudaHostAlloc(&data, bytes, cudaHostAllocDefault)); }
     uint8_t* bytes() const { return static_cast<uint8_t*>(data); }
 };
+struct PinnedUploadBackend {
+    using Error = cudaError_t;
+    static constexpr Error success = cudaSuccess;
+    Error allocate(void** p, size_t bytes) { return cudaMallocHost(p, bytes); }
+    void release(void* p) { (void)cudaFreeHost(p); }
+    Error copy(void* dst, const void* src, size_t bytes) {
+        return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    }
+};
 } // namespace
 
 struct MonolithicReference::Impl : core::DistributedLayerHooks {
@@ -54,8 +63,11 @@ struct MonolithicReference::Impl : core::DistributedLayerHooks {
     core::SessionState& state;
     std::string pack, native;
     uint32_t timeout_ms;
+    ExpertResidency residency;
     std::map<std::string, std::unique_ptr<GgufFile>> files;
     std::vector<Layer> layers;
+    std::vector<std::unique_ptr<DeviceBuffer>> resident_layers;
+    uint64_t expert_weight_bytes = 0;
     DeviceBuffer blobs, metadata, activation, scratch, embedding, parts;
     HostBuffer host_blobs, host_metadata;
     cudaEvent_t event = nullptr;
@@ -67,8 +79,9 @@ struct MonolithicReference::Impl : core::DistributedLayerHooks {
     int64_t position = 0;
 
     Impl(const core::WeightTable& w, const core::ModelGeometry& g, core::SessionState& s,
-         std::string p, std::string n, uint32_t ms)
-        : weights(w), geometry(g), state(s), pack(std::move(p)), native(std::move(n)), timeout_ms(ms) {}
+         std::string p, std::string n, uint32_t ms, ExpertResidency r)
+        : weights(w), geometry(g), state(s), pack(std::move(p)), native(std::move(n)), timeout_ms(ms),
+          residency(r) {}
     ~Impl() { if (event) cudaEventDestroy(event); }
 
     void complete(void* stream) {
@@ -87,6 +100,8 @@ struct MonolithicReference::Impl : core::DistributedLayerHooks {
 
     void initialize() {
         require(!ready && layers.empty(), "TP1 reference: initialize called twice");
+        require(residency == ExpertResidency::SelectedStaging || residency == ExpertResidency::AllResident,
+                "TP1 reference: invalid expert residency policy");
         require(timeout_ms >= 100 && timeout_ms <= 600000 && geometry.n_vocab == 248320 &&
                 geometry.n_layers == 48 && geometry.n_expert_used == 10 && geometry.n_expert == 512 &&
                 geometry.n_embd == 2560 && geometry.n_ff == 640 && state.k == 10 &&
@@ -149,18 +164,57 @@ struct MonolithicReference::Impl : core::DistributedLayerHooks {
             layers.push_back(layer);
         }
         const size_t k = size_t(state.k);
-        blobs.allocate(k * slot_bytes); host_blobs.allocate(k * slot_bytes);
         // Matching host/device offsets: pointers, starts, count, destinations,
         // token indices, and the routed IDs copied back before staging.
         const size_t meta_bytes = k * sizeof(unsigned long long) + (4 * k + 2) * sizeof(int32_t);
+        const size_t activation_bytes = size_t(geometry.n_embd / 32) * 36;
+        const size_t scratch_bytes = kernels::native_expert_scratch_bytes(state.k, geometry.n_ff);
+        const size_t embedding_bytes = size_t(geometry.n_embd) * sizeof(float);
+        const size_t parts_bytes = k * size_t(geometry.n_embd) * sizeof(float);
+        if (residency == ExpertResidency::AllResident) {
+            std::vector<size_t> slots;
+            for (const auto& layer : layers) slots.push_back(layer.format.bytes);
+            const auto plan = ReferenceResidencyPlan::all(slots, size_t(geometry.n_expert));
+            // Dense/head/PLE and session allocations already exist. On unified
+            // memory hardware cudaMemGetInfo describes the same physical pool.
+            size_t free_bytes = 0, total_bytes = 0;
+            check(cudaMemGetInfo(&free_bytes, &total_bytes));
+            auto buffers = ReferenceResidencyPlan::add(meta_bytes, activation_bytes);
+            buffers = ReferenceResidencyPlan::add(buffers, scratch_bytes);
+            buffers = ReferenceResidencyPlan::add(buffers, embedding_bytes);
+            buffers = ReferenceResidencyPlan::add(buffers, parts_bytes);
+            // The driver creates its logits output after model initialization.
+            buffers = ReferenceResidencyPlan::add(buffers, size_t(geometry.n_vocab) * sizeof(float));
+            buffers = ReferenceResidencyPlan::add(buffers, meta_bytes);
+            buffers = ReferenceResidencyPlan::add(buffers, core::NativeUpload<PinnedUploadBackend>::capacity);
+            const auto required_bytes = plan.required_bytes(buffers);
+            if (required_bytes > free_bytes)
+                throw std::runtime_error("TP1 reference: all-resident experts require " +
+                    std::to_string(required_bytes) + " additional bytes; CUDA free=" +
+                    std::to_string(free_bytes) + " total=" + std::to_string(total_bytes));
+            PinnedUploadBackend backend;
+            core::NativeUpload<PinnedUploadBackend> upload(backend);
+            for (size_t i = 0; i < layers.size(); ++i) {
+                auto buffer = std::make_unique<DeviceBuffer>();
+                buffer->allocate(plan.layer_bytes[i]);
+                const auto& layer = layers[i];
+                check(upload_reference_experts(upload, buffer->bytes(), size_t(geometry.n_expert),
+                    layer.format.bytes, layer.role, layer.role_bytes));
+                resident_layers.push_back(std::move(buffer));
+            }
+            expert_weight_bytes = plan.owned_weight_bytes;
+        } else {
+            blobs.allocate(k * slot_bytes); host_blobs.allocate(k * slot_bytes);
+            expert_weight_bytes = k * slot_bytes;
+        }
         metadata.allocate(meta_bytes); host_metadata.allocate(meta_bytes);
         pointers = reinterpret_cast<unsigned long long*>(metadata.data);
         starts = reinterpret_cast<int32_t*>(pointers + k); groups = starts + k + 1;
         destinations = groups + 1; tokens = destinations + k; ids = tokens + k;
-        activation.allocate(size_t(geometry.n_embd / 32) * 36);
-        scratch.allocate(kernels::native_expert_scratch_bytes(state.k, geometry.n_ff));
-        embedding.allocate(size_t(geometry.n_embd) * sizeof(float));
-        parts.allocate(k * size_t(geometry.n_embd) * sizeof(float));
+        activation.allocate(activation_bytes);
+        scratch.allocate(scratch_bytes);
+        embedding.allocate(embedding_bytes);
+        parts.allocate(parts_bytes);
         check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
         ready = true;
     }
@@ -197,19 +251,25 @@ struct MonolithicReference::Impl : core::DistributedLayerHooks {
                     "TP1 reference: routed expert ID outside original model");
             for (size_t j = 0; j < i; ++j)
                 require(selected[i] != selected[j], "TP1 reference: duplicate routed expert ID");
-            for (int role = 0; role < 3; ++role)
-                std::memcpy(host_blobs.bytes() + i * slot_bytes + offsets[role],
-                            layer.role[role] + size_t(selected[i]) * layer.role_bytes[role],
-                            layer.role_bytes[role]);
-            ptr[i] = reinterpret_cast<unsigned long long>(blobs.bytes() + i * slot_bytes);
+            if (residency == ExpertResidency::AllResident) {
+                ptr[i] = reinterpret_cast<unsigned long long>(resident_layers[size_t(layer_index)]->bytes() +
+                    size_t(selected[i]) * layer.format.bytes);
+            } else {
+                for (int role = 0; role < 3; ++role)
+                    std::memcpy(host_blobs.bytes() + i * slot_bytes + offsets[role],
+                                layer.role[role] + size_t(selected[i]) * layer.role_bytes[role],
+                                layer.role_bytes[role]);
+                ptr[i] = reinterpret_cast<unsigned long long>(blobs.bytes() + i * slot_bytes);
+            }
             start[i] = int32_t(i); dst[i] = int32_t(i); tok[i] = 0;
         }
         start[k] = int32_t(k); *count = int32_t(k);
         check(cudaMemcpyAsync(metadata.data, host_metadata.data, size_t(ids_offset), cudaMemcpyHostToDevice,
                               static_cast<cudaStream_t>(stream)));
-        for (size_t i = 0; i < k; ++i)
-            check(cudaMemcpyAsync(blobs.bytes() + i * slot_bytes, host_blobs.bytes() + i * slot_bytes,
-                                  layer.format.bytes, cudaMemcpyHostToDevice, static_cast<cudaStream_t>(stream)));
+        if (residency == ExpertResidency::SelectedStaging)
+            for (size_t i = 0; i < k; ++i)
+                check(cudaMemcpyAsync(blobs.bytes() + i * slot_bytes, host_blobs.bytes() + i * slot_bytes,
+                                      layer.format.bytes, cudaMemcpyHostToDevice, static_cast<cudaStream_t>(stream)));
         kernels::quantize_q8_1_rows(state.block.mixed, 1, geometry.n_embd, activation.data, stream);
         kernels::native_expert_grouped(layer.format, pointers, starts, groups, destinations, tokens,
                                        state.k, state.k, activation.data, scratch.data, parts.floats(), stream);
@@ -217,8 +277,9 @@ struct MonolithicReference::Impl : core::DistributedLayerHooks {
 };
 
 MonolithicReference::MonolithicReference(const core::WeightTable& w, const core::ModelGeometry& g,
-                                         core::SessionState& s, std::string pack, std::string native, uint32_t ms)
-    : impl_(std::make_unique<Impl>(w, g, s, std::move(pack), std::move(native), ms)) {}
+                                         core::SessionState& s, std::string pack, std::string native, uint32_t ms,
+                                         ExpertResidency residency)
+    : impl_(std::make_unique<Impl>(w, g, s, std::move(pack), std::move(native), ms, residency)) {}
 MonolithicReference::~MonolithicReference() = default;
 bool MonolithicReference::initialize(std::string& err) {
     try { impl_->initialize(); return true; }
@@ -227,6 +288,7 @@ bool MonolithicReference::initialize(std::string& err) {
 void MonolithicReference::native_head(const core::NativeHead* h) { impl_->head = h; }
 void MonolithicReference::parity_observer(ParityObserver observer) { impl_->observer = std::move(observer); }
 int64_t MonolithicReference::next_position() const { return impl_->position; }
+uint64_t MonolithicReference::owned_weight_bytes() const { return impl_->expert_weight_bytes; }
 bool MonolithicReference::reset(void* stream, std::string& err) {
     auto& p = *impl_;
     if (!p.ready || p.failed || !stream) { err = "TP1 reference: invalid reset state"; return false; }

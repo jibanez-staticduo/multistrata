@@ -2966,6 +2966,11 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_link_libraries(test_capture_positions PRIVATE strata_warnings)
   add_test(NAME test_capture_positions COMMAND test_capture_positions)
 
+  add_executable(test_reference_residency tests/distributed/test_reference_residency.cpp)
+  target_include_directories(test_reference_residency PRIVATE include)
+  target_link_libraries(test_reference_residency PRIVATE strata_warnings)
+  add_test(NAME test_reference_residency COMMAND test_reference_residency)
+
   add_executable(test_model_worker_command tests/distributed/test_model_worker_command.cpp
                                           src/distributed/model_worker.cpp)
   target_include_directories(test_model_worker_command PRIVATE include)

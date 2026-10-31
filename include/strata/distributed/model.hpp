@@ -27,6 +27,24 @@ public:
                         void* stream, std::string& err) = 0;
 };
 
+// Host elapsed time, in nanoseconds, accumulated until reset_profile(). Attempts
+// include failed phases; completed_collectives counts only successful completion.
+struct LayerCollectiveProfile {
+    uint64_t collective_calls = 0;
+    uint64_t completed_collectives = 0;
+    uint64_t route_calls = 0;
+    uint64_t route_pending_polls = 0;
+    // Per-rank device buffer extents, including gather padding, not network traffic.
+    uint64_t input_bytes = 0;
+    uint64_t output_bytes = 0;
+    uint64_t stage_metadata_ns = 0;
+    uint64_t operation_agreement_ns = 0;
+    uint64_t enqueue_ns = 0;
+    uint64_t wait_ns = 0;
+    uint64_t route_readback_ns = 0;
+    uint64_t route_agreement_ns = 0;
+};
+
 class SessionCollectives final : public LayerCollectives {
 public:
     SessionCollectives(Session& session, GuardedTransport& transport, const Clock& clock,
@@ -36,6 +54,10 @@ public:
     void reset_observations() { observed_.clear(); }
     const std::vector<ScheduledCollective>& observed() const { return observed_; }
     void expect_schedule(const std::vector<ScheduledCollective>& expected) { expected_ = expected; }
+    // Opt-in diagnostics. Disabled by default; toggling does not clear accumulated counters.
+    void profile(bool enabled) { profiling_ = enabled; }
+    const std::array<LayerCollectiveProfile, 48>& profile() const { return profile_; }
+    void reset_profile() { profile_.fill({}); }
     bool agree_routes(int64_t, const int*, int64_t, void*, std::string&) override;
     bool reduce(int64_t, const char*, const float*, float*, size_t, void*, std::string&) override;
     bool gather(int64_t, const char*, const float*, float*, std::array<uint64_t, 3>,
@@ -50,6 +72,8 @@ private:
     uint64_t step_ = 0;
     std::vector<ScheduledCollective> observed_;
     std::vector<ScheduledCollective> expected_;
+    bool profiling_ = false;
+    std::array<LayerCollectiveProfile, 48> profile_{};
 };
 
 // A provider fills this layer's k route outputs, already globally reduced,

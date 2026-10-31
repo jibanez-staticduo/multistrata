@@ -3,6 +3,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/session.hpp"
 #include "strata/distributed/parity_trace.hpp"
+#include "strata/distributed/reference_residency.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -11,13 +12,15 @@
 namespace strata::distributed {
 
 // Independent C1 oracle: original monolithic block pre/post and grouped CUDA
-// experts. Host-mapped GGUF weights are staged by selected expert, so this is
-// a numerical reference and does not provide comparable throughput timings.
+// experts. Selected staging is the default numerical reference. AllResident
+// keeps every original expert blob on the GPU and is eligible for matched
+// throughput comparisons; speed still requires measurement with matched policy.
 class MonolithicReference final {
 public:
     MonolithicReference(const core::WeightTable&, const core::ModelGeometry&,
                         core::SessionState&, std::string pack, std::string native,
-                        uint32_t timeout_ms = 60000);
+                        uint32_t timeout_ms = 60000,
+                        ExpertResidency residency = ExpertResidency::SelectedStaging);
     ~MonolithicReference();
     MonolithicReference(const MonolithicReference&) = delete;
     MonolithicReference& operator=(const MonolithicReference&) = delete;
@@ -29,6 +32,9 @@ public:
     bool token(int32_t token, int64_t position, int32_t position_base,
                float* logits, void* stream, std::string& err);
     int64_t next_position() const;
+    // Expert device storage; excludes dense/head/PLE and session buffers.
+    // AllResident reports the exact sum of original blobs, without padding.
+    uint64_t owned_weight_bytes() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
