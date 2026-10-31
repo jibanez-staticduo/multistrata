@@ -401,3 +401,23 @@ def test_request_phase_timing_rejects_invalid_value(config, value):
     config["args"] += ["--request-timing", value]
     with pytest.raises(runner.RunnerError):
         runner.validated(config)
+
+
+@pytest.mark.parametrize("size", ["1", "2", "4", "8"])
+def test_c1_prefill_batch_size_is_forwarded(config, size):
+    config["args"] += ["--prefill-batch-size", size]
+    assert runner.run(config)["native_command"][-2:] == ["--prefill-batch-size", size]
+
+
+@pytest.mark.parametrize("size", ["0", "9", "-1", "2.0"])
+def test_prefill_batch_size_is_bounded(config, size):
+    config["args"] += ["--prefill-batch-size", size]
+    with pytest.raises(runner.RunnerError):
+        runner.validated(config)
+
+
+def test_prefill_batching_rejects_mtp_and_multislot(config, tmp_path):
+    for args, mode, parallel in ((mtp_args(config, tmp_path), "autoregressive", 1),
+                                 (config["args"] + ["--parallel", "4"], "multislot", 4)):
+        with pytest.raises(runner.RunnerError):
+            runner.validated(dict(config, args=args + ["--prefill-batch-size", "8"], mode=mode, parallel=parallel))

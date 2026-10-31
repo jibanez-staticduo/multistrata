@@ -485,9 +485,10 @@ int main(int argc, char** argv) {
         const bool multislot = mode == "multislot";
         const auto prefill_batch_size = number("prefill-batch-size", 1);
         require(prefill_batch_size >= 1 && prefill_batch_size <= 8 &&
-                    (prefill_batch_size == 1 || mode == "teacher-forced"),
-                "--prefill-batch-size 2..8 currently requires teacher-forced qualification mode");
-        require(prefill_batch_size == 1 || (!args.contains("timing-file") && args.contains("logits-positions")),
+                    (prefill_batch_size == 1 || !multislot),
+                "--prefill-batch-size 2..8 currently requires C1 mode");
+        require(prefill_batch_size == 1 || autoregressive ||
+                    (!args.contains("timing-file") && args.contains("logits-positions")),
                 "batched prefill qualification requires explicit --logits-positions and no per-token timing");
         if (prefill_batch_size > 1) kernels::native_mmvq_set_multi_exact(true);
         const auto request_timing_value = args.contains("request-timing") ? args.at("request-timing") : "0";
@@ -507,6 +508,8 @@ int main(int argc, char** argv) {
         require((parallel == 1 || parallel == 4 || parallel == 8) && (multislot || !args.contains("parallel")),
                 "--parallel 1,4,8 requires --mode multislot");
         const bool mtp_enabled = args.contains("mtp-path");
+        require(prefill_batch_size == 1 || !mtp_enabled,
+                "batched prompt processing does not yet supply every target residual row required by MTP");
         const auto mtp_drafts = number("mtp-drafts", 4);
         require((mtp_enabled || (!args.contains("mtp-drafts") && !args.contains("mtp-hash"))) &&
                 (!mtp_enabled || (autoregressive && mtp_drafts >= 1 && mtp_drafts <= 4 &&
@@ -912,6 +915,23 @@ int main(int argc, char** argv) {
                                                  uint64_t(model.next_position()), err), err);
                     return Failure{};
                 };
+                callbacks.prefill_batch_size = uint32_t(prefill_batch_size);
+                if (prefill_batch_size > 1) callbacks.execute_prefill_batch =
+                    [&](std::string_view request, std::span<const int32_t> tokens, uint64_t position) {
+                        StepCommand command{join.session_uuid, std::string(request), 0, step++, StepPhase::prefill,
+                                            {tokens.begin(), tokens.end()}, {}, join.model_hash, {}};
+                        for (size_t row = 0; row < tokens.size(); ++row) command.positions.push_back(position + row);
+                        if (auto f = execution.plan(command, command.expected_collective_schedule)) return f;
+                        const auto result = worker.execute(command);
+                        if (model.requires_process_exit() || experts.requires_process_exit()) std::_Exit(2);
+                        if (result.status != StepStatus::completed)
+                            return result.failure ? result.failure : Failure::fail(FailureCode::comm_failed, "prefill chunk failed");
+                        if (service_evidence)
+                            for (size_t row = 0; row < tokens.size(); ++row)
+                                require(transcript.record_success(StepPhase::prefill, request, tokens[row], position + row,
+                                                                 position + row + 1, err), err);
+                        return Failure{};
+                    };
                 callbacks.sample = [&](const ServeRequest& request, const std::vector<int32_t>& history,
                                        uint64_t draw, int32_t& token) { return sampler->sample(request, history, draw, token); };
                 callbacks.emit = [&](std::string_view type, std::string_view request, int32_t token, std::string_view status) {

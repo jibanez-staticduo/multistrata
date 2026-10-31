@@ -41,6 +41,10 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
         !cb.broadcast || !cb.health || !cb.execute ||
         (rank == 0 && (!cb.poll || !cb.sample || !cb.emit)))
         return Failure::fail(FailureCode::invalid_config, "invalid autoregressive callbacks or geometry");
+    if (cb.prefill_batch_size == 0 || cb.prefill_batch_size > 8 ||
+        (cb.prefill_batch_size > 1 && (!cb.execute_prefill_batch || cb.mtp_enabled)))
+        return Failure::fail(FailureCode::invalid_config,
+                             "prefill batching requires a batch callback, size 1..8, and MTP disabled");
     if (cb.mtp_enabled && rank == 0 && (!cb.begin_request || !cb.prompt_row || !cb.propose ||
                                        !cb.record_target_row || !cb.accepted_window))
         return Failure::fail(FailureCode::invalid_config, "MTP service requires all root adapter hooks");
@@ -145,6 +149,8 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
         if (!active) continue;
         const auto& request = *active;
         const bool prefill = prompt < request.ids.size();
+        const size_t batch_size = prefill && cb.prefill_batch_size > 1 ?
+            std::min<size_t>(cb.prefill_batch_size, request.ids.size() - prompt) : 1;
         if (cb.mtp_enabled && !prefill) {
             const int32_t current_feedback = feedback;
             if (current_feedback < 0) return bad("MTP decode has no sampled feedback");
@@ -217,11 +223,14 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
             }
             continue;
         }
-        const int32_t input = prefill ? request.ids[prompt++] : feedback;
+        const int32_t input = prefill ? request.ids[prompt] : feedback;
         if (input < 0) return bad("decode has no committed sampled token");
         mark_started();
         const auto phase = prefill ? StepPhase::prefill : StepPhase::decode;
         const auto [compute, compute_ns] = timed([&] {
+            if (prefill && batch_size > 1)
+                return cb.execute_prefill_batch(request.request_id,
+                    std::span<const int32_t>(request.ids.data() + prompt, batch_size), history.size());
             return cb.execute(phase, request.request_id, input, history.size());
         });
         if (compute) return compute;
@@ -234,7 +243,12 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
             if (prefill) timing.prefill_ns += compute_ns + commit_ns;
             else timing.decode_ns += compute_ns + commit_ns;
         }
-        history.push_back(input);
+        if (prefill) {
+            for (size_t i = 0; i < batch_size; ++i) history.push_back(request.ids[prompt + i]);
+            prompt += batch_size;
+        } else {
+            history.push_back(input);
+        }
         if (prompt < request.ids.size()) {
             if (cb.mtp_enabled && rank == 0)
                 if (auto f = time_draft_operation([&] {

@@ -5,6 +5,7 @@
 #include "strata/distributed/speculative.hpp"
 
 #include <functional>
+#include <span>
 #include <string>
 
 namespace strata::distributed {
@@ -44,6 +45,10 @@ struct AutoregressiveCallbacks {
     std::function<Failure(std::string_view label, std::string& bytes)> broadcast;
     std::function<Failure()> health;
     std::function<Failure(StepPhase, std::string_view request, int32_t token, uint64_t position)> execute;
+    // Optional exact multi-token prompt forward. The coordinator commits the returned rows once.
+    std::function<Failure(std::string_view request, std::span<const int32_t> tokens,
+                          uint64_t first_position)> execute_prefill_batch;
+    uint32_t prefill_batch_size = 1;
     std::function<Failure(const ServeRequest&, const std::vector<int32_t>& history, uint64_t draw, int32_t&)> sample;
     std::function<void(std::string_view type, std::string_view request, int32_t token, std::string_view state)> emit;
     // Opt-in replacement for the ordinary done event; other event types use emit.

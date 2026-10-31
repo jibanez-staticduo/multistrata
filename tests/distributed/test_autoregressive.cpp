@@ -16,7 +16,7 @@ void check(bool value, const char* label) {
 }
 struct FakeBackend final : ExecutionBackend {
     std::vector<StepCommand> commands;
-    std::vector<int32_t> state, checkpoint;
+    std::vector<int32_t> state, checkpoint, pending_rows;
     std::vector<std::vector<int32_t>> completed;
     int32_t pending = -1;
     bool fail_commit = false;
@@ -27,13 +27,19 @@ struct FakeBackend final : ExecutionBackend {
     Failure finish(const StepCommand& c, BackendCompletion& out) override {
         if (fail_commit && c.phase == StepPhase::commit)
             return Failure::fail(FailureCode::comm_failed, "injected commit failure");
-        if (c.phase == StepPhase::prefill || c.phase == StepPhase::decode) pending = c.tokens.at(0);
-        if (c.phase == StepPhase::commit) { state.push_back(pending); pending = -1; }
+        if (c.phase == StepPhase::prefill || c.phase == StepPhase::decode) {
+            pending_rows = c.tokens;
+            pending = c.tokens.back();
+        }
+        if (c.phase == StepPhase::commit) {
+            state.insert(state.end(), pending_rows.begin(), pending_rows.end());
+            pending_rows.clear(); pending = -1;
+        }
         if (c.phase == StepPhase::checkpoint) checkpoint = state;
-        if (c.phase == StepPhase::rollback) { state = checkpoint; pending = -1; }
+        if (c.phase == StepPhase::rollback) { state = checkpoint; pending = -1; pending_rows.clear(); }
         if (c.phase == StepPhase::reset) completed.push_back(state);
         if (c.phase == StepPhase::reset || c.phase == StepPhase::cancel) {
-            state.clear(); checkpoint.clear(); pending = -1;
+            state.clear(); checkpoint.clear(); pending = -1; pending_rows.clear();
         }
         out = {true, true, true, "all-model-state"}; return {};
     }
@@ -99,6 +105,14 @@ struct Rig {
         };
         return cb;
     }
+    Failure execute_prefill_batch(std::string_view request, std::span<const int32_t> tokens,
+                                  uint64_t first_position) {
+        StepCommand command{"session", std::string(request), 0, step++, StepPhase::prefill,
+                            std::vector<int32_t>(tokens.begin(), tokens.end()), {}, "manifest", {}};
+        for (size_t i = 0; i < tokens.size(); ++i) command.positions.push_back(first_position + i);
+        const auto result = worker.execute(command);
+        return result.status == StepStatus::completed ? Failure{} : result.failure;
+    }
     size_t count(StepPhase phase) const {
         size_t result = 0; for (const auto& c : backend.commands) result += c.phase == phase; return result;
     }
@@ -140,6 +154,73 @@ void short_operation_budget() {
         return poll(wait, line, eof);
     };
     check(!run_autoregressive(0, 100, 64, cb, 100), "short operation budget remains healthy while idle");
+}
+void prefill_batching() {
+    {
+        Rig rig;
+        rig.input = {generate("batched", "1,2,3,4,5", 1), "", ""};
+        std::vector<std::vector<int32_t>> batches;
+        auto cb = rig.callbacks();
+        cb.prefill_batch_size = 2;
+        cb.execute_prefill_batch = [&](std::string_view request, std::span<const int32_t> tokens,
+                                       uint64_t first_position) {
+            check(request == "batched" && first_position == rig.backend.state.size(),
+                  "batch receives request identity and next committed position");
+            batches.emplace_back(tokens.begin(), tokens.end());
+            return rig.execute_prefill_batch(request, tokens, first_position);
+        };
+        check(!run_autoregressive(0, 100, 64, cb), "batched prefill completes");
+        std::vector<size_t> prefill_rows;
+        for (const auto& command : rig.backend.commands)
+            if (command.phase == StepPhase::prefill) prefill_rows.push_back(command.tokens.size());
+        check(batches == std::vector<std::vector<int32_t>>{{1,2},{3,4}} &&
+              prefill_rows == std::vector<size_t>{2,2,1},
+              "prefill batches use configured size and leave the final single token on legacy path");
+        check(rig.samples == 1 && rig.sampled_history == std::vector<std::vector<int32_t>>{{1,2,3,4,5}} &&
+              rig.backend.completed == std::vector<std::vector<int32_t>>{{1,2,3,4,5}} &&
+              rig.count(StepPhase::commit) == 3 && rig.count(StepPhase::prefill) == 3,
+              "batch rows commit together and sampling waits for the complete prompt");
+    }
+    {
+        Rig rig;
+        rig.input = {generate("batch-cancel", "1,2,3,4,5,6", 2), "", cancel("batch-cancel")};
+        auto cb = rig.callbacks();
+        cb.prefill_batch_size = 2;
+        cb.execute_prefill_batch = [&](std::string_view request, std::span<const int32_t> tokens,
+                                       uint64_t first_position) {
+            return rig.execute_prefill_batch(request, tokens, first_position);
+        };
+        const auto result = run_autoregressive(0, 100, 64, cb);
+        check(!result && rig.count(StepPhase::cancel) == 1 &&
+              rig.count(StepPhase::prefill) == 2 && rig.samples == 0 &&
+              rig.events.back() == "cancelled:batch-cancel",
+              "cancellation is drained between batches before any prompt output is sampled");
+    }
+    {
+        Rig rig;
+        rig.input = {generate("batch-fail", "1,2,3,4", 1)};
+        auto cb = rig.callbacks();
+        cb.prefill_batch_size = 3;
+        cb.execute_prefill_batch = [](std::string_view, std::span<const int32_t>, uint64_t) {
+            return Failure::fail(FailureCode::comm_failed, "injected batch failure");
+        };
+        check(bool(run_autoregressive(0, 100, 64, cb)) &&
+              rig.events == std::vector<std::string>{"ready:"},
+              "failed batched compute publishes no token or done");
+    }
+    {
+        Rig rig;
+        auto cb = rig.callbacks();
+        cb.prefill_batch_size = 2;
+        check(bool(run_autoregressive(0, 100, 64, cb)),
+              "batching without a batch execution callback is rejected");
+        cb.execute_prefill_batch = [](std::string_view, std::span<const int32_t>, uint64_t) {
+            return Failure{};
+        };
+        cb.mtp_enabled = true;
+        check(bool(run_autoregressive(0, 100, 64, cb)),
+              "MTP and batched prefill are rejected before service startup");
+    }
 }
 void failures_and_cancel() {
     {
@@ -455,7 +536,7 @@ void mtp_cancel_fresh_and_budget() {
 }
 }
 int main() {
-    normal_and_followers(); short_operation_budget(); failures_and_cancel(); large_chunked_prompt();
+    normal_and_followers(); short_operation_budget(); prefill_batching(); failures_and_cancel(); large_chunked_prompt();
     request_timing(); cancelled_request_reports_partial_timing();
     mtp_parity_and_followers(); mtp_timing_separates_control_cost();
     mtp_failures_withhold_output(); mtp_cancel_fresh_and_budget();

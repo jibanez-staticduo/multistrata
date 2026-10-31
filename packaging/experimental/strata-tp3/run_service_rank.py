@@ -80,6 +80,9 @@ def validated(supplied):
     options = dict(zip(args[::2], args[1::2]))
     if options.get("--request-timing", "0") not in ("0", "1"):
         raise RunnerError("request-timing must be 0 or 1")
+    batch_size = options.get("--prefill-batch-size", "1")
+    if batch_size not in tuple(str(n) for n in range(1, 9)):
+        raise RunnerError("prefill-batch-size must be in 1..8")
     mode = config.get("mode", "autoregressive")
     if mode not in ("autoregressive", "multislot"):
         raise RunnerError("service mode must be autoregressive or multislot")
@@ -95,6 +98,8 @@ def validated(supplied):
     if mode != "multislot" and (parallel != 1 or "--parallel" in options):
         raise RunnerError("parallel requires multislot mode")
     mtp = {flag for flag in SERVICE_FLAGS - {"--parallel", "--service-state-dir"} if flag in options}
+    if batch_size != "1" and (mtp or mode != "autoregressive"):
+        raise RunnerError("prefill batching requires C1 autoregressive mode with MTP disabled")
     if mtp:
         if mtp != SERVICE_FLAGS - {"--parallel"} or mode != "autoregressive":
             raise RunnerError("MTP requires autoregressive mode and path, drafts and hash together")
@@ -104,7 +109,8 @@ def validated(supplied):
             raise RunnerError("MTP hash must be exactly 64 lowercase hex characters")
     capture_options = {flag: options[flag] for flag in SERVICE_CAPTURE_FLAGS if flag in options}
     common_args = [item for flag, value in zip(args[::2], args[1::2])
-                   if flag not in SERVICE_FLAGS | {"--service-state-dir", "--request-timing"} for item in (flag, value)]
+                   if flag not in SERVICE_FLAGS | {"--service-state-dir", "--request-timing", "--prefill-batch-size"}
+                   for item in (flag, value)]
     # Reuse the pinned teacher-forced runner's common validation. Its mandatory
     # input/logits fields are placeholders here and never reach the native argv.
     normalized = dict(config, args=[*common_args, "--logits-dir", config["evidence_dir"]],
