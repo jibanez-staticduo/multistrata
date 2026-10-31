@@ -116,6 +116,21 @@ This is an actual 8K prompt check, rather than allocated context alone. It does
 not qualify 64K or the performance matrix. TP3 process wall time was about
 2385 seconds including loading and evidence capture; this is not a decode rate.
 
+## Later 64K reference and compact model checks
+
+The all-resident TP1 GPU reference consumes **65536 actual prompt IDs plus 256
+teacher-forced continuation IDs**, at capacity 65792, and exits 0. Its log contains
+all consecutive positions 0 through 65791. Full-vocabulary logits and 171
+logical state arrays are retained at positions 0, 8191, 65535 and 65791 in
+[the reference receipt][longreference]. This proves the reference executed that
+input; TP3 qualification of the same long input is still pending.
+
+The compact TP3 short whole-model run exits 0 on all three hosts. Against the
+unchanged original reference, eight logit rows, 2070 state comparisons, 1728
+traces and 1964 reset comparisons have zero differing bits. The
+[independent compact receipt][compactmodel] qualifies this short C1 case.
+It does not establish long-input correctness or a performance gain.
+
 ## Later component and reference service checks
 
 The optional `--expert-operands compact` path keeps the original FMA operands
@@ -197,3 +212,6 @@ files with this report when sharing it; the links are not public downloads.
 [compactgraphs]: /home/staticduo/tmp/strata-tp3-20261031/compact-graphs-gpu-final.log
 [referencehttp]: /home/staticduo/tmp/strata-tp3-20261031/head-upload-probes/reference-http-qualification.json
 [failure]: /home/staticduo/tmp/strata-tp3-20261031/operations/window2/NUMERICAL-FAILURE.md
+
+[longreference]: /home/staticduo/tmp/strata-tp3-20261031/long-context/65792/reference-summary.json
+[compactmodel]: /home/staticduo/tmp/strata-tp3-20261031/compact-short/independent-qualification.json
