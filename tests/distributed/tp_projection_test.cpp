@@ -852,6 +852,26 @@ void test_refusals() {
                   "64 logical lanes do not fit a 32-lane buffer");
 }
 
+void test_invalid_projection_geometry() {
+    begin("malformed geometry is refused before reading weights");
+    ProjectionView view;
+    check_refusal(describe(input_cut(64, 8, -32, 0, 32, {32,32,32}), view),
+                  Refusal::BadRange, "a negative input offset cannot point before the weight slab");
+    const auto gate = output_cut(4, 3, 0, 3, 0, {3});
+    const auto up = output_cut(5, 3, 0, 3, 0, {3});
+    std::vector<float> gw(12, 1), uw(15, 1), x(4, 1), out(3, 91);
+    const auto c = contract("gate_up", "none", 0, {4}, "none", 1, false, "global_reference");
+    check_refusal(gate_up_swiglu(gate, {gw.data(),4}, up, {uw.data(),5}, c,
+                               {x.data(),4,4,1,4}, out.data(),3),
+                  Refusal::ShapeMismatch, "gate and up cannot consume different input widths");
+    check_bits(out[0], 91, "a refused projection leaves the output untouched");
+    float raw[8] = {1,2,3,4,99,99,99,99};
+    float copy[8] = {};
+    check_refusal(quantize_activation(c, raw, 8, 4, copy), Refusal::None,
+                  "an unquantized activation still has a logical length");
+    check_bits(copy[7], 0, "unused lanes are workspace rather than stale activations");
+}
+
 }  // namespace
 
 int main() {
@@ -862,6 +882,7 @@ int main() {
     test_ffn_parity_vs_monolithic();
     test_quantize_once_on_the_global_grid();
     test_refusals();
+    test_invalid_projection_geometry();
     std::cout << "\nchecks: " << (g_checks - g_failed) << " passed, " << g_failed << " failed\n";
     return g_failed == 0 ? 0 : 1;
 }

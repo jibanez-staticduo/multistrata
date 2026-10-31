@@ -100,7 +100,7 @@ inline Refusal describe(const TensorSlice& slice, ProjectionView& out) {
     v.first = slice.range_start;
     v.last = slice.range_end;
     v.block_size = slice.block_size > 1 ? slice.block_size : 0;
-    if (v.last <= v.first) return Refusal::BadRange;
+    if (v.first < 0 || v.last <= v.first) return Refusal::BadRange;
     if (v.last > (v.cuts_output ? n_out : n_in)) return Refusal::BadRange;
     v.owned = v.last - v.first;
     if (slice.local_shape[0] != (v.cuts_output ? n_in : v.owned) ||
@@ -204,7 +204,9 @@ inline Refusal gate_up_swiglu(const TensorSlice& gate_slice, const Weights& gate
     ProjectionView g, u;
     Refusal r = describe(gate_slice, g);
     if (r == Refusal::None) r = describe(up_slice, u);
-    if (r == Refusal::None && (g.first != u.first || g.last != u.last))
+    if (r == Refusal::None && (g.first != u.first || g.last != u.last ||
+                              g.n_in != u.n_in || g.n_out != u.n_out ||
+                              g.cuts_output != u.cuts_output))
         r = Refusal::ShapeMismatch;  // gate and up must own the same rows, or the product is not one row
     if (r == Refusal::None && !g.cuts_output) r = Refusal::NotAProjection;
     if (r == Refusal::None && (!gate.data || !up.data || !ff)) r = Refusal::NullBuffer;
@@ -328,7 +330,8 @@ inline Refusal quantize_activation(const ActivationContract& c, const float* x, 
     if (!x || !out || width <= 0) return Refusal::NullBuffer;
     if (valid <= 0 || valid > width) return Refusal::ActivationWidth;
     if (c.quantizer == "none" || c.block_size <= 1) {
-        for (int64_t i = 0; i < width; ++i) out[i] = x[i];
+        for (int64_t i = 0; i < valid; ++i) out[i] = x[i];
+        for (int64_t i = valid; i < width; ++i) out[i] = 0.0f;
         return Refusal::None;
     }
     if (width % c.block_size) return Refusal::BadContract;
