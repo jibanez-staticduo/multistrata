@@ -6,6 +6,9 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/platform/memory.hpp"
+#if defined(STRATA_BUILD_DISTRIBUTED)
+#include "strata/core/native_upload.hpp"
+#endif
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -25,6 +28,17 @@
 
 namespace strata::core {
 namespace {
+#if defined(STRATA_BUILD_DISTRIBUTED)
+struct PinnedUploadBackend {
+    using Error = cudaError_t;
+    static constexpr Error success = cudaSuccess;
+    Error allocate(void** p, size_t bytes) { return cudaMallocHost(p, bytes); }
+    void release(void* p) { (void) cudaFreeHost(p); }
+    Error copy(void* dst, const void* src, size_t bytes) {
+        return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    }
+};
+#endif
 // `load` makes one cudaMalloc per projection matrix, and the driver backs each call with 2 MiB granules
 // (measured on the RTX 5060: 300 buffers of 6.73 MiB asked 2019 MiB and cost 2400).  So a stage's real
 // footprint is the granule-rounded sum, not the payload sum.  This rule - a granule for every matrix of a
@@ -273,6 +287,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
         std::vector<Pending> pending;
+#if defined(STRATA_BUILD_DISTRIBUTED)
+        PinnedUploadBackend upload_backend;
+        NativeUpload<PinnedUploadBackend> upload(upload_backend);
+#endif
         std::set<std::string> seen;
         int max_in = 0;
         uint64_t total = 0, hc_q8_bytes = 0, allocated = 0;
@@ -366,8 +384,19 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
+#if defined(STRATA_BUILD_DISTRIBUTED)
+                std::fprintf(stderr, "native dense upload begin: %s bytes=%llu\n", tensor.name.c_str(),
+                             (unsigned long long) bytes);
+#endif
                 if (status == cudaSuccess)
+#if defined(STRATA_BUILD_DISTRIBUTED)
+                    status = upload.copy(data.get(), gguf.tensor_data(tensor), bytes);
+#else
                     status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
+#endif
+#if defined(STRATA_BUILD_DISTRIBUTED)
+                std::fprintf(stderr, "native dense upload end: %s status=%d\n", tensor.name.c_str(), (int) status);
+#endif
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
@@ -387,7 +416,11 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     auto packed_status = cudaMalloc(&packed_allocation, bytes);
                     packed.reset(packed_allocation);
                     if (packed_status == cudaSuccess)
+#if defined(STRATA_BUILD_DISTRIBUTED)
+                        packed_status = upload.copy(packed.get(), host.data(), bytes);
+#else
                         packed_status = cudaMemcpy(packed.get(), host.data(), bytes, cudaMemcpyHostToDevice);
+#endif
                     if (packed_status != cudaSuccess) {
                         err = "native dense packed upload " + tensor.name + ": " + cudaGetErrorString(packed_status);
                         return false;
