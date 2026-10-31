@@ -110,6 +110,22 @@ the wrong ID field for a solo SparkRun workload. That attempt is retained in
 `failed-campaign-solo-id`; the corrected campaign starts all three rounds anew.
 These are partial results, not completion of Task 10 or a production recommendation.
 
+## Performance Interpretation
+
+The measured C1 regression has no causal GPU/network breakdown yet. The
+uncaptured native schedule executes 192 tensor collectives and 48 separate
+route agreements per token. FFN ownership is 256/192/192 channels, so rank 0
+owns 40% and the other ranks 30% each. These are structural costs visible in
+the code, not measured percentages of the benchmark delay.
+
+The separate window 8 host profile cannot be subtracted from the current
+benchmark times. Logical gather-buffer extents are not measured wire bytes,
+and sampled GPU utilization does not identify kernel or collective completion
+times. Detailed evidence, units and limits are recorded in
+`/home/staticduo/tmp/strata-tp3-20261031/benchmark-qualified/PERFORMANCE-CAUSES.md`.
+The baseline remains frozen; any later graph/hybrid tuning comparison must
+have its own run record.
+
 ## Passed measurements
 
 Windows [4][q4], [6][q6] and [7][q7] independently compare C1 against the same-pack
