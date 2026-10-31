@@ -61,6 +61,8 @@ struct Rig {
     size_t forwards = 0, previous_poll_forwards = 0;
     size_t fail_health = 0;
     bool fail_poll = false, fail_sample = false, throw_poll = false;
+    uint64_t clock = 100;
+    std::map<std::string, RequestTiming> timings;
     StepPhase fail_phase = StepPhase::abort;
     std::string fail_label;
     const std::vector<Frame>* replay = nullptr;
@@ -94,6 +96,7 @@ struct Rig {
                 events.push_back({std::string(type), std::string(id), std::string(state), std::string(reason), token});
                 if (type == "token") output[std::string(id)].push_back(token);
             };
+            cb.now_ns = [&] { return clock; };
             cb.scheduler.sample = [&](uint32_t slot, const ServeRequest& request,
                                       const std::vector<int32_t>& history, uint64_t draw, int32_t& token) {
                 ++samples;
@@ -125,11 +128,13 @@ struct Rig {
             if (phase == fail_phase) return injected();
             if (phase == StepPhase::prefill || phase == StepPhase::decode) {
                 ++forwards;
+                clock += 10;
                 check(position == histories[slot].size(), "each slot advances its own position");
                 pending[slot] = token;
             } else if (phase == StepPhase::commit) histories[slot].push_back(pending[slot]);
             else if (phase == StepPhase::reset || phase == StepPhase::cancel) histories[slot].clear();
             else check(false, "service executes only scheduler forward, commit and retirement phases");
+            if (phase == StepPhase::commit) clock += 3;
             return Failure{};
         };
         cb.scheduler.abort_all = [&] {
@@ -287,6 +292,47 @@ void budgets_chunks_and_validation() {
     check(bool(corrupt.run()) && corrupt.calls.empty() && corrupt.aborted == 1,
           "readiness disagreement aborts follower before execution");
 }
+void request_timing_is_per_request() {
+    Rig rig;
+    rig.input = {generate("blocker", 2, 3), generate("b", 1, 3), generate("c", 1, 3),
+                 generate("d", 1, 3), cancel("blocker"), generate("queued", 2, 1)};
+    rig.idle(100);
+    auto callbacks = rig.callbacks();
+    callbacks.emit_timing = [&](std::string_view id, const RequestTiming& timing) {
+        rig.timings[std::string(id)] = timing;
+    };
+    check(!run_multislot_service(rig.config, callbacks), "interleaved timed requests complete");
+    const auto queued = rig.timings.find("queued");
+    check(queued != rig.timings.end(),
+          "completed queued request emits its own timing record");
+    if (queued != rig.timings.end()) {
+        check(queued->second.queue_ns >= 13 && queued->second.prefill_ns == 26 &&
+              queued->second.decode_ns == 0 && queued->second.generated_tokens == 1 &&
+              queued->second.prompt_tokens == 2,
+              "waiting slot records neighboring work as queue but excludes it from own prefill");
+    }
+}
+void disabled_timing_never_reads_clock() {
+    Rig rig;
+    rig.input = {generate("cancel-a", 3, 4), cancel("cancel-a"),
+                 generate("cancel-b", 2, 4), cancel("cancel-b")};
+    auto callbacks = rig.callbacks();
+    callbacks.now_ns = []() -> uint64_t {
+        throw std::runtime_error("clock must remain unused when timing is disabled");
+    };
+    check(!run_multislot_service(rig.config, callbacks) &&
+          rig.count("cancelled", "cancel-a") == 1 && rig.count("cancelled", "cancel-b") == 1,
+          "disabled timings neither read the clock nor disrupt repeated cancellations");
+}
+void timing_callback_does_not_replace_required_events() {
+    Rig rig;
+    auto callbacks = rig.callbacks();
+    callbacks.emit = {};
+    callbacks.emit_timing = [](std::string_view, const RequestTiming&) {};
+    const auto result = run_multislot_service(rig.config, callbacks);
+    check(result.code == FailureCode::invalid_config && rig.health_calls == 0,
+          "timing-only callback is rejected before startup work");
+}
 } // namespace
 
 int main() {
@@ -294,6 +340,9 @@ int main() {
     cancellation_and_shutdown();
     failures_withhold_output();
     budgets_chunks_and_validation();
+    request_timing_is_per_request();
+    disabled_timing_never_reads_clock();
+    timing_callback_does_not_replace_required_events();
     std::printf("multislot_service: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

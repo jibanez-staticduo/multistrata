@@ -34,6 +34,7 @@ PROTOCOL = "strata-distributed-v1"
 ROSTER = [0, 1, 2]
 MAX_LINE = 1 << 20
 MAX_TOKEN = (1 << 31) - 1
+MAX_TIMING_NS = (1 << 64) - 1
 
 
 def normalize_sampling(sampling: dict | None, n_vocab: int = MAX_TOKEN) -> dict:
@@ -167,6 +168,7 @@ def validate_reference_config(cfg: dict) -> dict:
 @dataclass
 class _Request:
     token_limit: int
+    prompt_tokens: int
     events: queue.Queue = field(init=False)
     output_done: bool = False
     cancel_sent: bool = False
@@ -176,6 +178,23 @@ class _Request:
     def __post_init__(self) -> None:
         # Tokens, done and a possible cancel acknowledgement fit without blocking the reader.
         self.events = queue.Queue(maxsize=self.token_limit + 2)
+
+
+def _validate_native_timing(value: object, request: _Request) -> dict:
+    """Validate the opt-in native timing payload before accepting its done event."""
+    expected = {
+        "clock", "queue_ns", "prefill_ns", "decode_ns", "sampling_ns", "mtp_draft_ns",
+        "mtp_checkpoint_ns", "mtp_rollback_ns", "prompt_tokens", "generated_tokens",
+    }
+    if not isinstance(value, dict) or value.keys() != expected or value.get("clock") != "host_steady_wall":
+        raise ValueError("invalid native timing fields or clock")
+    for key in expected - {"clock"}:
+        number = value[key]
+        if type(number) is not int or not 0 <= number <= MAX_TIMING_NS:
+            raise ValueError("invalid native timing value")
+    if value["prompt_tokens"] != request.prompt_tokens or value["generated_tokens"] != request.received_tokens:
+        raise ValueError("native timing token counts do not match the request")
+    return dict(value)
 
 
 class DistributedEngine:
@@ -340,6 +359,8 @@ class DistributedEngine:
                         else:
                             if request.output_done or (kind == "rejected" and request.received_tokens):
                                 raise ValueError
+                            if kind == "done" and "timing" in msg:
+                                _validate_native_timing(msg["timing"], request)
                             request.output_done = True
                         self._state = "busy" if any(not r.output_done for r in self._requests.values()) else "ready"
                         event = request.events
@@ -471,7 +492,7 @@ class DistributedEngine:
             if time.monotonic() >= admission_deadline:
                 raise ValueError("the distributed request admission deadline expired")
             complete, submitted = False, False
-            state = _Request(max_new)
+            state = _Request(max_new, len(ids))
             with self._lock:
                 if request in self._requests:
                     raise ValueError("duplicate distributed request ID")
@@ -493,6 +514,20 @@ class DistributedEngine:
                         continue
                     if msg["type"] == "done":
                         self.last = {"generated": count}
+                        if "timing" in msg:
+                            native = dict(msg["timing"])
+                            self.last = {
+                                **self.last,
+                                "prompt_tokens": native["prompt_tokens"],
+                                "prompt_ms": native["prefill_ns"] / 1_000_000,
+                                "decode_ms": native["decode_ns"] / 1_000_000,
+                                "queue_ms": native["queue_ns"] / 1_000_000,
+                                "sampling_ms": native["sampling_ns"] / 1_000_000,
+                                "mtp_draft_ms": native["mtp_draft_ns"] / 1_000_000,
+                                "mtp_checkpoint_ms": native["mtp_checkpoint_ns"] / 1_000_000,
+                                "mtp_rollback_ms": native["mtp_rollback_ns"] / 1_000_000,
+                                "native_phase_timing": native,
+                            }
                         complete = True
                         break
                     if msg["type"] == "rejected":

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "strata/distributed/autoregressive.hpp"
 #include "strata/distributed/worker.hpp"
 
 #include <functional>
@@ -34,12 +35,13 @@ private:
 
 std::string reference_event(std::string_view type, std::string_view request_id = {},
                             int32_t token = -1, uint32_t context = 0,
-                            std::string_view state = "ready");
+                            std::string_view state = "ready",
+                            const RequestTiming* timing = nullptr);
 
 #ifdef STRATA_REFERENCE_CUDA
 class MonolithicReference;
 // Call before loading weights so model diagnostics cannot enter the JSONL channel.
-void prepare_reference_service(uint32_t timeout_ms = 60000);
+void prepare_reference_service(uint32_t timeout_ms = 60000, bool request_timing = false);
 // Owns fixed sampler/readback buffers and the bounded JSONL channel until shutdown.
 Failure run_reference_service(MonolithicReference& model, int32_t vocabulary, uint32_t context,
                               float* device_logits, void* stream, uint32_t timeout_ms = 60000);

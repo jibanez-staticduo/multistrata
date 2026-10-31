@@ -78,6 +78,8 @@ def validated(supplied):
     if any(flag in {"--mode", "--logits-dir", "--trace-dir", "--state-dir", "--state-positions", "--state-max-bytes"} for flag in args[::2]):
         raise RunnerError("service args cannot include mode or teacher-forced evidence flags")
     options = dict(zip(args[::2], args[1::2]))
+    if options.get("--request-timing", "0") not in ("0", "1"):
+        raise RunnerError("request-timing must be 0 or 1")
     mode = config.get("mode", "autoregressive")
     if mode not in ("autoregressive", "multislot"):
         raise RunnerError("service mode must be autoregressive or multislot")
@@ -102,7 +104,7 @@ def validated(supplied):
             raise RunnerError("MTP hash must be exactly 64 lowercase hex characters")
     capture_options = {flag: options[flag] for flag in SERVICE_CAPTURE_FLAGS if flag in options}
     common_args = [item for flag, value in zip(args[::2], args[1::2])
-                   if flag not in SERVICE_FLAGS | {"--service-state-dir"} for item in (flag, value)]
+                   if flag not in SERVICE_FLAGS | {"--service-state-dir", "--request-timing"} for item in (flag, value)]
     # Reuse the pinned teacher-forced runner's common validation. Its mandatory
     # input/logits fields are placeholders here and never reach the native argv.
     normalized = dict(config, args=[*common_args, "--logits-dir", config["evidence_dir"]],

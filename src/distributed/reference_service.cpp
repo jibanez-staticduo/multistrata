@@ -65,7 +65,7 @@ Failure ReferenceService::execute(StepPhase phase, std::string_view request, int
 }
 
 std::string reference_event(std::string_view type, std::string_view request_id, int32_t token,
-                            uint32_t context, std::string_view state) {
+                            uint32_t context, std::string_view state, const RequestTiming* timing) {
     if (type != "ready" && type != "health" && type != "token" && type != "done" && type != "cancelled")
         throw std::invalid_argument("unknown reference event");
     std::string out = "{\"type\":\"" + std::string(type) + "\",\"alive_ranks\":[0]";
@@ -81,7 +81,10 @@ std::string reference_event(std::string_view type, std::string_view request_id, 
         if (type == "token") {
             if (token < 0) throw std::invalid_argument("invalid reference token");
             out += ",\"committed\":true,\"id\":" + std::to_string(token);
-        } else out += ",\"state\":\"ready\"";
+        } else {
+            out += ",\"state\":\"ready\"";
+            if (type == "done" && timing) out += ",\"timing\":" + request_timing_json(*timing);
+        }
     }
     return out + '}';
 }
@@ -200,6 +203,7 @@ class JsonOutput {
 
 
 std::unique_ptr<JsonOutput> output;
+bool request_timing_enabled = false;
 struct DeviceBuffer {
     void* pointer = nullptr;
     ~DeviceBuffer() { if (pointer) cudaFree(pointer); }
@@ -314,9 +318,10 @@ private:
 };
 } // namespace
 
-void prepare_reference_service(uint32_t timeout_ms) {
+void prepare_reference_service(uint32_t timeout_ms, bool request_timing) {
     require(!output && timeout_ms >= 100 && timeout_ms <= 600000, "invalid reference output initialization");
     std::signal(SIGPIPE, SIG_IGN);
+    request_timing_enabled = request_timing;
     output = std::make_unique<JsonOutput>(timeout_ms);
 }
 
@@ -366,6 +371,12 @@ Failure run_reference_service(MonolithicReference& model, int32_t vocabulary, ui
     callbacks.emit = [&](std::string_view type, std::string_view request, int32_t token, std::string_view state) {
         output->emit(reference_event(type, request, token, context, state));
     };
+    if (request_timing_enabled)
+        callbacks.emit_timing = [&](std::string_view type, std::string_view request, int32_t token,
+                                    std::string_view state, const RequestTiming& timing) {
+            output->emit(reference_event(type, request, token, context, state,
+                                         type == "done" ? &timing : nullptr));
+        };
     return run_autoregressive(0, vocabulary, context, callbacks, timeout_ms);
 }
 } // namespace strata::distributed

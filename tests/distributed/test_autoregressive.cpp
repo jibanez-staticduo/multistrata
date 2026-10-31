@@ -170,6 +170,49 @@ void failures_and_cancel() {
         if (mode < 2) check(rig.events == std::vector<std::string>{"ready:"}, "failed commit or token agreement publishes no token or done");
     }
 }
+
+void request_timing() {
+    Rig rig;
+    rig.input = {generate("timed", "1,2", 2), "", ""};
+    uint64_t clock = 100;
+    RequestTiming captured;
+    bool got_timing = false;
+    auto cb = rig.callbacks();
+    auto execute = cb.execute;
+    cb.execute = [&, execute](StepPhase phase, std::string_view id, int32_t token, uint64_t position) {
+        const auto result = execute(phase, id, token, position);
+        if (!result) {
+            if (phase == StepPhase::prefill) clock += 11;
+            else if (phase == StepPhase::decode) clock += 13;
+            else if (phase == StepPhase::commit) clock += 3;
+            else if (phase == StepPhase::reset) clock += 5000;
+        }
+        return result;
+    };
+    auto sample = cb.sample;
+    cb.sample = [&, sample](const auto& request, const auto& history, uint64_t draw, int32_t& token) {
+        const auto result = sample(request, history, draw, token);
+        if (!result) clock += 7;
+        return result;
+    };
+    cb.now_ns = [&] { return clock; };
+    cb.emit = [&](std::string_view type, std::string_view, int32_t, std::string_view) {
+        if (type == "done") clock += 9000;
+    };
+    cb.emit_timing = [&](std::string_view type, std::string_view id, int32_t token,
+                         std::string_view state, const RequestTiming& timing) {
+        check(type == "done" && id == "timed" && token == -1 && state == "ready",
+              "timing companion describes the final done event");
+        captured = timing; got_timing = true;
+    };
+    check(!run_autoregressive(0, 100, 64, cb), "timed autoregressive request completes");
+    check(got_timing && captured.queue_ns == 0 && captured.prefill_ns == 28 &&
+          captured.decode_ns == 16 && captured.sampling_ns == 14 &&
+          captured.prompt_tokens == 2 && captured.generated_tokens == 2,
+          "phase timings sum execute plus commit and exclude reset and event emission");
+    check(request_timing_json(captured).find("\"clock\":\"host_steady_wall\"") != std::string::npos,
+          "timing JSON identifies host steady wall measurements");
+}
 void large_chunked_prompt() {
     std::string ids = "1";
     for (int i = 1; i < 20000; ++i) ids += ",1";
@@ -299,6 +342,52 @@ void mtp_parity_and_followers() {
         }
     }
 }
+
+void mtp_timing_separates_control_cost() {
+    MtpRig rig;
+    rig.input = {generate("mtp-time", "1,2", 4), "", "", "", "", ""};
+    uint64_t clock = 10;
+    RequestTiming captured;
+    auto cb = rig.mtp_callbacks();
+    cb.now_ns = [&] { return clock; };
+    auto execute = cb.execute;
+    cb.execute = [&, execute](StepPhase phase, std::string_view id, int32_t token, uint64_t position) {
+        const auto result = execute(phase, id, token, position);
+        if (!result) {
+            if (phase == StepPhase::decode) clock += 10;
+            else if (phase == StepPhase::commit) clock += 2;
+            else if (phase == StepPhase::checkpoint) clock += 3;
+            else if (phase == StepPhase::rollback) clock += 5;
+            else if (phase == StepPhase::reset) clock += 1000;
+        }
+        return result;
+    };
+    auto propose = cb.propose;
+    cb.propose = [&, propose](const auto& history, int32_t feedback, uint64_t draw, auto& drafts) {
+        const auto result = propose(history, feedback, draw, drafts);
+        if (!result) clock += 17;
+        return result;
+    };
+    auto accepted = cb.accepted_window;
+    cb.accepted_window = [&, accepted](const auto& window, const auto& result) {
+        const auto failure = accepted(window, result);
+        if (!failure) clock += 19;
+        return failure;
+    };
+    auto sample = cb.sample;
+    cb.sample = [&, sample](const auto& request, const auto& history, uint64_t draw, int32_t& token) {
+        const auto result = sample(request, history, draw, token);
+        if (!result) clock += 7;
+        return result;
+    };
+    cb.emit_timing = [&](std::string_view, std::string_view, int32_t, std::string_view,
+                         const RequestTiming& timing) { captured = timing; };
+    check(!run_autoregressive(0, 100, 64, cb), "MTP timed request completes");
+    check(captured.prompt_tokens == 2 && captured.generated_tokens == 4 &&
+          captured.mtp_draft_ns == 36 && captured.mtp_checkpoint_ns == 3 &&
+          captured.decode_ns == 36 && captured.sampling_ns == 28,
+          "MTP draft, checkpoint, target decode and sampling costs remain separate");
+}
 void mtp_failures_withhold_output() {
     for (int failure = 0; failure < 7; ++failure) {
         MtpRig rig;
@@ -341,7 +430,8 @@ void mtp_cancel_fresh_and_budget() {
 }
 int main() {
     normal_and_followers(); short_operation_budget(); failures_and_cancel(); large_chunked_prompt();
-    mtp_parity_and_followers(); mtp_failures_withhold_output(); mtp_cancel_fresh_and_budget();
+    request_timing(); mtp_parity_and_followers(); mtp_timing_separates_control_cost();
+    mtp_failures_withhold_output(); mtp_cancel_fresh_and_budget();
     std::printf("%d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <optional>
 #include <set>
 
@@ -37,7 +38,8 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
                            const AutoregressiveCallbacks& cb, uint32_t operation_budget_ms) {
     if (rank >= kTpWorld || n_vocab <= 0 || context < 4 || context > kDistributedMaxContext ||
         operation_budget_ms < 100 ||
-        !cb.broadcast || !cb.health || !cb.execute || (rank == 0 && (!cb.poll || !cb.sample || !cb.emit)))
+        !cb.broadcast || !cb.health || !cb.execute ||
+        (rank == 0 && (!cb.poll || !cb.sample || !cb.emit)))
         return Failure::fail(FailureCode::invalid_config, "invalid autoregressive callbacks or geometry");
     if (cb.mtp_enabled && rank == 0 && (!cb.begin_request || !cb.prompt_row || !cb.propose ||
                                        !cb.record_target_row || !cb.accepted_window))
@@ -51,8 +53,42 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
     uint32_t generated = 0;
     int32_t feedback = -1;
     bool worker_active = false;
+    RequestTiming timing;
+    uint64_t admitted_ns = 0;
+    bool timing_active = false, queue_recorded = false;
+    const bool timing_enabled = rank == 0 && bool(cb.emit_timing);
+    const auto now_ns = [&]() {
+        if (cb.now_ns) return cb.now_ns();
+        return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
     auto emit = [&](std::string_view type, std::string_view request = {}, int32_t token = -1) {
-        if (rank == 0) cb.emit(type, request, token, active ? "busy" : "ready");
+        if (rank != 0) return;
+        const auto state = active ? "busy" : "ready";
+        if (type == "done" && cb.emit_timing) cb.emit_timing(type, request, token, state, timing);
+        else if (cb.emit) cb.emit(type, request, token, state);
+    };
+    const auto timed = [&](auto&& operation) -> std::pair<Failure, uint64_t> {
+        if (!timing_enabled) return {operation(), 0};
+        const auto start = now_ns();
+        auto result = operation();
+        const auto end = now_ns();
+        return {std::move(result), end >= start ? end - start : 0};
+    };
+    const auto mark_started = [&]() {
+        if (timing_enabled && timing_active && !queue_recorded) {
+            const auto started_ns = now_ns();
+            timing.queue_ns = started_ns >= admitted_ns ? started_ns - admitted_ns : 0;
+            queue_recorded = true;
+        }
+    };
+    const auto time_draft_operation = [&](auto&& operation) -> Failure {
+        if (!timing_enabled) return operation();
+        const auto start = now_ns();
+        auto result = operation();
+        const auto end = now_ns();
+        if (!result && end >= start) timing.mtp_draft_ns += end - start;
+        return result;
     };
     // READY is published only after a real three-rank round trip and local transport health checks.
     if (auto f = cb.health()) return f;
@@ -87,7 +123,7 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
                     if (worker_active) if (auto f = cb.execute(StepPhase::cancel, request.request_id, -1, 0)) return f;
                     retired.insert(request.request_id);
                     cancelled.insert(request.request_id);
-                    active.reset(); worker_active = false; feedback = -1; history.clear();
+                    active.reset(); worker_active = false; feedback = -1; history.clear(); timing_active = false;
                     emit("cancelled", request.request_id);
                 } else if (retired.contains(request.request_id)) {
                     // A stream consumer can close on its final token before it reads done. Acknowledge its
@@ -97,7 +133,12 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
             } else {
                 if (active || retired.contains(request.request_id)) return bad("busy or reused serve request identity");
                 active = std::move(request); prompt = 0; generated = 0; feedback = -1; history.clear();
-                if (cb.mtp_enabled && rank == 0) if (auto f = cb.begin_request(*active)) return f;
+                timing = {};
+                timing.prompt_tokens = active->ids.size();
+                admitted_ns = now_ns();
+                timing_active = true; queue_recorded = false;
+                if (cb.mtp_enabled && rank == 0)
+                    if (auto f = time_draft_operation([&] { return cb.begin_request(*active); })) return f;
             }
         } else return bad("unknown serve action");
         if (!active) continue;
@@ -109,7 +150,9 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
             std::vector<int32_t> drafts;
             std::string proposal;
             if (rank == 0) {
-                if (auto f = cb.propose(history, current_feedback, generated, drafts)) return f;
+                if (auto f = time_draft_operation([&] {
+                        return cb.propose(history, current_feedback, generated, drafts);
+                    })) return f;
                 if (drafts.size() > 4) return bad("MTP producer exceeded four drafts");
                 for (auto token : drafts) {
                     if (token < 0 || token >= n_vocab) return bad("MTP producer returned invalid token");
@@ -131,15 +174,31 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
             SpeculativeCallbacks spec;
             spec.broadcast = cb.broadcast;
             spec.execute = [&](StepPhase phase, int32_t token, uint64_t position) {
-                return cb.execute(phase, request.request_id, token, position);
+                mark_started();
+                const auto [result, elapsed] = timed([&] {
+                    return cb.execute(phase, request.request_id, token, position);
+                });
+                if (!result && rank == 0) {
+                    if (phase == StepPhase::decode || phase == StepPhase::commit) timing.decode_ns += elapsed;
+                    else if (phase == StepPhase::checkpoint) timing.mtp_checkpoint_ns += elapsed;
+                    else if (phase == StepPhase::rollback) timing.mtp_rollback_ns += elapsed;
+                }
+                return result;
             };
             spec.sample = [&](const auto& tail, uint64_t draw, int32_t& token) {
-                return cb.sample(request, tail, draw, token);
+                const auto [result, elapsed] = timed([&] { return cb.sample(request, tail, draw, token); });
+                if (!result && rank == 0) timing.sampling_ns += elapsed;
+                return result;
             };
-            spec.record_target_row = cb.record_target_row;
+            if (rank == 0) {
+                spec.record_target_row = [&](size_t row, int32_t input, int32_t next) {
+                    return time_draft_operation([&] { return cb.record_target_row(row, input, next); });
+                };
+            }
             SpeculativeResult result;
             if (auto f = verifier.verify(window, spec, result)) return f;
-            if (rank == 0) if (auto f = cb.accepted_window(window, result)) return f;
+            if (rank == 0)
+                if (auto f = time_draft_operation([&] { return cb.accepted_window(window, result); })) return f;
             // Finish root's accepted-row bookkeeping before any output can escape.
             std::string ready = rank == 0 ? "accepted" : std::string{};
             if (auto f = cb.broadcast("serve-mtp-accepted-v1", ready)) return f;
@@ -147,29 +206,47 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
             history.insert(history.end(), result.consumed_inputs.begin(), result.consumed_inputs.end());
             feedback = result.next_feedback;
             generated += uint32_t(result.tokens.size());
+            if (rank == 0) timing.generated_tokens = generated;
             for (auto token : result.tokens) emit("token", request.request_id, token);
             if (generated == request.max_new) {
                 const auto id = request.request_id;
                 if (auto f = cb.execute(StepPhase::reset, id, -1, 0)) return f;
-                retired.insert(id); active.reset(); worker_active = false; feedback = -1; history.clear();
+                retired.insert(id); active.reset(); worker_active = false; feedback = -1; history.clear(); timing_active = false;
                 emit("done", id);
             }
             continue;
         }
         const int32_t input = prefill ? request.ids[prompt++] : feedback;
         if (input < 0) return bad("decode has no committed sampled token");
-        if (auto f = cb.execute(prefill ? StepPhase::prefill : StepPhase::decode,
-                                request.request_id, input, history.size())) return f;
+        mark_started();
+        const auto phase = prefill ? StepPhase::prefill : StepPhase::decode;
+        const auto [compute, compute_ns] = timed([&] {
+            return cb.execute(phase, request.request_id, input, history.size());
+        });
+        if (compute) return compute;
         worker_active = true;
-        if (auto f = cb.execute(StepPhase::commit, request.request_id, -1, 0)) return f;
+        const auto [commit, commit_ns] = timed([&] {
+            return cb.execute(StepPhase::commit, request.request_id, -1, 0);
+        });
+        if (commit) return commit;
+        if (rank == 0) {
+            if (prefill) timing.prefill_ns += compute_ns + commit_ns;
+            else timing.decode_ns += compute_ns + commit_ns;
+        }
         history.push_back(input);
         if (prompt < request.ids.size()) {
             if (cb.mtp_enabled && rank == 0)
-                if (auto f = cb.prompt_row(request.ids[prompt], history.size() - 1)) return f;
+                if (auto f = time_draft_operation([&] {
+                        return cb.prompt_row(request.ids[prompt], history.size() - 1);
+                    })) return f;
             continue;
         }
         int32_t token = -1;
-        if (rank == 0) if (auto f = cb.sample(request, history, generated, token)) return f;
+        if (rank == 0) {
+            const auto [sample, elapsed] = timed([&] { return cb.sample(request, history, generated, token); });
+            if (sample) return sample;
+            timing.sampling_ns += elapsed;
+        }
         std::string picked;
         if (rank == 0) {
             for (int shift : {24, 16, 8, 0}) picked.push_back(static_cast<char>((uint32_t(token) >> shift) & 0xff));
@@ -182,11 +259,12 @@ Failure run_autoregressive(uint32_t rank, int32_t n_vocab, uint32_t context,
         if (value >= uint32_t(n_vocab)) return bad("sampled token is outside vocabulary");
         feedback = static_cast<int32_t>(value);
         ++generated;
+        if (rank == 0) timing.generated_tokens = generated;
         emit("token", request.request_id, feedback);
         if (generated == request.max_new) {
             const auto id = request.request_id;
             if (auto f = cb.execute(StepPhase::reset, id, -1, 0)) return f;
-            retired.insert(id); active.reset(); worker_active = false; feedback = -1; history.clear();
+            retired.insert(id); active.reset(); worker_active = false; feedback = -1; history.clear(); timing_active = false;
             emit("done", id);
         }
     }

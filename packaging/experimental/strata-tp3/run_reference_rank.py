@@ -57,6 +57,8 @@ def validated(supplied):
     if not isinstance(supplied, dict):
         raise RunnerError("config must be an object")
     config = dict(supplied)
+    if type(config.get("request_timing", False)) is not bool:
+        raise RunnerError("request_timing must be a boolean")
     if type(config.get("release_verified_cache", False)) is not bool:
         raise RunnerError("release_verified_cache must be a boolean")
     if config.get("release_verified_cache") and not hasattr(os, "posix_fadvise"):
@@ -122,7 +124,8 @@ def server_config(config):
             "parallel": 1, "open_browser": False, "before_load": None,
             "cwd": config["server_source_root"], "sampling": {"temperature": 0},
             "reference": {"command": [config["binary"], "--expert-residency", "all",
-                                      "--mode", "autoregressive", *config["args"]],
+                                      "--mode", "autoregressive", *config["args"],
+                                      *(["--request-timing", "1"] if config.get("request_timing") else [])],
                           "parallel": 1, "ready_timeout": config["ready_timeout"],
                           "health_timeout": 30, "process_deadline": config["request_timeout"],
                           "cancel_timeout": config["cancel_timeout"],

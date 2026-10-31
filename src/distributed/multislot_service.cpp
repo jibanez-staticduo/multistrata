@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <set>
+#include <unordered_map>
 
 namespace strata::distributed {
 namespace {
@@ -38,11 +40,88 @@ Failure run_multislot_service(MultiSlotConfig config, const MultiSlotServiceCall
         (config.rank == 0 && (!cb.poll || !cb.emit || !cb.scheduler.sample)))
         return Failure::fail(FailureCode::invalid_config, "invalid multislot service configuration");
     std::set<std::string> retired, acknowledged;
+    std::unordered_map<std::string, RequestTiming> timings;
+    std::unordered_map<std::string, uint64_t> admitted_ns;
+    std::unordered_map<std::string, bool> queue_recorded;
+    std::unordered_map<std::string, StepPhase> pending_compute;
+    const bool timing_enabled = config.rank == 0 && bool(cb.emit_timing);
+    const auto now_ns = [&]() {
+        if (cb.now_ns) return cb.now_ns();
+        return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    };
+    auto timed = [&](auto&& operation) {
+        if (!timing_enabled) return std::pair{operation(), uint64_t{0}};
+        const auto start = now_ns();
+        auto result = operation();
+        const auto end = now_ns();
+        return std::pair{std::move(result), end >= start ? end - start : uint64_t{0}};
+    };
     auto callbacks = cb.scheduler;
     callbacks.emit = [&](std::string_view type, uint32_t, std::string_view request, int32_t token) {
         if (type == "done" || type == "cancelled") retired.insert(std::string(request));
         if (type == "cancelled") acknowledged.insert(std::string(request));
-        if (config.rank == 0) cb.emit(type, request, token, "ready", {});
+        if (config.rank != 0) return;
+        if (type == "token" && timing_enabled) {
+            auto found = timings.find(std::string(request));
+            if (found != timings.end()) ++found->second.generated_tokens;
+        }
+        if (type == "done" && timing_enabled) {
+            cb.emit_timing(request, timings[std::string(request)]);
+            timings.erase(std::string(request));
+            admitted_ns.erase(std::string(request));
+            queue_recorded.erase(std::string(request));
+            pending_compute.erase(std::string(request));
+        } else if (cb.emit) cb.emit(type, request, token, "ready", {});
+        if (type == "cancelled") {
+            timings.erase(std::string(request));
+            admitted_ns.erase(std::string(request));
+            queue_recorded.erase(std::string(request));
+            pending_compute.erase(std::string(request));
+        }
+    };
+    const auto original_execute = callbacks.execute;
+    callbacks.execute = [&](uint32_t slot, StepPhase phase, std::string_view request,
+                            int32_t token, uint64_t position) {
+        const std::string id(request);
+        if (timing_enabled && (phase == StepPhase::prefill || phase == StepPhase::decode)) {
+            auto found = timings.find(id);
+            if (found != timings.end() && !queue_recorded[id]) {
+                const auto at = now_ns();
+                const auto start = admitted_ns[id];
+                found->second.queue_ns = at >= start ? at - start : 0;
+                queue_recorded[id] = true;
+            }
+        }
+        const auto [result, elapsed] = timed([&] { return original_execute(slot, phase, request, token, position); });
+        if (!result && timing_enabled) {
+            auto found = timings.find(id);
+            if (found != timings.end()) {
+                if (phase == StepPhase::prefill) found->second.prefill_ns += elapsed;
+                else if (phase == StepPhase::decode) found->second.decode_ns += elapsed;
+                else if (phase == StepPhase::commit) {
+                    auto previous = pending_compute.find(id);
+                    if (previous != pending_compute.end()) {
+                        if (previous->second == StepPhase::prefill) found->second.prefill_ns += elapsed;
+                        else found->second.decode_ns += elapsed;
+                        pending_compute.erase(previous);
+                    }
+                }
+            }
+        }
+        if (!result && timing_enabled && (phase == StepPhase::prefill || phase == StepPhase::decode))
+            pending_compute[id] = phase;
+        return result;
+    };
+    const auto original_sample = callbacks.sample;
+    callbacks.sample = [&](uint32_t slot, const ServeRequest& request, const std::vector<int32_t>& history,
+                           uint64_t draw, int32_t& token) {
+        const auto [result, elapsed] = timed([&] { return original_sample(slot, request, history, draw, token); });
+        if (!result && timing_enabled) {
+            auto found = timings.find(request.request_id);
+            if (found != timings.end()) found->second.sampling_ns += elapsed;
+        }
+        return result;
     };
     MultiSlotScheduler scheduler(config, std::move(callbacks));
     auto fail = [&](Failure f) { return scheduler.abort(std::move(f)).failure; };
@@ -77,6 +156,15 @@ Failure run_multislot_service(MultiSlotConfig config, const MultiSlotServiceCall
                 const auto result = request.kind == ServeRequest::Kind::generate ? scheduler.submit(json) :
                                                                                  scheduler.cancel(request.request_id);
                 if (result.failure) return result.failure;
+                if (timing_enabled && request.kind == ServeRequest::Kind::generate &&
+                    result.outcome == MultiSlotOutcome::accepted) {
+                    auto [it, inserted] = timings.try_emplace(request.request_id);
+                    if (inserted) {
+                        it->second.prompt_tokens = request.ids.size();
+                        admitted_ns[request.request_id] = now_ns();
+                        queue_recorded[request.request_id] = false;
+                    }
+                }
                 if (result.outcome == MultiSlotOutcome::rejected && config.rank == 0) {
                     if (request.kind == ServeRequest::Kind::cancel && retired.contains(request.request_id)) {
                         if (acknowledged.insert(request.request_id).second)

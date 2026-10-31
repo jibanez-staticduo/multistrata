@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
     try {
         std::map<std::string, std::string> args;
         const std::set<std::string> allowed = {"pack", "native", "ple", "context", "logits-dir", "logits-positions",
-            "state-dir", "state-positions", "state-max-bytes", "trace-dir", "expert-residency", "mode", "timing-file"};
+            "state-dir", "state-positions", "state-max-bytes", "trace-dir", "expert-residency", "mode", "timing-file", "request-timing"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
             if (i + 1 == argc || !key.starts_with("--") || !allowed.contains(key.substr(2)) ||
@@ -137,6 +137,10 @@ int main(int argc, char** argv) {
         const auto mode = args.contains("mode") ? args.at("mode") : "teacher-forced";
         require(mode == "teacher-forced" || mode == "autoregressive", "--mode must be teacher-forced or autoregressive");
         const bool autoregressive = mode == "autoregressive";
+        const auto request_timing_value = args.contains("request-timing") ? args.at("request-timing") : "0";
+        require((request_timing_value == "0" || request_timing_value == "1") &&
+                    (request_timing_value == "0" || autoregressive),
+                "--request-timing 1 requires autoregressive reference mode");
         require(!args.contains("timing-file") || !args.contains("trace-dir"),
                 "--timing-file cannot be combined with --trace-dir: trace writes run inside model forward");
         if (autoregressive) {
@@ -185,7 +189,7 @@ int main(int argc, char** argv) {
         const auto pack = get("pack"), native = get("native"), ple = get("ple");
         std::unique_ptr<TokenTimingWriter> timing;
         if (args.contains("timing-file")) timing = std::make_unique<TokenTimingWriter>(args.at("timing-file"));
-        if (autoregressive) prepare_reference_service();
+        if (autoregressive) prepare_reference_service(60000, request_timing_value == "1");
         const auto shards = gguf_split_paths(native);
         const GgufFile metadata(shards.front());
         core::ModelGeometry geometry;

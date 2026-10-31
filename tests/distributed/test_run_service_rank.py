@@ -387,3 +387,17 @@ def test_expanded_context_capacity(config):
     args[at] = str(runner.DISTRIBUTED_MAX_CONTEXT + 1)
     with pytest.raises(runner.RunnerError):
         runner.validated(dict(config, args=args))
+
+
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_request_phase_timing_is_explicit_and_forwarded(config, value):
+    config["args"] += ["--request-timing", value]
+    result = runner.run(config)
+    assert result["native_command"][-2:] == ["--request-timing", value]
+
+
+@pytest.mark.parametrize("value", ["2", "true", "01"])
+def test_request_phase_timing_rejects_invalid_value(config, value):
+    config["args"] += ["--request-timing", value]
+    with pytest.raises(runner.RunnerError):
+        runner.validated(config)

@@ -214,9 +214,14 @@ def test_timeout_kills_stubborn_descendant(config, tmp_path):
     pid = int(child_pid.read_text())
     proc = Path(f"/proc/{pid}/stat")
     deadline = time.monotonic() + 2
-    while proc.exists() and proc.read_text().split()[2] != "Z" and time.monotonic() < deadline:
+    def still_running():
+        try:
+            return proc.read_text().split()[2] != "Z"
+        except FileNotFoundError:
+            return False
+    while still_running() and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert not proc.exists() or proc.read_text().split()[2] == "Z"
+    assert not still_running()
 
 
 def test_sigterm_reaches_wrapper_process_group(config, tmp_path):
@@ -256,3 +261,11 @@ def test_expanded_context_capacity(config):
     args = list(config["args"])
     args[-1] = str(runner.DISTRIBUTED_MAX_CONTEXT)
     assert runner.validated(dict(config, args=args))["options"]["--context"] == "65792"
+
+
+def test_optional_native_request_timing_preserves_model_flag_contract(config):
+    result = runner.run(dict(config, request_timing=True))
+    assert result["native_command"][-2:] == ["--request-timing", "1"]
+    assert runner.run(config)["native_command"][-2:] == config["args"][-2:]
+    with pytest.raises(runner.RunnerError):
+        runner.validated(dict(config, request_timing="yes"))

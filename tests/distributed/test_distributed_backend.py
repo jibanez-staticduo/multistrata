@@ -85,13 +85,35 @@ for line in sys.stdin:
     if mode == 'done_error':
         emit('done', request_id=rid, state='failed')
         continue
-    if mode == 'echo':
+    if mode == 'echo' or mode.startswith('timing'):
         values = msg['ids']
     else:
         values = list(b'</think>\n\nHello.') + [257]
     for token in values[:msg['max_new']]:
         emit('token', request_id=rid, id=token, committed=mode != 'uncommitted')
-    emit('done', request_id=rid, state='ready')
+    done = {'request_id': rid, 'state': 'ready'}
+    if mode.startswith('timing'):
+        done['timing'] = {
+            'clock': 'host_steady_wall', 'queue_ns': 11, 'prefill_ns': 22,
+            'decode_ns': msg['ids'][0], 'sampling_ns': 44, 'mtp_draft_ns': 55,
+            'mtp_checkpoint_ns': 66, 'mtp_rollback_ns': 77,
+            'prompt_tokens': len(msg['ids']), 'generated_tokens': len(values[:msg['max_new']]),
+        }
+        if mode == 'timing_bad_clock':
+            done['timing']['clock'] = 'gpu_kernel'
+        elif mode == 'timing_bool':
+            done['timing']['decode_ns'] = True
+        elif mode == 'timing_float':
+            done['timing']['decode_ns'] = 1.5
+        elif mode == 'timing_nan':
+            done['timing']['decode_ns'] = float('nan')
+        elif mode == 'timing_overflow':
+            done['timing']['decode_ns'] = 2**64
+        elif mode == 'timing_prompt_mismatch':
+            done['timing']['prompt_tokens'] += 1
+        elif mode == 'timing_generated_mismatch':
+            done['timing']['generated_tokens'] += 1
+    emit('done', **done)
 '''
 
 
@@ -128,6 +150,52 @@ def test_token_ids_and_sampling_use_existing_boundary(make_engine):
     assert list(engine.generate([17, 42, 83], 3, {"temperature": .3, "seed": 7}, threading.Event())) == [17, 42, 83]
     assert engine.batch == 0
     assert engine.health()["alive_ranks"] == [0, 1, 2]
+
+
+def test_native_done_timings_preserve_phases_and_convert_wall_units(make_engine):
+    engine = make_engine("timing")
+    assert list(engine.generate([17, 42], 3, {}, threading.Event())) == [17, 42]
+    assert engine.last == {
+        "generated": 2, "prompt_tokens": 2, "prompt_ms": 22 / 1_000_000,
+        "decode_ms": 17 / 1_000_000, "queue_ms": 11 / 1_000_000,
+        "sampling_ms": 44 / 1_000_000, "mtp_draft_ms": 55 / 1_000_000,
+        "mtp_checkpoint_ms": 66 / 1_000_000, "mtp_rollback_ms": 77 / 1_000_000,
+        "native_phase_timing": {
+            "clock": "host_steady_wall", "queue_ns": 11, "prefill_ns": 22,
+            "decode_ns": 17, "sampling_ns": 44, "mtp_draft_ns": 55,
+            "mtp_checkpoint_ns": 66, "mtp_rollback_ns": 77,
+            "prompt_tokens": 2, "generated_tokens": 2,
+        },
+    }
+
+
+def test_multislot_native_timings_remain_request_thread_local(make_multislot):
+    engine = make_multislot(4, cohort=4, mode="timing")
+    prompts = [[101 + index] for index in range(4)]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(
+            lambda ids: (list(engine.generate(ids, 1, {}, threading.Event())), engine.last["decode_ms"]),
+            prompts,
+        ))
+    assert results == [([ids[0]], ids[0] / 1_000_000) for ids in prompts]
+
+
+@pytest.mark.parametrize("mode", [
+    "timing_bad_clock", "timing_bool", "timing_float", "timing_nan", "timing_overflow",
+    "timing_prompt_mismatch", "timing_generated_mismatch",
+])
+def test_malformed_native_done_timings_fail_the_group(make_engine, mode):
+    engine = make_engine(mode)
+    with pytest.raises(EngineDied, match="invalid group state"):
+        list(engine.generate([17, 42], 3, {}, threading.Event()))
+    assert engine.last is None
+    assert not engine.alive()
+
+
+def test_legacy_done_without_timings_keeps_generated_only_last(make_engine):
+    engine = make_engine("echo")
+    assert list(engine.generate([17, 42], 2, {}, threading.Event())) == [17, 42]
+    assert engine.last == {"generated": 2}
 
 
 @pytest.mark.parametrize("sampling", [{"temperature": float("nan")}, {"temperature": True}, {"top_p": 0},
@@ -712,7 +780,15 @@ def generate(msg, stopped):
             if stopped.wait(.003):
                 return
             emit('token', request_id=rid, id=token, committed=True)
-        emit('done', request_id=rid, state='ready')
+        done = {'request_id': rid, 'state': 'ready'}
+        if mode == 'timing':
+            done['timing'] = {
+                'clock': 'host_steady_wall', 'queue_ns': 1, 'prefill_ns': 2,
+                'decode_ns': msg['ids'][0], 'sampling_ns': 4, 'mtp_draft_ns': 5,
+                'mtp_checkpoint_ns': 6, 'mtp_rollback_ns': 7,
+                'prompt_tokens': len(msg['ids']), 'generated_tokens': len(values),
+            }
+        emit('done', **done)
         if msg['ids'][0] == 996:
             emit('done', request_id=rid, state='ready')
     finally:

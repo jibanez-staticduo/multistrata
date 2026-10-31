@@ -81,6 +81,15 @@ void context_capacity() {
     try { reference_event("ready", {}, -1, kDistributedMaxContext + 1); }
     catch (const std::invalid_argument&) { threw = true; }
     check(threw, "oversized reference ready capacity rejected");
+    const RequestTiming timing{1, 2, 3, 4, 5, 6, 7, 8, 9};
+    const auto legacy_done = reference_event("done", "timed", -1, 16);
+    check(legacy_done == "{\"type\":\"done\",\"alive_ranks\":[0],\"request_id\":\"timed\",\"state\":\"ready\"}",
+          "reference done event retains byte-identical JSON when timing is disabled");
+    check(reference_event("done", "timed", -1, 16, "ready", &timing).find(
+              "\"timing\":{\"clock\":\"host_steady_wall\",\"queue_ns\":1,\"prefill_ns\":2,"
+              "\"decode_ns\":3,\"sampling_ns\":4,\"mtp_draft_ns\":5,\"mtp_checkpoint_ns\":6,"
+              "\"mtp_rollback_ns\":7,\"prompt_tokens\":8,\"generated_tokens\":9}") != std::string::npos,
+          "reference done event appends the opt-in host timing object");
 }
 void failed_completion() {
     for (bool deadline : {false, true}) {

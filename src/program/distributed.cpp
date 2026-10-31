@@ -408,7 +408,7 @@ int main(int argc, char** argv) {
             "pack", "native", "ple", "context", "logits-dir", "logits-positions", "timeout-ms",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "mode", "poll-interval-ms",
             "expert-collectives", "graph-finish", "mtp-path", "mtp-drafts", "mtp-hash", "parallel", "profile-dir",
-            "collective-agreement", "service-state-dir", "timing-file", "expert-operands"};
+            "collective-agreement", "service-state-dir", "timing-file", "expert-operands", "request-timing"};
 #if defined(STRATA_BUILD_ROCE_EXPERIMENTAL)
         allowed.insert("gather-transport");
         allowed.insert("roce-hca-list");
@@ -481,6 +481,11 @@ int main(int argc, char** argv) {
         require(mode == "teacher-forced" || mode == "autoregressive" || mode == "multislot", "invalid distributed mode");
         const bool autoregressive = mode == "autoregressive";
         const bool multislot = mode == "multislot";
+        const auto request_timing_value = args.contains("request-timing") ? args.at("request-timing") : "0";
+        require((request_timing_value == "0" || request_timing_value == "1") &&
+                    (request_timing_value == "0" || autoregressive || multislot),
+                "--request-timing 1 requires autoregressive or multislot mode");
+        const bool request_timing = request_timing_value == "1";
         require(!args.contains("timing-file") || (!autoregressive && !multislot),
                 "--timing-file requires teacher-forced mode");
         require(!args.contains("timing-file") || !args.contains("trace-dir"),
@@ -803,6 +808,11 @@ int main(int argc, char** argv) {
                     if (type == "ready") event.insert(event.size() - 1, ",\"slots\":" + std::to_string(parallel));
                     json->emit(event);
                 };
+                if (request_timing) callbacks.emit_timing = [&](std::string_view request, const RequestTiming& timing) {
+                    auto event = serve_event("done", request, -1, uint32_t(context), "ready");
+                    event.insert(event.size() - 1, ",\"timing\":" + request_timing_json(timing));
+                    json->emit(event);
+                };
                 const auto service_result = run_multislot_service({uint32_t(rank), uint32_t(parallel),
                      int32_t(geometry.n_vocab), uint32_t(context)}, callbacks,
                      std::min(config.budgets.operation_ms, session.roster().budgets.operation_ms));
@@ -893,6 +903,13 @@ int main(int argc, char** argv) {
                                        uint64_t draw, int32_t& token) { return sampler->sample(request, history, draw, token); };
                 callbacks.emit = [&](std::string_view type, std::string_view request, int32_t token, std::string_view status) {
                     json->emit(serve_event(type, request, token, uint32_t(context), status));
+                };
+                if (request_timing) callbacks.emit_timing = [&](std::string_view type, std::string_view request,
+                                                               int32_t token, std::string_view status,
+                                                               const RequestTiming& timing) {
+                    auto event = serve_event(type, request, token, uint32_t(context), status);
+                    event.insert(event.size() - 1, ",\"timing\":" + request_timing_json(timing));
+                    json->emit(event);
                 };
                 callbacks.mtp_enabled = mtp_enabled;
                 if (mtp_enabled && rank == 0) {
