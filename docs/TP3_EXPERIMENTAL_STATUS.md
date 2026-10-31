@@ -211,6 +211,16 @@ ranks exit 0, with eight exact logit rows, 2070 state comparisons, 1728 traces
 and 1964 reset comparisons. [The hybrid receipt][hybridmodel] qualifies this
 short case only; long prompts and performance remain pending.
 
+## NCCL graph sessions
+
+The explicit NCCL graph-session API passes a three-host CUDA smoke with the
+approved NCCL 2.30.7 library: three captured collectives, 100 replays, changing
+input contents at fixed addresses and exact analytic results. All ranks exit 0.
+A later-replay peer-loss injection ends the survivors through their deadlines
+without publishing a passing result. [The graph-session receipt][ncclgraphs]
+records exits and pending-DMA diagnostics. This establishes transport capture
+and failure behavior; it does not qualify a graph of the complete model.
+
 ## Service state checks
 
 A normal C1 service request captures 18 consumed input IDs on all three ranks.
@@ -316,3 +326,5 @@ files with this report when sharing it; the links are not public downloads.
 [servicebatch8]: /home/staticduo/tmp/strata-tp3-20261031/service-state-validation/batch8-check/result/comparison.json
 
 [expertrows]: /home/staticduo/tmp/strata-tp3-20261031/expert-prefill8/independent-qualification.json
+
+[ncclgraphs]: /home/staticduo/tmp/strata-tp3-20261031/nccl-graph-qualified/summary.json
