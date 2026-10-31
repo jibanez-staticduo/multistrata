@@ -19,7 +19,7 @@ PACKAGE = ROOT / "packaging/experimental/strata-tp3"
 sys.path.insert(0, str(PACKAGE))
 
 from sparkrun.plugins import Recipe, RuntimePlugin
-from strata_sparkrun import SPARKRUN_PLUGIN_API_VERSION, StrataNativeRuntime
+from strata_sparkrun import SPARKRUN_PLUGIN_API_VERSION, StrataNativeRuntime, StrataReferenceRuntime
 
 
 @pytest.fixture
@@ -101,9 +101,63 @@ from sparkrun.application import initialize
 from sparkrun.core.bootstrap import get_runtime
 context = initialize()
 assert get_runtime('strata-native', context.variables).runtime_name == 'strata-native'
+assert get_runtime('strata-reference', context.variables).runtime_name == 'strata-reference'
 """
     env = dict(os.environ, SPARKRUN_CONFIG_DIR=str(tmp_path), SPARKRUN_NO_TELEMETRY="1",
                SPARKRUN_NO_DEFAULT_PLUGINS="1")
     env.pop("SPARKRUN_NO_INSTALLED_PLUGINS", None)
     subprocess.run([sys.executable, "-c", code], env=env, check=True, timeout=60,
                    capture_output=True, text=True)
+
+
+@pytest.fixture
+def reference_recipe():
+    import yaml
+    return Recipe(yaml.safe_load((PACKAGE / "reference-service.yaml").read_text()))
+
+
+def test_reference_single_rank_command_and_recipe(reference_recipe):
+    runtime = StrataReferenceRuntime()
+    assert type(runtime).__bases__ == (RuntimePlugin,)
+    assert runtime.validate_recipe(reference_recipe) == []
+    assert runtime.native_rendezvous_port(reference_recipe) is None
+    expected = ["/usr/bin/python3", "/experiment/source/packaging/experimental/strata-tp3/run_reference_rank.py",
+                "--config", "/experiment/reference/service-rank0.json", "--execute"]
+    assert shlex.split(runtime.generate_command(reference_recipe, {}, False)) == expected
+    assert shlex.split(runtime.generate_node_command(reference_recipe, {}, None, 1, 0)) == expected
+    parallelism = SimpleNamespace(tensor_parallel=1, pipeline_parallel=1, data_parallel=1, expert_parallel=1)
+    assert runtime.world_size(parallelism, recipe=reference_recipe, cluster=None) == 1
+    for key in vars(parallelism):
+        with pytest.raises(ValueError):
+            runtime.world_size(SimpleNamespace(**(vars(parallelism) | {key: 2})), recipe=reference_recipe, cluster=None)
+    assert reference_recipe.executor_config["gpus"] == "device=0"
+    assert reference_recipe.executor_config["user"] == "1000:1000"
+    assert "devices" not in reference_recipe.executor_config
+
+
+def test_reference_strict_topology_paths_and_quoting(reference_recipe):
+    runtime = StrataReferenceRuntime()
+    override = {"reference_config": "/experiment/a b'$(touch nope).json"}
+    assert shlex.split(runtime.generate_command(reference_recipe, override, False))[3] == override["reference_config"]
+    for override in ({"tensor_parallel": 3}, {"pipeline_parallel": 2}, {"data_parallel": 2},
+                     {"expert_parallel": 2}, {"ep_size": 2}, {"tensor_parallel": True},
+                     {"python": "python3"}, {"reference_config": "relative"}):
+        with pytest.raises(ValueError):
+            runtime.generate_command(reference_recipe, override, False)
+    for nodes, rank in ((3, 0), (1, 1), (True, 0), (1, False)):
+        with pytest.raises(ValueError):
+            runtime.generate_node_command(reference_recipe, {}, None, nodes, rank)
+
+
+def test_reference_uses_solo_lifecycle(reference_recipe, monkeypatch):
+    runtime, calls = StrataReferenceRuntime(), []
+    monkeypatch.setattr(runtime, "_run_solo", lambda **kw: calls.append(kw) or 0)
+    command = runtime.generate_command(reference_recipe, {}, False)
+    assert runtime.run(["dg1"], "pinned-image", command, reference_recipe, {},
+                       dry_run=True, backends={}) == 0
+    assert calls[0]["host"] == "dg1" and calls[0]["serve_command"] == command
+    assert calls[0]["dry_run"] is True
+    with pytest.raises(ValueError):
+        runtime.run(["dg1", "dg2"], "image", command, reference_recipe, {}, dry_run=True)
+    with pytest.raises(ValueError):
+        runtime.run(["dg1"], "image", "unapproved command", reference_recipe, {}, dry_run=True)

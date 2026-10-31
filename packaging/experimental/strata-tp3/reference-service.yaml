@@ -1,0 +1,33 @@
+recipe_version: 2
+model: strata-tp1-reference-experimental
+runtime: strata-reference
+container: ghcr.io/ursuciprian/spark-vllm-b12x@sha256:1346035488a5c8a0f405ade8e74febf68c66b8df1e026b7e3a6fb83cb9f4ce13
+min_nodes: 1
+max_nodes: 1
+metadata:
+  description: Experimental all-resident native C1 TP1 reference; localhost:18081.
+defaults:
+  tensor_parallel: 1
+  pipeline_parallel: 1
+  data_parallel: 1
+  expert_parallel: 1
+  python: /usr/bin/python3
+  reference_runner: /experiment/source/packaging/experimental/strata-tp3/run_reference_rank.py
+  reference_config: /experiment/reference/service-rank0.json
+distribution_config:
+  models:
+    enabled: false
+    entries: []
+  containers:
+    enabled: false
+    entries: []
+readiness:
+  inference: false
+executor_config:
+  entrypoint: ''
+  network: host
+  user: '1000:1000'
+  gpu_access_mode: gpus
+  gpus: device=0
+  volumes:
+    - /home/staticduo/tmp/strata-tp3-20261031:/experiment
