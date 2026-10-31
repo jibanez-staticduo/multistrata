@@ -176,7 +176,10 @@ failure; graph fault injection and model integration remain unqualified.
 The first attempts failed before payload execution because of GID selection,
 an old staged binary, or the follower coordinator address. They are retained.
 NCCL remains the default model transport. The hybrid model path is opt-in and
-keeps reductions on NCCL; it requires its own full-model comparison.
+keeps reductions on NCCL. Its short full-model comparison now passes: all three
+ranks exit 0, with eight exact logit rows, 2070 state comparisons, 1728 traces
+and 1964 reset comparisons. [The hybrid receipt][hybridmodel] qualifies this
+short case only; long prompts and performance remain pending.
 
 ## Failed attempts retained
 
@@ -237,3 +240,5 @@ files with this report when sharing it; the links are not public downloads.
 
 [rocesmoke]: /home/staticduo/tmp/strata-tp3-20261031/roce-qualified/retry4-autogid/summary.json
 [rocefaults]: /home/staticduo/tmp/strata-tp3-20261031/roce-qualified/fault-summary.json
+
+[hybridmodel]: /home/staticduo/tmp/strata-tp3-20261031/hybrid-short2/independent-qualification.json
