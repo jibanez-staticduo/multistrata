@@ -258,3 +258,117 @@ def test_cli_writes_invalid_evidence_receipt(evidence, tmp_path):
     assert code == 2 and not report["qualified"]
     assert "duplicate JSON key" in report["error"]
     assert report["comparison_command"]
+
+
+def freeze_inventory(evidence, descriptor):
+    a, b, policy = evidence
+    change(policy, lambda p: p["required_states"].append(descriptor))
+    for path in (a, b):
+        change(path, lambda m: m.update(policy_sha256=cm.sha256(policy)))
+
+
+@pytest.mark.parametrize("kind,dtype", [("metadata", "<i8"), ("indexer", "<i4"), ("ple", "|u1"),
+                                        ("residual", "<f4")])
+def test_extra_frozen_kinds_complete_and_integer_values_compare_exactly(evidence, kind, dtype):
+    a, b, _ = evidence
+    add_states(a, b)
+    descriptor = dict(kind=kind, name="extra", dtype=dtype, shape=[2])
+    freeze_inventory(evidence, descriptor)
+    base = 2**60 if dtype == "<i8" else 4
+    for side, path in enumerate((a, b)):
+        def add(meta):
+            for row in meta["rows"]:
+                name = f"extra-{side}-{row['position']}.bin"
+                np.array([base, base + 1], dtype=dtype).tofile(path.parent / name)
+                meta["states"].append(dict(descriptor, request_id=row["request_id"], position=row["position"], path=name))
+        change(path, add)
+    report, code = cm.compare(*evidence)
+    assert code == 0 and report["full_model_pass"]
+    if dtype != "<f4":
+        np.array([base, base + 2], dtype=dtype).tofile(b.parent / "extra-1-1.bin")
+        report, code = cm.compare(*evidence)
+        assert code == 1
+        extra = [s for s in report["states"] if s["kind"] == kind and s["position"] == 1][0]
+        assert extra["comparison"] == "integer_exact" and not extra["exact_equal"]
+        assert "mean_abs" not in extra
+
+
+def test_unfrozen_extra_array_cannot_claim_full_gate(evidence):
+    a, b, _ = evidence
+    add_states(a, b)
+    for path in (a, b):
+        change(path, lambda m: m["states"].append(dict(m["states"][0], kind="ple", name="extra")))
+    report, code = cm.compare(*evidence)
+    assert code == 77 and report["unfrozen_states"]
+
+
+@pytest.mark.parametrize("shape", [[2**100], [2**62, 8], [1] * 33, [0], [-1]])
+def test_huge_or_invalid_shapes_rejected_before_allocation(tmp_path, shape):
+    path = tmp_path / "tiny.bin"
+    path.write_bytes(b"\0\0\0\0")
+    with pytest.raises(cm.EvidenceError, match="shape"):
+        cm.raw(path, "<f4", shape, {})
+
+
+def make_manifest_shards(evidence, *, ranks=(0, 1, 2), overlap=False):
+    a, b, _ = evidence
+    add_states(a, b)
+    descriptor = dict(kind="residual", name="hc", dtype="<f4", shape=[2, 3], layout="logical", layer=-1)
+    freeze_inventory(evidence, descriptor)
+    for side, path in enumerate((a, b)):
+        manifests = []
+        for row in json.loads(path.read_text())["rows"]:
+            for rank in ranks:
+                directory = path.parent / f"manifest-{side}-{row['position']}-{rank}"
+                directory.mkdir()
+                indices = [0 if overlap and rank == 1 else rank]
+                desc = dict(descriptor, shape=[2, 1], layout="axis_shard", logical_shape=[2, 3],
+                            shard_axis=1, axis_indices=indices)
+                np.array([[rank], [rank + 3]], dtype="<f4").tofile(directory / "state-0.bin")
+                state = dict(desc, request_id=row["request_id"], position=row["position"], path="state-0.bin")
+                manifest = dict(schema_version=1, complete=True, logical_complete=False,
+                                request_id=row["request_id"], position=row["position"],
+                                token_count=row["position"] + 1, total_bytes=8,
+                                required_states=[desc], states=[state])
+                (directory / "manifest.json").write_text(json.dumps(manifest))
+                manifests.append(dict(rank=rank, path=str(directory.relative_to(path.parent) / "manifest.json")))
+        change(path, lambda m: m.update(state_manifests=manifests))
+
+
+def test_helper_manifest_reconstructs_three_rank_axis_with_correct_values(evidence):
+    make_manifest_shards(evidence)
+    report, code = cm.compare(*evidence)
+    assert code == 0 and report["full_model_pass"]
+    assert not any(report["partial_states"].values())
+    policy = cm.read_policy(evidence[2])
+    loaded = cm.load(evidence[1], evidence[2], policy, {})
+    np.testing.assert_array_equal(loaded["states"][("request-A", 0, "residual", "hc")][2],
+                                  [[0, 1, 2], [3, 4, 5]])
+
+
+def test_two_rank_state_snapshot_stays_partial(evidence):
+    make_manifest_shards(evidence, ranks=(0, 1))
+    report, code = cm.compare(*evidence)
+    assert code == 77 and not report["full_model_pass"]
+    assert report["partial_states"]["candidate"][0]["ranks"] == [0, 1]
+
+
+def test_overlapping_three_rank_state_is_invalid(evidence):
+    make_manifest_shards(evidence, overlap=True)
+    with pytest.raises(cm.EvidenceError, match="overlapping"):
+        cm.compare(*evidence)
+
+
+def test_reset_manifest_cannot_collide_with_first_token_position(evidence):
+    make_manifest_shards(evidence)
+    manifest = evidence[1].parent / "manifest-1-0-0" / "manifest.json"
+    change(manifest, lambda m: m.update(phase="reset", token_count=0))
+    with pytest.raises(cm.EvidenceError, match="separate reset gate"):
+        cm.compare(*evidence)
+
+
+def test_float_state_nan_fails_full_gate(evidence):
+    add_states(*evidence[:2])
+    np.array([1, 2, 3, np.nan], dtype="<f2").tofile(evidence[1].parent / "state-1-gdn-1.bin")
+    report, code = cm.compare(*evidence)
+    assert code == 1 and report["state_validation"] == "failed"
