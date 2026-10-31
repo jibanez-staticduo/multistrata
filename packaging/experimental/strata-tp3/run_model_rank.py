@@ -28,6 +28,7 @@ class RunnerError(ValueError):
 
 FLAGS = frozenset("rank rank0-address port session-uuid library-path nccl-version library-provenance model-hash config-fingerprint pack native ple context timeout-ms logits-dir".split())
 STATE_FLAGS = frozenset({"state-dir", "state-positions", "state-max-bytes"})
+TRACE_FLAGS = frozenset({"trace-dir"})
 NETWORK_ENV = frozenset("NCCL_IB_HCA NCCL_SOCKET_IFNAME NCCL_IB_GID_INDEX NCCL_IB_ADDR_FAMILY NCCL_IB_ADDR_RANGE NCCL_IB_ROCE_VERSION_NUM NCCL_CROSS_NIC NCCL_IB_QPS_PER_CONNECTION NCCL_IB_TC NCCL_IB_SL NCCL_IB_TIMEOUT NCCL_IB_RETRY_CNT NCCL_NET_GDR_LEVEL NCCL_CUMEM_ENABLE NCCL_IB_MERGE_NICS NCCL_IB_SUBNET_AWARE_ROUTING NCCL_NET_MERGE_LEVEL NCCL_NVLS_ENABLE NCCL_IGNORE_CPU_AFFINITY".split())
 SHA = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
@@ -47,11 +48,13 @@ def validated(config):
         raise RunnerError("args must be a flag/value argv list")
     options = {}
     for flag, value in zip(args[::2], args[1::2]):
-        if not flag.startswith("--") or flag[2:] not in FLAGS | STATE_FLAGS or flag[2:] in options:
+        if not flag.startswith("--") or flag[2:] not in FLAGS | STATE_FLAGS | TRACE_FLAGS or flag[2:] in options:
             raise RunnerError("unknown or duplicate binary flag")
         options[flag[2:]] = value
     if not FLAGS <= set(options):
         raise RunnerError("args must provide every distributed model flag exactly once")
+    if "trace-dir" in options and not Path(options["trace-dir"]).is_absolute():
+        raise RunnerError("trace-dir must be absolute")
     if set(options) & STATE_FLAGS:
         if "state-dir" not in options or not Path(options["state-dir"]).is_absolute():
             raise RunnerError("state options require an absolute state-dir")
@@ -195,6 +198,8 @@ def run(supplied, evidence=None, execute=False):
     expected, resets = schedule(data, int(options["context"]))
     if "state-dir" in options and Path(options["state-dir"]).exists():
         raise RunnerError("state-dir must be fresh; driver creates it")
+    if "trace-dir" in options and Path(options["trace-dir"]).exists():
+        raise RunnerError("trace-dir must be fresh; driver creates it")
     evidence = Path(evidence)
     evidence.mkdir(parents=True, exist_ok=False, mode=0o700)
     logits = Path(options["logits-dir"])

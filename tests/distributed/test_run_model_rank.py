@@ -165,3 +165,13 @@ def test_credentials_permissions_argv_leaks_and_validation(config, tmp_path):
     leak[leak.index("--pack") + 1] = "/private testing credential"
     with pytest.raises(runner.RunnerError, match="credential appears"):
         runner.run(dict(config, args=leak), tmp_path / "evidence", True)
+
+
+def test_trace_directory_is_optional_and_must_be_fresh(config, tmp_path, monkeypatch):
+    trace = tmp_path / "trace"
+    traced = dict(config, args=config["args"] + ["--trace-dir", str(trace)])
+    assert runner.validated(traced)["options"]["trace-dir"] == str(trace)
+    trace.mkdir()
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *_a, **_k: pytest.fail("launched"))
+    with pytest.raises(runner.RunnerError, match="trace-dir must be fresh"):
+        runner.run(traced, tmp_path / "evidence", True)
