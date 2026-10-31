@@ -161,13 +161,17 @@ int main(int argc, char** argv) {
         require(core::WeightTable::pool_bytes(pack, weight_bytes, err, &skip), err);
         Allocation weight_memory;
         weight_memory.allocate(weight_bytes);
+        std::cerr << "LOAD rank=" << rank << " stage=dense-pack bytes=" << weight_bytes << std::endl;
         require(weights.load(pack, weight_memory.pointer, weight_bytes, err, &skip), err);
+        std::cerr << "LOAD rank=" << rank << " stage=dense-native" << std::endl;
         require(core::check_all(weights, geometry, err), err);
         core::NativeDense dense;
         require(dense.load(shards, weights, err, true), err);
         core::NativeHead head;
         core::NativeEmbed embedding;
+        std::cerr << "LOAD rank=" << rank << " stage=head" << std::endl;
         require(head.load(shards, geometry.n_embd, geometry.n_vocab, err), err);
+        std::cerr << "LOAD rank=" << rank << " stage=embedding" << std::endl;
         require(embedding.load(shards, geometry.n_embd, geometry.n_vocab, err), err);
         core::set_native_embed(&embedding);
         core::SessionState state;
@@ -207,6 +211,7 @@ int main(int argc, char** argv) {
         config.approved_nccl_version = version; config.approved_library_provenance = provenance;
         config.budgets = {uint32_t(timeout), uint32_t(timeout), uint32_t(timeout), uint32_t(timeout)};
         Session session(config, join, *channel, clock);
+        std::cerr << "LOAD rank=" << rank << " stage=join" << std::endl;
         require(session.start());
         require(session.bootstrap_id(0, nccl_config.bootstrap_id));
         nccl_config.initialize_ms = std::min(config.budgets.initialize_ms, session.roster().budgets.initialize_ms);
@@ -217,7 +222,9 @@ int main(int argc, char** argv) {
             SessionCollectives collectives(session, transport, clock, uint32_t(timeout));
             NativeRoutedExperts experts(pack, native, geometry, int(rank), collectives,
                                          {256, 192, 192}, uint32_t(timeout));
+            std::cerr << "LOAD rank=" << rank << " stage=expert-shards" << std::endl;
             require(experts.initialize(err), err);
+            std::cerr << "LOAD rank=" << rank << " stage=expert-shards-complete bytes=" << experts.owned_weight_bytes() << std::endl;
             ModelForward model(weights, geometry, state, int(rank), collectives, experts);
             model.native_head(&head);
             WorkerConfig worker_config{join.session_uuid, join.model_hash, uint32_t(rank)};
