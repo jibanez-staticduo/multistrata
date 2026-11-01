@@ -111,7 +111,7 @@ int main(int argc, char** argv) {
     std::cout.setf(std::ios::unitbuf);
     try {
         std::map<std::string, std::string> args;
-        const std::set<std::string> allowed = {"pack", "native", "ple", "context", "logits-dir", "logits-positions",
+        const std::set<std::string> allowed = {"pack", "native", "embd", "ple", "context", "logits-dir", "logits-positions",
             "state-dir", "state-positions", "state-max-bytes", "trace-dir", "expert-residency", "mode", "timing-file", "request-timing"};
         for (int i = 1; i < argc; i += 2) {
             const std::string key = argv[i];
@@ -233,7 +233,8 @@ int main(int argc, char** argv) {
         core::NativeHead head;
         core::NativeEmbed embedding;
         require(head.load(shards, geometry.n_embd, geometry.n_vocab, err), err);
-        require(embedding.load(shards, geometry.n_embd, geometry.n_vocab, err), err);
+        require(embedding.load(args.contains("embd")?std::vector<std::string>{args.at("embd")}:shards,
+                               geometry.n_embd, geometry.n_vocab, err), err);
         core::set_native_embed(&embedding);
         struct EmbedReset { ~EmbedReset() { core::set_native_embed(nullptr); } } embed_reset;
         core::SessionState state;

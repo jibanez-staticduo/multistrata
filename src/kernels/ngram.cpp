@@ -660,7 +660,7 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     // MADV_WILLNEED, a hint that cannot change a value: an unfetched page is faulted by the read) while this window is read.
     constexpr size_t kWin = 4096;   // rows a window
     auto hint = [&](size_t a, size_t b) {
-        if (impl_->data == nullptr || !g_ple_prefetch) return;
+        if (impl_->data == nullptr || impl_->locked || !g_ple_prefetch) return;
 #if defined(_WIN32)
         WIN32_MEMORY_RANGE_ENTRY ranges[kWin];
         ULONG_PTR k = 0;

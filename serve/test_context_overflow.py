@@ -102,6 +102,19 @@ class ContextOverflow(unittest.TestCase):
                     self.assertEqual(status, 400, body)
                     self.assertIn("no room to answer", body["error"]["message"])
 
+    def test_distributed_engine_can_use_the_exact_context_budget(self):
+        with mock.patch.object(self.engine, "distributed_health", True, create=True):
+            for path, key in APIS:
+                with self.subTest(path=path):
+                    with mock.patch.object(self.engine, "generate", wraps=self.engine.generate) as generate:
+                        status, _, body = self.post(path, key, CTX - 16, 16)
+                    self.assertEqual(status, 200, body)
+                    self.assertEqual(generate.call_args.args[1], 16)
+                    with mock.patch.object(self.engine, "generate") as generate:
+                        status, _, body = self.post(path, key, CTX - 16, 17)
+                    self.assertEqual(status, 400, body)
+                    generate.assert_not_called()
+
     def test_one_token_of_room_still_answers_but_zero_is_rejected(self):
         for path, key in APIS:
             for fit in (False, True):

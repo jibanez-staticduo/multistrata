@@ -29,6 +29,7 @@ struct Options {
     std::string rank0_address, session_uuid, library_path, nccl_version;
     std::string library_provenance, model_hash, config_fingerprint, build_commit;
     bool kill_peer = false;
+    bool stream_step = false;
 };
 
 uint32_t number(const std::string& value) {
@@ -43,7 +44,7 @@ Options parse(int argc, char** argv) {
         {"rank", ""}, {"world", ""}, {"rank0-address", ""}, {"port", ""}, {"session-uuid", ""},
         {"library-path", ""}, {"nccl-version", ""}, {"library-provenance", ""}, {"model-hash", ""},
         {"config-fingerprint", ""}, {"build-commit", ""}, {"timeout-ms", ""}, {"fault", ""},
-        {"fault-rank", ""}};
+        {"fault-rank", ""}, {"stream-step", ""}};
     auto args = allowed;
     for (int i = 1; i < argc; i += 2) {
         if (i + 1 >= argc || std::strncmp(argv[i], "--", 2) != 0)
@@ -72,6 +73,7 @@ Options parse(int argc, char** argv) {
     out.build_commit = get("build-commit");
     if (!args["timeout-ms"].empty()) out.timeout_ms = number(args["timeout-ms"]);
     if (!args["fault-rank"].empty()) out.fault_rank = number(args["fault-rank"]);
+    out.stream_step = args["stream-step"] == "1";
     if (!args["fault"].empty()) {
         if (args["fault"] != "none" && args["fault"] != "killed-peer")
             throw std::runtime_error("invalid fault mode");
@@ -179,7 +181,8 @@ void run(const Options& options, Session& session, NcclBackend& backend, cudaStr
         cuda_check(cudaMemcpyAsync(sends[op].get(), input_ptrs[op],
                                    sizes[op] * sizeof(float), cudaMemcpyHostToDevice, stream));
     }
-    require(backend.prepare_graph_session(stream, sizes.size()));
+    if (options.stream_step) require(backend.begin_stream_step(stream));
+    else require(backend.prepare_graph_session(stream, sizes.size()));
     cudaEvent_t warmup_done = nullptr;
     cuda_check(cudaEventCreateWithFlags(&warmup_done, cudaEventDisableTiming));
     cuda_check(cudaEventRecord(warmup_done, stream));
@@ -200,7 +203,7 @@ void run(const Options& options, Session& session, NcclBackend& backend, cudaStr
     }
     cuda_check(cudaEventDestroy(warmup_done));
     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-    require(backend.check_graph_capture());
+    if (!options.stream_step) require(backend.check_graph_capture());
     for (size_t op = 0; op < sizes.size(); ++op) {
         require(backend.raw_all_reduce_sum({sends[op].get(), sizes[op], ScalarType::fp32},
                                            {receives[op].get(), sizes[op], ScalarType::fp32},
@@ -208,9 +211,11 @@ void run(const Options& options, Session& session, NcclBackend& backend, cudaStr
     }
     cudaGraph_t graph_handle = nullptr;
     cuda_check(cudaStreamEndCapture(stream, &graph_handle));
-    require(backend.finish_graph_capture());
+    if (!options.stream_step) require(backend.finish_graph_capture());
     Graph captured;
     captured.instantiate(graph_handle);
+    if (options.stream_step)
+        require(backend.finish_stream_step({std::chrono::steady_clock::now() + std::chrono::milliseconds(options.timeout_ms)}));
     require(session.operation_deadline(deadline));
     require(session.agree_control_payload("nccl-graph-capture-ready", "three-ops", deadline));
 
@@ -225,7 +230,8 @@ void run(const Options& options, Session& session, NcclBackend& backend, cudaStr
             std::cout << "{\"event\":\"injected_peer_exit\",\"rank\":" << options.rank << "}\n";
             std::_Exit(86);
         }
-        require(backend.begin_captured_replay());
+        if (options.stream_step) require(backend.begin_stream_step(stream));
+        else require(backend.begin_captured_replay());
         const auto launch = cudaGraphLaunch(captured.exec(), stream);
         if (launch != cudaSuccess) {
             backend.raw_abort();
@@ -237,7 +243,8 @@ void run(const Options& options, Session& session, NcclBackend& backend, cudaStr
         }
         const Deadline replay_deadline{std::chrono::steady_clock::now() +
                                        std::chrono::milliseconds(options.timeout_ms)};
-        const Failure replay_status = backend.wait_captured_replay(replay_deadline);
+        const Failure replay_status = options.stream_step ? backend.finish_stream_step(replay_deadline) :
+                                                           backend.wait_captured_replay(replay_deadline);
         if (replay_status && backend.requires_process_exit()) {
             std::cerr << "{\"event\":\"fatal_pending_dma\",\"rank\":" << options.rank
                       << ",\"failure_code\":\"" << failure_code_name(replay_status.code) << "\"}\n";
@@ -278,7 +285,7 @@ void run(const Options& options, Session& session, NcclBackend& backend, cudaStr
         }
     }
     captured.destroy();
-    require(backend.end_graph_session());
+    if (!options.stream_step) require(backend.end_graph_session());
     require(session.operation_deadline(deadline));
     require(session.agree_control_payload("nccl-graph-smoke-complete", "100-replays", deadline));
     std::cout << "{\"event\":\"result\",\"status\":\"passed\",\"rank\":" << options.rank

@@ -35,7 +35,12 @@ struct FakeState {
     cudaError_t event_record = cudaSuccess;
     bool capturing = false;
     uint32_t captured_launches = 0;
+    uint32_t replay_launches = 0;
     uint32_t state_sequence = 0;
+    strata::distributed::roce::cuda::Kind last_kind =
+        strata::distributed::roce::cuda::Kind::all_reduce_sum;
+    uint64_t last_global_first = 0;
+    uint64_t last_global_total = 0;
     int proxy_gid_index = INT32_MIN;
     uint8_t* region = nullptr;
     uint64_t ctrl_off = 0;
@@ -44,6 +49,7 @@ struct FakeState {
     int live_allocations = 0;
     int frees = 0;
     int proxy_destroys = 0;
+    int event_records = 0;
 } fake;
 
 void check(bool condition, const char* message) {
@@ -110,9 +116,16 @@ void test_config_and_setup_failures(const std::filesystem::path& sysfs) {
           "explicit GID index no longer selects populated entries");
     {
         Config config = valid_config();
-        config.blocks = 2;
+        config.blocks = 9;
         RoceBackend backend(config);
         check(backend.create().code == FailureCode::invalid_config, "invalid geometry was accepted");
+    }
+    {
+        Config config = valid_config();
+        config.blocks = 8;
+        config.threads = 512;
+        RoceBackend backend(config);
+        check(!backend.create(), "explicit cooperative geometry was rejected");
     }
     {
         Config config = valid_config();
@@ -197,6 +210,53 @@ void test_single_enqueue_and_abort() {
     fake.live_allocations = 0;
 }
 
+void test_ring_sum_validation_and_forwarding() {
+    BackendFixture fixture("strata-roce-state-ring-sum");
+    alignas(16) std::array<uint8_t, 64> input{}, output{};
+    const auto stream = reinterpret_cast<cudaStream_t>(uintptr_t(7));
+    RoceBackend backend(valid_config());
+
+    check(backend.raw_all_reduce_ring_sum({input.data(), 16, ScalarType::bf16},
+                                          {output.data(), 16, ScalarType::bf16},
+                                          16, 0, 32, stream).code == FailureCode::bad_extent,
+          "ring sum accepted BF16 before backend setup");
+    check(backend.raw_all_reduce_ring_sum({input.data(), 16, ScalarType::fp32},
+                                          {output.data(), 16, ScalarType::fp32},
+                                          16, 0, 30, stream).code == FailureCode::bad_extent,
+          "ring sum accepted a total outside SIMPLE8 geometry");
+    check(backend.raw_all_reduce_ring_sum({input.data(), 16, ScalarType::fp32},
+                                          {output.data(), 16, ScalarType::fp32},
+                                          16, 2, 32, stream).code == FailureCode::bad_extent,
+          "ring sum accepted an unaligned global offset");
+    check(backend.raw_all_reduce_ring_sum({input.data(), 12, ScalarType::fp32},
+                                          {output.data(), 16, ScalarType::fp32},
+                                          16, 0, 32, stream).code == FailureCode::bad_extent,
+          "ring sum accepted input metadata that differs from its element count");
+    check(backend.raw_all_reduce_ring_sum({input.data(), 16, ScalarType::fp32},
+                                          {output.data(), 12, ScalarType::fp32},
+                                          16, 0, 32, stream).code == FailureCode::bad_extent,
+          "ring sum accepted output metadata that differs from its element count");
+    check(backend.raw_all_reduce_ring_sum({input.data(), 16, ScalarType::fp32},
+                                          {output.data(), 16, ScalarType::fp32},
+                                          16, 20, 32, stream).code == FailureCode::bad_extent,
+          "ring sum accepted a chunk extending past the global reduction");
+    check(backend.raw_all_reduce_ring_sum({input.data(), 16, ScalarType::fp32},
+                                          {output.data(), 16, ScalarType::fp32},
+                                          16, 0, 32, stream).code == FailureCode::not_ready,
+          "ring sum did not defer valid spans to backend readiness");
+
+    connect_backend(backend);
+    check(!backend.raw_all_reduce_ring_sum({input.data(), 16, ScalarType::fp32},
+                                           {output.data(), 16, ScalarType::fp32},
+                                           16, 4, 32, stream),
+          "valid ring sum enqueue failed");
+    check(fake.last_kind == strata::distributed::roce::cuda::Kind::all_reduce_ring_sum &&
+              fake.last_global_first == 4 && fake.last_global_total == 32,
+          "ring sum kind or global range was not forwarded to the CUDA launcher");
+    check(!backend.raw_poll({std::chrono::steady_clock::now() + std::chrono::seconds(1)}),
+          "valid ring sum completion failed");
+}
+
 void test_capture_and_replay() {
     BackendFixture fixture("strata-roce-state-graphs");
     {
@@ -223,6 +283,73 @@ void test_capture_and_replay() {
         }
         backend.raw_abort();
         check(!backend.requires_process_exit(), "completed replay unnecessarily requires process exit");
+    }
+}
+
+void test_stream_steps() {
+    BackendFixture fixture("strata-roce-state-stream-step");
+    {
+        RoceBackend backend(valid_config());
+        connect_backend(backend);
+        alignas(16) std::array<uint8_t, 64> input{}, output{};
+        auto stream = reinterpret_cast<cudaStream_t>(uintptr_t(6));
+        const auto deadline = [] {
+            return Deadline{std::chrono::steady_clock::now() + std::chrono::seconds(1)};
+        };
+
+        check(!backend.begin_stream_step(stream), "eager stream step did not begin");
+        check(!backend.raw_all_reduce_sum({input.data(), 16, ScalarType::fp32},
+                                          {output.data(), 16, ScalarType::fp32}, 16, stream),
+              "first eager stream-step enqueue failed");
+        check(!backend.raw_all_reduce_sum({input.data(), 16, ScalarType::fp32},
+                                          {output.data(), 16, ScalarType::fp32}, 16, stream),
+              "second eager stream-step enqueue failed");
+        check(fake.event_records == 0, "stream step recorded an event per collective");
+        check(!backend.finish_stream_step(deadline()), "multiple eager stream operations did not finish");
+        check(fake.event_records == 1 && fake.proxy->completed == 2,
+              "eager stream step did not record one event and observe both operations");
+
+        fake.capturing = true;
+        check(!backend.begin_stream_step(stream), "captured stream step did not begin");
+        for (int i = 0; i < 3; ++i) {
+            check(!backend.raw_all_reduce_sum({input.data(), 16, ScalarType::fp32},
+                                              {output.data(), 16, ScalarType::fp32}, 16, stream),
+                  "first captured stream-step enqueue failed");
+        }
+        fake.capturing = false;
+        check(!backend.finish_stream_step(deadline()), "first captured stream step did not finish");
+        check(fake.proxy->completed == 5, "first captured stream step lost operations");
+
+        fake.capturing = true;
+        check(!backend.begin_stream_step(stream), "second captured stream step did not begin");
+        check(!backend.raw_all_reduce_sum({input.data(), 16, ScalarType::fp32},
+                                          {output.data(), 16, ScalarType::fp32}, 16, stream),
+              "second captured stream-step enqueue failed");
+        check(!backend.raw_all_reduce_sum({input.data(), 16, ScalarType::fp32},
+                                          {output.data(), 16, ScalarType::fp32}, 16, stream),
+              "second captured stream-step enqueue failed");
+        fake.capturing = false;
+        check(!backend.finish_stream_step(deadline()), "different-size captured stream step did not finish");
+        check(fake.proxy->completed == 7, "different-size captured stream step used a static count");
+
+        fake.replay_launches = 0;
+        check(!backend.begin_stream_step(stream), "empty stream step did not begin");
+        check(!backend.finish_stream_step(deadline()), "empty stream step was rejected");
+        check(fake.proxy->completed == 7, "empty stream step changed the completion sequence");
+
+        fake.replay_launches = 3;
+        check(!backend.begin_stream_step(stream), "cached graph replay step did not begin");
+        check(!backend.finish_stream_step(deadline()), "cached graph without host enqueues did not finish");
+        check(fake.proxy->completed == 10, "cached graph replay lost its dynamic completion sequence");
+        fake.replay_launches = 0;
+        check(!backend.begin_stream_step(stream), "mixed eager/capture step did not begin");
+        check(!backend.raw_all_reduce_sum({input.data(),16,ScalarType::fp32},
+            {output.data(),16,ScalarType::fp32},16,stream), "mixed step eager enqueue failed");
+        fake.capturing=true;
+        check(!backend.raw_all_reduce_sum({input.data(),16,ScalarType::fp32},
+            {output.data(),16,ScalarType::fp32},16,stream), "mixed step capture enqueue failed");
+        fake.capturing=false;
+        check(!backend.finish_stream_step(deadline()), "mixed eager/capture step did not finish");
     }
 }
 
@@ -377,13 +504,15 @@ cudaError_t cudaStreamIsCapturing(cudaStream_t, cudaStreamCaptureStatus* status)
 }
 cudaError_t cudaEventRecord(cudaEvent_t, cudaStream_t) {
     if (fake.event_record != cudaSuccess) return fake.event_record;
-    if (!fake.capturing && fake.captured_launches != 0) {
-        fake.state_sequence += fake.captured_launches;
+    ++fake.event_records;
+    if (!fake.capturing && fake.replay_launches != 0) {
+        fake.state_sequence += fake.replay_launches;
         put_u32(fake.device_state, 0, fake.state_sequence);
         const uint32_t ctrl = static_cast<uint32_t>(fake.ctrl_off);
         put_u32(fake.region, ctrl + strata::distributed::roce::cuda::kCtrlCompletedSeq,
                 fake.state_sequence);
         if (fake.proxy) fake.proxy->completed = fake.state_sequence;
+        fake.captured_launches = 0;
     }
     return cudaSuccess;
 }
@@ -423,13 +552,17 @@ bool layout(uint32_t world, uint64_t slot_bytes, Layout& out) {
     fake.ctrl_off = out.ctrl_off;
     return true;
 }
-cudaError_t launch(const DeviceBuffer&, const DeviceBuffer&, Kind, uint32_t, const Layout&,
+cudaError_t launch(const DeviceBuffer&, const DeviceBuffer&, Kind kind, uint32_t, const Layout&,
                    void* region, uint64_t, void* device_state, uint32_t, cudaStream_t,
-                   uint32_t, uint32_t) {
+                   uint32_t, uint32_t, uint64_t global_first, uint64_t global_total) {
+    fake.last_kind = kind;
+    fake.last_global_first = global_first;
+    fake.last_global_total = global_total;
     fake.region = static_cast<uint8_t*>(region);
     fake.device_state = device_state;
     if (fake.capturing) {
         ++fake.captured_launches;
+        fake.replay_launches = fake.captured_launches;
         return cudaSuccess;
     }
     ++fake.state_sequence;
@@ -445,7 +578,9 @@ int main() {
         BackendFixture setup("strata-roce-state-setup");
         test_config_and_setup_failures(setup.sysfs);
         test_single_enqueue_and_abort();
+        test_ring_sum_validation_and_forwarding();
         test_capture_and_replay();
+        test_stream_steps();
         test_uncertain_capture_lifetime();
         test_event_error_requires_exit();
         check(fake.live_allocations >= 0, "invalid fake allocation count");

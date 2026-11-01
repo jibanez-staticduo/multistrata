@@ -33,6 +33,19 @@ inline uint64_t kv_q8_bytes_per_cell(const QsaShapes& s) {
 void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
                         const int32_t* step, int step_stride, const float* kcur, const float* vcur, int cur_stride,
                         int n_tok, const QsaShapes& s, void* stream, const KvHostPools* host);
+struct KvQ8AppendGroups {
+    int8_t* k[8] = {};
+    int8_t* v[8] = {};
+    uint16_t* k_scale[8] = {};
+    uint16_t* v_scale[8] = {};
+    const int32_t* page_table[8] = {};
+    int first[8] = {}, count[8] = {};
+    int n = 0;
+};
+// Contiguous, distinct cells within each group; groups own disjoint pools.
+void kv_append_q8_groups(const KvQ8AppendGroups&, const int32_t* steps, int step_stride,
+                         const float* keys, const float* values, int cur_stride,
+                         int rows, const QsaShapes&, void* stream);
 void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
                        const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                        const KvHostPools* host = nullptr);

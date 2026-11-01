@@ -10,7 +10,7 @@
 
 namespace strata::distributed {
 
-inline constexpr size_t kAutoregressiveMaxLine = 1u << 20;
+inline constexpr size_t kAutoregressiveMaxLine = kDistributedMaxLineBytes;
 inline constexpr size_t kAutoregressiveChunk = 24u << 10;
 
 // Synchronous host wall time at service callback boundaries, not device kernel time.

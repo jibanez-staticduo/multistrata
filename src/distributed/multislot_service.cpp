@@ -11,7 +11,7 @@ namespace strata::distributed {
 namespace {
 Failure bad(std::string_view message) { return Failure::fail(FailureCode::bad_frame, message); }
 Failure message(uint32_t rank, const MultiSlotCallbacks& cb, std::string& bytes) {
-    constexpr size_t chunk_size = 24u << 10, limit = (1u << 20) + 1;
+    constexpr size_t chunk_size = 24u << 10, limit = kDistributedMaxLineBytes + 1;
     std::string length = rank == 0 ? std::to_string(bytes.size()) : std::string{};
     if (auto f = cb.broadcast("multislot-message-length-v1", length)) return f;
     size_t count = 0;
@@ -114,6 +114,38 @@ Failure run_multislot_service(MultiSlotConfig config, const MultiSlotServiceCall
         return result;
     };
     const auto original_sample = callbacks.sample;
+    const auto original_speculate = callbacks.speculate;
+    if(original_speculate)callbacks.speculate = [&](const std::vector<MultiSlotProposal>& requests,
+                                                     std::vector<MultiSlotAccepted>& accepted) {
+        const auto [result,elapsed]=timed([&]{return original_speculate(requests,accepted);});
+        if(!result && timing_enabled)for(const auto& request:requests) {
+            auto found=timings.find(request.request.request_id);
+            if(found!=timings.end())found->second.decode_ns+=elapsed;
+        }
+        return result;
+    };
+    const auto original_batch = callbacks.execute_batch;
+    if (original_batch) callbacks.execute_batch = [&](const std::vector<MultiSlotBatchRow>& rows) {
+        const auto start = timing_enabled ? now_ns() : 0;
+        if (timing_enabled) for (const auto& row : rows) {
+            auto found = timings.find(row.request);
+            if (found != timings.end() && !queue_recorded[row.request]) {
+                const auto admitted = admitted_ns[row.request];
+                found->second.queue_ns = start >= admitted ? start - admitted : 0;
+                queue_recorded[row.request] = true;
+            }
+        }
+        const auto [result, elapsed] = timed([&] { return original_batch(rows); });
+        if (!result && timing_enabled) for (const auto& row : rows) {
+            auto found = timings.find(row.request);
+            if (found == timings.end()) continue;
+            // All rows overlap in the same batch. Each request records its
+            // observed batch wall time; these values must not be summed as GPU time.
+            if (row.phase == StepPhase::prefill) found->second.prefill_ns += elapsed;
+            else found->second.decode_ns += elapsed;
+        }
+        return result;
+    };
     callbacks.sample = [&](uint32_t slot, const ServeRequest& request, const std::vector<int32_t>& history,
                            uint64_t draw, int32_t& token) {
         const auto [result, elapsed] = timed([&] { return original_sample(slot, request, history, draw, token); });
@@ -138,7 +170,7 @@ Failure run_multislot_service(MultiSlotConfig config, const MultiSlotServiceCall
                 bool eof = false;
                 const auto wait = scheduler.active() ? 0 : std::min(1000u, operation_budget_ms / 4);
                 if (auto f = cb.poll(wait, action, eof)) return fail(f);
-                if (action.size() > (1u << 20)) return fail(bad("multislot input exceeds one MiB"));
+                if (action.size() > kDistributedMaxLineBytes) return fail(bad("multislot input exceeds 4 MiB"));
                 action = eof && action.empty() ? "S" : action.empty() ? "H" : "J" + action;
             }
             if (auto f = message(config.rank, cb.scheduler, action)) return fail(f);
@@ -177,6 +209,8 @@ Failure run_multislot_service(MultiSlotConfig config, const MultiSlotServiceCall
                     }
                 }
             }
+            // Admit the bounded burst already queued before packing prompt rows.
+            if(config.packed_prefill&&action!="H"&&scheduler.active()<config.slots)continue;
             const auto result = scheduler.tick();
             if (result.failure) return result.failure;
             if (config.rank == 0) cb.emit("health", {}, -1, scheduler.active() ? "busy" : "ready", {});

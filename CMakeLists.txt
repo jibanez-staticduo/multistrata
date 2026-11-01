@@ -101,6 +101,10 @@ option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF
 # the expert cache of every card); -DSTRATA_WINDOW_MAX_T=16 builds the wide CUDA engine.
 set(STRATA_WINDOW_MAX_T "auto" CACHE STRING "rows of a verify / batch window: 8, 16 or auto (HIP 16, CUDA 8)")
 set_property(CACHE STRATA_WINDOW_MAX_T PROPERTY STRINGS auto 8 16)
+option(STRATA_TP_WIDE_WINDOW "EXPERIMENTAL: CUDA TP3 logical window of 40 rows, native kernels tiled at 16" OFF)
+if(STRATA_TP_WIDE_WINDOW AND (NOT STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR NOT STRATA_BUILD_DISTRIBUTED))
+  message(FATAL_ERROR "STRATA_TP_WIDE_WINDOW requires the experimental CUDA distributed build")
+endif()
 if(NOT STRATA_WINDOW_MAX_T STREQUAL "auto" AND NOT STRATA_WINDOW_MAX_T STREQUAL "8" AND NOT STRATA_WINDOW_MAX_T STREQUAL "16")
   message(FATAL_ERROR "STRATA_WINDOW_MAX_T must be auto, 8 or 16 (got '${STRATA_WINDOW_MAX_T}')")
 endif()
@@ -113,6 +117,10 @@ if(STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA)
     endif()
   else()
     set(_strata_window_max_t ${STRATA_WINDOW_MAX_T})
+  endif()
+  if(STRATA_TP_WIDE_WINDOW)
+    set(_strata_window_max_t 40)
+    add_compile_definitions(STRATA_TP_WIDE_WINDOW=1)
   endif()
   add_compile_definitions(STRATA_VERIFY_MAX_T=${_strata_window_max_t})
   message(STATUS "Strata: verify / batch windows hold up to ${_strata_window_max_t} rows")
@@ -2863,9 +2871,14 @@ if(STRATA_BUILD_DISTRIBUTED)
 
   # Preserve the original native CUDA arithmetic; these files do not inherit fast-math source flags.
   add_library(strata_tp_cuda STATIC src/kernels/cuda/tp/linear.cu src/kernels/cuda/tp/moe.cu
-                                  src/kernels/cuda/tp/gdn.cu src/kernels/cuda/tp/qsa.cu)
+                                  src/kernels/cuda/tp/gdn.cu src/kernels/cuda/tp/qsa.cu
+                                  src/kernels/cuda/tp/b12x_pack.cu)
   target_include_directories(strata_tp_cuda PUBLIC include PRIVATE third_party/ggml)
   target_link_libraries(strata_tp_cuda PUBLIC strata_kernels CUDA::cudart)
+  add_executable(tp_b12x_pack_parity tests/distributed/tp_b12x_pack_parity.cu)
+  target_link_libraries(tp_b12x_pack_parity PRIVATE strata_tp_cuda)
+  add_test(NAME distributed_tp_b12x_pack_parity COMMAND tp_b12x_pack_parity)
+  set_tests_properties(distributed_tp_b12x_pack_parity PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
   add_executable(tp_expert_parity tests/distributed/tp_expert_parity.cu)
   target_include_directories(tp_expert_parity PRIVATE include third_party/ggml)
   target_link_libraries(tp_expert_parity PRIVATE strata_tp_cuda)
@@ -2904,6 +2917,81 @@ if(STRATA_BUILD_DISTRIBUTED)
                             ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata-distributed PRIVATE strata_engine strata_tp_cuda strata_kernels_cpu
                         ${CMAKE_DL_LIBS} Threads::Threads)
+  add_executable(tp_kv_slot_growth tests/distributed/tp_kv_slot_growth.cu)
+  target_compile_definitions(tp_kv_slot_growth PRIVATE STRATA_BUILD_DISTRIBUTED STRATA_DISTRIBUTED_CUDA)
+  target_link_libraries(tp_kv_slot_growth PRIVATE strata_engine)
+  add_test(NAME distributed_tp_kv_slot_growth COMMAND tp_kv_slot_growth)
+  set_tests_properties(distributed_tp_kv_slot_growth PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
+  add_executable(fast_assets_probe tests/distributed/fast_assets_probe.cpp src/distributed/fast_assets.cpp)
+  target_compile_definitions(fast_assets_probe PRIVATE STRATA_BUILD_DISTRIBUTED STRATA_DISTRIBUTED_CUDA)
+  target_link_libraries(fast_assets_probe PRIVATE strata_engine)
+  add_executable(tp_fast_qsa src/kernels/qsa_prompt_attn_parity.cpp
+    src/kernels/cuda/tp/qsa_fast_decode.cu src/kernels/cuda/tp/qsa_fast_prompt.cu)
+  target_compile_definitions(tp_fast_qsa PRIVATE STRATA_QSA_TP_PARITY=1)
+  target_link_libraries(tp_fast_qsa PRIVATE strata_kernels)
+  target_compile_options(tp_fast_qsa PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>)
+  add_test(NAME distributed_tp_fast_qsa COMMAND tp_fast_qsa 4096 32 1)
+  set_tests_properties(distributed_tp_fast_qsa PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
+  add_executable(tp_fast_gdn tests/distributed/tp_fast_gdn.cu src/kernels/cuda/tp/gdn_fast.cu)
+  target_link_libraries(tp_fast_gdn PRIVATE strata_kernels)
+  target_compile_options(tp_fast_gdn PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-use_fast_math>)
+  add_test(NAME distributed_tp_fast_gdn COMMAND tp_fast_gdn)
+  set_tests_properties(distributed_tp_fast_gdn PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
+  add_executable(tp_fast_gdn_batch tests/distributed/tp_fast_gdn_batch.cu
+    src/kernels/cuda/tp/gdn_batch.cu src/kernels/cuda/tp/fast_mixer.cu)
+  target_link_libraries(tp_fast_gdn_batch PRIVATE strata_kernels)
+  target_compile_options(tp_fast_gdn_batch PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+  add_test(NAME distributed_tp_fast_gdn_batch COMMAND tp_fast_gdn_batch)
+  set_tests_properties(distributed_tp_fast_gdn_batch PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
+  add_executable(tp_qsa_append_groups tests/distributed/tp_qsa_append_groups.cu)
+  target_link_libraries(tp_qsa_append_groups PRIVATE strata_kernels)
+  add_test(NAME distributed_tp_qsa_append_groups COMMAND tp_qsa_append_groups)
+  set_tests_properties(distributed_tp_qsa_append_groups PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/tp/nvfp4.cu")
+    add_executable(tp_nvfp4_parity tests/distributed/tp_nvfp4_parity.cu src/kernels/cuda/tp/nvfp4.cu)
+    target_link_libraries(tp_nvfp4_parity PRIVATE strata_prefill)
+    add_test(NAME distributed_tp_nvfp4_parity COMMAND tp_nvfp4_parity)
+    set_tests_properties(distributed_tp_nvfp4_parity PROPERTIES SKIP_RETURN_CODE 77 LABELS "distributed;cuda")
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/distributed/fast_mixer.cpp" AND
+     EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/tp/nvfp4.cu")
+    add_executable(strata-distributed-fast src/program/distributed_fast.cpp
+      src/distributed/fast_config.cpp src/distributed/fast_assets.cpp
+      src/distributed/fast_execution.cpp src/distributed/fast_model.cpp
+      src/distributed/fast_service.cpp src/distributed/fast_runtime.cpp
+      src/distributed/fast_mixer.cpp src/distributed/nvfp4_experts.cpp
+      src/kernels/cuda/tp/nvfp4.cu src/kernels/cuda/tp/fast_mixer.cu
+      src/kernels/cuda/tp/qsa_fast_decode.cu src/kernels/cuda/tp/qsa_fast_prompt.cu
+      src/kernels/cuda/tp/gdn_fast.cu src/kernels/cuda/tp/gdn_batch.cu
+      src/distributed/nccl_transport.cpp
+      src/distributed/session.cpp src/distributed/control_tcp.cpp
+      src/distributed/serve_protocol.cpp src/distributed/autoregressive.cpp
+      src/distributed/speculative.cpp src/distributed/multislot.cpp src/distributed/multislot_service.cpp)
+    target_compile_definitions(strata-distributed-fast PRIVATE STRATA_BUILD_DISTRIBUTED
+      STRATA_DISTRIBUTED_CUDA STRATA_NATIVE_EXPERTS)
+    target_include_directories(strata-distributed-fast PRIVATE include src
+      ${STRATA_NCCL_INCLUDE_DIR} ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(strata-distributed-fast PRIVATE strata_prefill strata_tp_cuda strata_spec
+      strata_kernels_cpu ${CMAKE_DL_LIBS} Threads::Threads)
+    target_compile_options(strata-distributed-fast PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    if(STRATA_TP_WIDE_WINDOW)
+      add_executable(tp_wide40_kernels tests/distributed/tp_wide40_kernels.cu src/kernels/cuda/tp/fast_mixer.cu)
+      target_include_directories(tp_wide40_kernels PRIVATE include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+      target_link_libraries(tp_wide40_kernels PRIVATE strata_kernels CUDA::cudart)
+    endif()
+    if(STRATA_BUILD_ROCE_EXPERIMENTAL)
+      find_library(STRATA_RDMACM_LIBRARY rdmacm REQUIRED)
+      set_target_properties(strata-distributed-fast PROPERTIES
+        BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR};$ORIGIN/../rdma-runtime;$ORIGIN/../../rdma-runtime")
+      target_sources(strata-distributed-fast PRIVATE src/distributed/fast_roce_api.cpp
+        src/distributed/control_rdma.cpp src/distributed/roce_backend.cpp
+        src/kernels/cuda/tp/roce_collective.cu third_party/rocenante/proxy.c)
+      target_compile_definitions(strata-distributed-fast PRIVATE STRATA_BUILD_ROCE_EXPERIMENTAL
+        STRATA_ROCE_PROXY_SHA256="${STRATA_ROCE_PROXY_SHA256}")
+      target_include_directories(strata-distributed-fast PRIVATE ${STRATA_IBVERBS_INCLUDE_DIR})
+      target_link_libraries(strata-distributed-fast PRIVATE ${STRATA_IBVERBS_LIBRARY} ${STRATA_RDMACM_LIBRARY})
+    endif()
+  endif()
   if(STRATA_BUILD_ROCE_EXPERIMENTAL)
     target_sources(strata-distributed PRIVATE src/distributed/roce_backend.cpp
                    src/kernels/cuda/tp/roce_collective.cu third_party/rocenante/proxy.c)
@@ -2955,6 +3043,9 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   find_package(Threads REQUIRED)  # test_session drives three ranks in three threads over real loopback TCP
 
   add_executable(test_hybrid_backend tests/distributed/test_hybrid_backend.cpp)
+  add_executable(test_segmented_reduce tests/distributed/test_segmented_reduce.cpp)
+  target_include_directories(test_segmented_reduce PRIVATE include)
+  add_test(NAME test_segmented_reduce COMMAND test_segmented_reduce)
   target_include_directories(test_hybrid_backend PRIVATE include)
   target_link_libraries(test_hybrid_backend PRIVATE strata_warnings)
   add_test(NAME test_hybrid_backend COMMAND test_hybrid_backend)
@@ -2978,12 +3069,22 @@ if(STRATA_BUILD_DISTRIBUTED_TESTS)
   target_link_libraries(test_nccl_graph_api PRIVATE strata_warnings)
   add_test(NAME test_nccl_graph_api COMMAND test_nccl_graph_api)
 
+  add_executable(test_fast_execution tests/distributed/test_fast_execution.cpp src/distributed/fast_execution.cpp)
+  target_include_directories(test_fast_execution PRIVATE include src)
+  target_link_libraries(test_fast_execution PRIVATE strata_warnings)
+  add_test(NAME test_fast_execution COMMAND test_fast_execution)
+
   # three ranks forming one session: the join protocol on a scripted channel, framing and sockets over real TCP
   add_executable(test_session tests/distributed/test_session.cpp
                              src/distributed/session.cpp src/distributed/control_tcp.cpp)
   target_include_directories(test_session PRIVATE include)
   target_link_libraries(test_session PRIVATE strata_warnings Threads::Threads)
   add_test(NAME test_session COMMAND test_session)
+  add_executable(test_rdma_control tests/distributed/test_rdma_control.cpp
+    src/distributed/session.cpp src/distributed/control_tcp.cpp)
+  target_include_directories(test_rdma_control PRIVATE include src)
+  target_link_libraries(test_rdma_control PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME test_rdma_control COMMAND test_rdma_control)
 
   add_executable(test_memory_phase tests/distributed/test_memory_phase.cpp)
   target_include_directories(test_memory_phase PRIVATE include)

@@ -38,6 +38,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_pattn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
@@ -67,6 +68,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <mutex>
@@ -1609,11 +1611,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.borrow_spill = m.borrowed && borrow_spill;
     bool ok = true;
     // one-time: events, the stager, the host buffers (for the largest chunk), the identity page table
-    for (int i = 0; i < ring_cap(); ++i) {
+    for (int i = 0; tp_ == nullptr && i < ring_cap(); ++i) {
         if (cudaEventCreateWithFlags(&m.copied[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
         if (cudaEventCreateWithFlags(&m.used[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
     }
-    if (!m.stager) {
+    if (tp_ == nullptr && !m.stager) {
         m.stager = std::make_unique<Stager>();
         const int hw = (int) std::thread::hardware_concurrency();
         const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
@@ -1847,8 +1849,8 @@ bool Prefill::carve(size_t T, void* alloc) {
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
     }
-    m.ring = ring_slots(T);
-    const int nstage = stage_slots(T);   // the staged walk may use STAGE_GRP of them
+    m.ring = tp_ != nullptr ? 0 : ring_slots(T);
+    const int nstage = tp_ != nullptr ? 0 : stage_slots(T);
     if (o.base == nullptr && m.ring > 0) {
         // OWNED buffers: the ring in ONE allocation.  384 separate 2.7 MiB cudaMallocs each round up to a 2 MiB page
         // (~1.3 MiB a slot, ~0.5 GiB in all) that no count ever saw.  A borrowed region keeps its per-slot layout (and
@@ -1912,6 +1914,22 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+
+bool Prefill::rebind_session(core::SessionState& session, std::string& error) {
+    auto& m = *impl_;
+    if (tp_ == nullptr || m.ss == nullptr || session.max_cells != m.ss->max_cells ||
+        session.layer_lo != m.ss->layer_lo || session.layer_hi != m.ss->layer_hi ||
+        session.k != m.ss->k || session.gdn_ord0 != m.ss->gdn_ord0 || session.qsa_ord0 != m.ss->qsa_ord0) {
+        error = "prefill: incompatible TP session rebind";
+        return false;
+    }
+    if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+        error = "prefill: previous session work did not finish";
+        return false;
+    }
+    m.ss = &session;
+    return true;
+}
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err, const char** why) {
@@ -2980,7 +2998,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const char* e = std::getenv("STRATA_KV_PREFETCH");
         return e ? std::atoi(e) != 0 : false;
     }();
-    const bool kv_prefetch = kv_prefetch_on;
+    const bool kv_prefetch = kv_prefetch_on && packed_ == nullptr;
     if (kv_prefetch) {
         if ((!m.kv_copy && cudaStreamCreateWithFlags(&m.kv_copy, cudaStreamNonBlocking) != cudaSuccess) ||
             (!m.kv_released && cudaEventCreateWithFlags(&m.kv_released, cudaEventDisableTiming) != cudaSuccess) ||
@@ -3054,8 +3072,31 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0, C](int64_t c0, int buf, std::string& e) -> bool {
+    auto ple_gather = [this, &m, &ss, tokens, n, prev0, C](int64_t c0, int buf, std::string& e) -> bool {
         const int64_t T = std::min(C, n - c0);
+        if (packed_ != nullptr) {
+            for (size_t i = 0; i < packed_->segments.size(); ++i) {
+                const auto& segment = packed_->segments[i];
+                const auto& session = *packed_->sessions[i];
+                int32_t pv[2] = {session.ple_prev[0], session.ple_prev[1]};
+                const int64_t end = std::min<int64_t>(c0 + T, segment.first + segment.count);
+                for (int64_t row = std::max(c0, segment.first); row < end; ++row) {
+                    const int32_t tok = (int32_t) tokens[row];
+                    strata::kernels::ngram_rows(&tok, pv, 1, session.ple.consts,
+                                                m.ple_rows[buf].data() + row * strata::kernels::PLE_N_HEADS);
+                    pv[0] = pv[1];
+                    pv[1] = tok;
+                }
+            }
+            if (ple_compact_on() && m.ple_pageable[buf].empty() && m.ple_raw_dev != nullptr &&
+                ss.ple.table->gather_raw_iq4nl(m.ple_rows[buf].data(), (size_t) T,
+                                                (uint8_t*) m.ple_emb_host[buf])) {
+                m.ple_compact[buf] = true;
+                return true;
+            }
+            m.ple_compact[buf] = false;
+            return ss.ple.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
+        }
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
@@ -3287,7 +3328,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         };
         for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
         // ---- the QSA step records of every position in the chunk
-        for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
+        if (packed_ != nullptr) {
+            for (const auto& segment : packed_->segments)
+                for (int64_t t = 0; t < segment.count; ++t)
+                    strata::kernels::qsa_step_fill(m.steps_host.data() + (segment.first + t) * strata::kernels::kStepCount,
+                                                   segment.position + t, s);
+        } else {
+            for (int64_t t = 0; t < T; ++t)
+                strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
+        }
         if (!m.steps_up.upload(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount, m.cs)) {
             err = "prefill: the QSA step records' upload failed";
             return false;
@@ -3665,8 +3714,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
                     if (e16_lo) m.gemm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
                     try {
-                        strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
-                                                                  gate, (int) nb, m.cs);
+                        if (packed_ == nullptr) {
+                            strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn,
+                                                                      gated, gate, (int) nb, m.cs);
+                        } else {
+                            for (size_t i = 0; i < packed_->segments.size(); ++i) {
+                                const auto& segment = packed_->segments[i];
+                                const int64_t first = std::max<int64_t>(s0, segment.first);
+                                const int64_t end = std::min<int64_t>(s0 + nb, segment.first + segment.count);
+                                if (first >= end) continue;
+                                const int64_t row = first - s0;
+                                strata::kernels::native_ple_postops_batch(
+                                    key + row * HD, m.R + first * D, val + row * N, packed_->sessions[i]->ple.hist,
+                                    pw, qn + row * HD, gated + row * HD, gate + row * 4, (int) (end - first), m.cs);
+                            }
+                        }
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                 }
                 stats_.ms_ple += ms_since(tp);
@@ -3677,11 +3739,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     strata::kernels::PleOut po;
                     po.normalized = m.ple_norm;
                     po.result = m.R + t * D;
+                    core::SessionState* ple_session = &ss;
+                    if (packed_ != nullptr) {
+                        for (size_t i = 0; i < packed_->segments.size(); ++i) {
+                            const auto& segment = packed_->segments[i];
+                            if (t >= segment.first && t < segment.first + segment.count) {
+                                ple_session = packed_->sessions[i];
+                                break;
+                            }
+                        }
+                    }
                     try {
-                        strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
-                                                   ss.ple.scratch, m.cs);
+                        strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ple_session->ple.hist,
+                                                   ple_session->ple.w, po, ple_session->ple.scratch, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
-                    strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
+                    strata::kernels::ple_history_advance(ple_session->ple.hist, m.ple_norm, m.cs);
                 }
                 stats_.ms_ple += ms_since(tp);
             }
@@ -3784,7 +3856,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     core::NativeDense::hc_bf16_release(m.cs, 0, 0);
                     core::NativeDense::hc_bf16_release(m.cs, 1, 0);
                 }
-                if (half == 0 && !core::is_qsa_layer(g, l)) {
+                if (half == 0 && tp_ != nullptr) {
+                    core::TensorParallelRows rows;
+                    rows.count = T;
+                    rows.position = p0;
+                    rows.positions = m.steps_dev + strata::kernels::kStepPos;
+                    rows.position_stride = strata::kernels::kStepCount;
+                    rows.slot = tp_slot_;
+                    if (packed_ != nullptr) {
+                        rows.segments = packed_->segments.data();
+                        rows.segment_count = (int) packed_->segments.size();
+                    }
+                    if (!tp_->mixer(l, rows, m.mixed, m.bo, m.cs, err)) return false;
+                } else if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
                     const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
                                           *wo = need(v, "ssm_out.weight", err), *wa = need(v, "ssm_alpha.weight", err),
@@ -4172,8 +4256,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     };
                     // Only the router needs to finish before readback. Queue the shared expert afterwards
                     // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
-                    const bool defer_shared = !stream_all && stream_ahead_enabled();
-                    if (!defer_shared && !shared_expert()) return false;
+                    const bool defer_shared = tp_ == nullptr && !stream_all && stream_ahead_enabled();
+                    const bool shared_sharded=tp_&&tp_->has_sharded_shared();
+                    if (!shared_sharded && !defer_shared && !shared_expert()) return false;
+                    if (tp_ != nullptr) {
+                        core::TensorParallelRows rows;
+                        rows.count = T;
+                        rows.position = p0;
+                        rows.positions = m.steps_dev + strata::kernels::kStepPos;
+                        rows.position_stride = strata::kernels::kStepCount;
+                        rows.slot = tp_slot_;
+                        if (packed_ != nullptr) {
+                            rows.segments = packed_->segments.data();
+                            rows.segment_count = (int) packed_->segments.size();
+                        }
+                        if (!tp_->experts(l, rows, m.mixed, m.ids, m.w, (int) K, m.Dm, m.cs, err)) return false;
+                        if(shared_sharded) {
+                            const auto result=cudaMemcpyAsync(m.bo,m.Dm,size_t(T)*N*sizeof(float),cudaMemcpyDeviceToDevice,(cudaStream_t)m.cs);
+                            if(result!=cudaSuccess){err="prefill: shared TP output copy failed";return false;}
+                        } else {
+                            moe_shared_init(m.shared, m.sg, m.bo, T, m.cs);
+                            strata::kernels::add_inplace(m.bo, m.Dm, T * N, m.cs);
+                        }
+                    } else {
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -5534,6 +5639,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                 }
+                    }
                 pt.mark(kPfHcWrite, cs);   // the write-back (and the next half's norm) on its own line; it used to be charged to the phase before
                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
                 // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
@@ -5724,8 +5830,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     }
     // Do not drain the successor here. This is the overlap: an intermediate
     // stage can return while later GPUs are still processing the previous chunk.
-    ss.ple_prev[0] = prev[0];
-    ss.ple_prev[1] = prev[1];
+    if (packed_ == nullptr) {
+        ss.ple_prev[0] = prev[0];
+        ss.ple_prev[1] = prev[1];
+    }
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
         cudaStreamSynchronize(m.cs);
         auto bad = [&](const float* d, int64_t n) {
@@ -7087,7 +7195,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 #endif
     // layer-major prefill: STRATA_PREFILL_LAYER_MAJOR=1 / 0 win; unset, it is on for a CUDA layer split (sm120_series.hpp
     // prefill_layer_major_default; STRATA_DEFAULTS=026 and a HIP build leave it off)
-    if (hand_in_ == nullptr && impl_ &&
+    if (tp_ == nullptr && hand_in_ == nullptr && impl_ &&
         strata::prefill_layer_major_resolve(lm_env_text(), lm_hip, stage_count(), strata::qwen_defaults_026())) {
         const bool by_default = !lm_env_explicit();
         for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_by_default_ = by_default;
@@ -7137,6 +7245,141 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                  "streamed (STRATA_MMQ_DIRECT, totals)\n", (long long) p->stage_lb_,
                          (long long) p->stage_le_, (long long) p->stats_.experts_direct,
                          (long long) p->stats_.experts_resident, (long long) p->stats_.experts_streamed);
+    }
+    return true;
+}
+
+bool Prefill::run_packed(const std::vector<PrefillPackedPrompt>& prompts, std::string& err) {
+    err.clear();
+    if (tp_ == nullptr || impl_ == nullptr || prompts.empty() || prompts.size() > 8) {
+        err = "prefill: packed prompts require tensor parallelism and 1..8 segments";
+        return false;
+    }
+    Impl& m = *impl_;
+    if (m.ss == nullptr || m.g == nullptr || prompts.size() > (size_t) std::numeric_limits<int>::max() ||
+        stage_lb_ != 0 || (stage_le_ >= 0 && stage_le_ != m.g->n_layers) || next_ != nullptr ||
+        hand_in_ != nullptr || helper_ != nullptr || m.pp != nullptr || embd_rows != nullptr ||
+        !tap_layers_.empty() || on_chunk || on_stage_chunk || on_taps || should_stop || stop_at_chunk) {
+        err = "prefill: packed prompts require a full-model text-only TP path without taps, split, or peer execution";
+        return false;
+    }
+    const auto& kva = kva_config();
+    if (kva.on || kva.capture) {
+        err = "prefill: packed prompts do not support STRATA_KVA";
+        return false;
+    }
+    if (m.T <= 0) {
+        err = "prefill: packed prompts have no initialized chunk capacity";
+        return false;
+    }
+
+    PackedContext context;
+    context.segments.reserve(prompts.size());
+    context.sessions.reserve(prompts.size());
+    std::vector<int64_t> tokens;
+    std::vector<int32_t> slots;
+    tokens.reserve((size_t) m.T);
+    for (const auto& prompt : prompts) {
+        if (prompt.session == nullptr || prompt.slot < 0 || prompt.tokens == nullptr || prompt.count <= 0 ||
+            prompt.position < 0 || prompt.position > std::numeric_limits<int32_t>::max() ||
+            prompt.count - 1 > std::numeric_limits<int32_t>::max() - prompt.position ||
+            prompt.count > prompt.session->max_cells ||
+            prompt.position > prompt.session->max_cells - prompt.count ||
+            prompt.count > m.T - (int64_t) tokens.size()) {
+            err = "prefill: packed prompt has invalid tokens, position, session, or exceeds chunk capacity";
+            return false;
+        }
+        if (std::find(slots.begin(), slots.end(), prompt.slot) != slots.end() ||
+            std::find(context.sessions.begin(), context.sessions.end(), prompt.session) != context.sessions.end()) {
+            err = "prefill: packed prompt slots and sessions must be unique";
+            return false;
+        }
+        const core::SessionState& base = *m.ss;
+        const core::SessionState& session = *prompt.session;
+        if (session.max_cells != base.max_cells || session.layer_lo != base.layer_lo || session.layer_hi != base.layer_hi ||
+            session.k != base.k || session.qsa_ord0 != base.qsa_ord0 || session.qsa_alloc != base.qsa_alloc ||
+            session.gdn_ord0 != base.gdn_ord0 || session.gdn_alloc != base.gdn_alloc ||
+            session.ple.ready() != base.ple.ready() ||
+            (base.ple.ready() &&
+             (session.ple.table != base.ple.table || session.ple.w.key_bf16 != base.ple.w.key_bf16 ||
+              session.ple.w.key_codes != base.ple.w.key_codes || session.ple.w.key_scales != base.ple.w.key_scales ||
+              session.ple.w.key_native_data != base.ple.w.key_native_data ||
+              session.ple.w.key_native_type != base.ple.w.key_native_type ||
+              session.ple.w.key_native_q8_1 != base.ple.w.key_native_q8_1 ||
+              session.ple.w.value_bf16 != base.ple.w.value_bf16 ||
+              session.ple.w.norm_key != base.ple.w.norm_key || session.ple.w.norm_query != base.ple.w.norm_query ||
+              session.ple.w.norm_conv != base.ple.w.norm_conv ||
+              session.ple.w.conv1d_f16 != base.ple.w.conv1d_f16 ||
+              std::memcmp(&session.ple.consts, &base.ple.consts, sizeof(base.ple.consts)) != 0))) {
+            err = "prefill: packed prompt session is incompatible with the initialized session";
+            return false;
+        }
+        for (int64_t i = 0; i < prompt.count; ++i) {
+            if (prompt.tokens[i] < 0 || prompt.tokens[i] >= m.g->n_vocab ||
+                prompt.tokens[i] > std::numeric_limits<int32_t>::max()) {
+                err = "prefill: packed prompt token ID is outside the vocabulary";
+                return false;
+            }
+            tokens.push_back(prompt.tokens[i]);
+        }
+        context.segments.push_back(
+            {prompt.slot, (int64_t) (tokens.size() - (size_t) prompt.count), prompt.count, prompt.position});
+        context.sessions.push_back(prompt.session);
+        slots.push_back(prompt.slot);
+    }
+
+    const int64_t total = (int64_t) tokens.size();
+    const int64_t old_force = force_chunk_;
+    const bool old_single = force_single_, old_planned = force_planned_;
+    const int32_t old_slot = tp_slot_;
+    core::SessionState* const old_session = m.ss;
+    PackedContext* const old_packed = packed_;
+    struct Restore {
+        Prefill& self;
+        Impl& impl;
+        int64_t force;
+        bool single, planned;
+        int32_t slot;
+        core::SessionState* session;
+        PackedContext* packed;
+        ~Restore() {
+            self.force_chunk_ = force;
+            self.force_single_ = single;
+            self.force_planned_ = planned;
+            self.tp_slot_ = slot;
+            impl.ss = session;
+            self.packed_ = packed;
+        }
+    } restore{*this, m, old_force, old_single, old_planned, old_slot, old_session, old_packed};
+
+    packed_ = &context;
+    force_chunk_ = total;
+    force_single_ = true;
+    force_planned_ = false;
+    tp_slot_ = prompts.front().slot;
+    std::string flat_err;
+    if (!run_impl(tokens.data(), total, 0, flat_err)) {
+        err = flat_err;
+        return false;
+    }
+    for (size_t i = 0; i < context.segments.size(); ++i) {
+        const auto& segment = context.segments[i];
+        auto& session = *context.sessions[i];
+        int32_t prev0 = session.ple_prev[0], prev1 = session.ple_prev[1];
+        for (int64_t row = segment.first; row < segment.first + segment.count; ++row) {
+            prev0 = prev1;
+            prev1 = (int32_t) tokens[(size_t) row];
+        }
+        session.ple_prev[0] = prev0;
+        session.ple_prev[1] = prev1;
+    }
+    for (size_t i = 0; i < context.segments.size(); ++i) {
+        const auto& segment = context.segments[i];
+        if (on_packed_chunk &&
+            !on_packed_chunk(segment.slot, m.R + (size_t) segment.first * (size_t) (m.g->n_embd * m.g->hc),
+                             segment.count, segment.position, err)) {
+            return false;
+        }
     }
     return true;
 }

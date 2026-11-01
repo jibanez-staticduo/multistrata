@@ -1311,11 +1311,12 @@ namespace {
 // 7+ tokens lost its last entries).  A window of 9..16 rows (up to 160 entries) runs the same kernel on 256 threads;
 // one block size per window class, so a narrow window launches exactly the 128-thread kernel it always did.
 constexpr int kResidentPlanNarrow = 128;
-constexpr int kResidentPlanMax = kVerifyMaxT > kVerifyNarrowT ? 256 : kResidentPlanNarrow;
+constexpr int kResidentPlanMax = kVerifyMaxT > 16 ? 512 :
+                                 kVerifyMaxT > kVerifyNarrowT ? 256 : kResidentPlanNarrow;
 static_assert(kVerifyNarrowT * 10 <= kResidentPlanNarrow, "resident_plan: one thread per entry");
 static_assert(kVerifyMaxT * 10 <= kResidentPlanMax, "resident_plan: one thread per entry");
 // the parallel scan keeps one partial sum per warp in s_wsum[NT / 32] and packs (entries << 16 | groups) in an int
-static_assert(kResidentPlanMax <= 256 && kResidentPlanMax % 32 == 0, "resident_plan: at most 8 warps");
+static_assert(kResidentPlanMax <= 512 && kResidentPlanMax % 32 == 0, "resident_plan: at most 16 warps");
 static_assert(kResidentPlanMax < 32768, "resident_plan: the packed entry count must stay below 2^15");
 template <int NT>
 __global__ void __launch_bounds__(NT) resident_plan_kernel(const int32_t* __restrict__ ids, int n, int k, const int32_t* __restrict__ res,

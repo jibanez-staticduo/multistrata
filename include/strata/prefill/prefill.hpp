@@ -14,6 +14,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/tensor_parallel.hpp"
 #include "strata/core/weights.hpp"
 
 #include <cstdint>
@@ -21,6 +22,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
@@ -39,6 +41,14 @@ struct PrefillStats {
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
     double ms_ple = 0;
+};
+
+struct PrefillPackedPrompt {
+    core::SessionState* session = nullptr;
+    int32_t slot = -1;
+    const int64_t* tokens = nullptr;
+    int64_t count = 0;
+    int64_t position = 0;
 };
 
 }  // namespace strata::prefill
@@ -65,6 +75,9 @@ public:
     ~Prefill();
     Prefill(const Prefill&) = delete;
     Prefill& operator=(const Prefill&) = delete;
+    void set_tensor_parallel(core::TensorParallelHooks* hooks) { tp_ = hooks; }
+    void set_tensor_parallel_slot(int32_t slot) { tp_slot_ = slot; }
+    bool rebind_session(core::SessionState&, std::string& error);
 
     /// Frees every buffer, stream and event `init` made (as the destructor does) and starts over empty, so `init` can
     /// run again - with a smaller chunk when the first one did not fit.  The stage range (`set_stage`) and the
@@ -177,6 +190,9 @@ public:
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    /// Runs independent contiguous prompts as one tensor-parallel batch. The total must fit this instance's chunk.
+    bool run_packed(const std::vector<PrefillPackedPrompt>& prompts, std::string& err);
+    std::function<bool(int32_t slot, const float* R_rows, int64_t n, int64_t pos0, std::string& err)> on_packed_chunk;
 
     const PrefillStats& stats() const { return stats_; }
 
@@ -272,6 +288,13 @@ public:
     }
 
 private:
+    core::TensorParallelHooks* tp_ = nullptr;
+    int32_t tp_slot_ = 0;
+    struct PackedContext {
+        std::vector<core::TensorParallelSegment> segments;
+        std::vector<core::SessionState*> sessions;
+    };
+    PackedContext* packed_ = nullptr;
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool

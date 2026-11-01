@@ -52,6 +52,10 @@ void scale_down_rows(float* d, int64_t ld, const int32_t* bounds, int n, const f
 /// over `src`, as before.
 void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int ggml_type, int64_t cols,
                       int64_t ld, int64_t tokens, int k_used, void* stream);
+/// NVFP4 W4A4: quantize each token once, then publish identical bytes and scales
+/// to its routed rows. slot maps each original token/expert visit to packed order.
+void quantize_nvfp4_scatter(const float* x, const int32_t* slot, void* xq, float* scales,
+                            int64_t cols, int64_t ld, int64_t tokens, int k_used, void* stream);
 
 constexpr int kGatherGroupMax = 16;
 /// STRATA_MMQ_DIRECT: each expert's own weight address (gate|up or down), in place of `w + z * expert_bytes` -
@@ -82,6 +86,14 @@ struct Product {
     /// and only where `tab_fits` said so.
     const WeightTab* tab = nullptr;
 };
+
+// TP's resident prefill: compact the expert tile grid on the device. The
+// product and arithmetic are unchanged; empty expert/column tiles are omitted.
+bool nvfp4_prefill_tiles_available();
+bool nvfp4_decode_tiles_available();
+/// Small expert batches use J8 tiles with the same packed FP4 activation layout.
+void nvfp4_decode_tiles(const Product& p, int32_t* tiles, void* stream);
+void nvfp4_prefill_tiles(const Product& product, int32_t* tile_bounds, void* stream);
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
 class Context {

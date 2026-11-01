@@ -1,3 +1,6 @@
+> Experimental MultiStrata fork: native NVFP4 TP3 across three DGX Sparks over
+> RoCE. See [MULTISTRATA.md](MULTISTRATA.md) for the measured status and how to help.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">

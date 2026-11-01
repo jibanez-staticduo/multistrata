@@ -66,6 +66,19 @@ def manifest(root, entries, required):
 def validated(supplied):
     if not isinstance(supplied, dict):
         raise RunnerError("config must be an object")
+    if supplied.get("profile") == "nvfp4_tp3":
+        spec = importlib.util.spec_from_file_location("_tp3_fast_profile", Path(__file__).with_name("fast_profile.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        config = module.validated(supplied, _common)
+        source = Path(config["server_source_root"])
+        required = {"tools/strata_tokenizer.py", "serve/server.py", "serve/distributed_backend.py", "serve/chat_template.jinja"}
+        for package in ("serve", "strata_control"):
+            required.update(str(p.relative_to(source)) for p in (source / package).rglob("*.py") if "__pycache__" not in p.parts)
+        manifest(source, config.get("source_manifest"), required)
+        manifest(Path(config["tokenizer_dir"]), config.get("tokenizer_manifest"),
+                 {"vocab.json", "merges.txt", "token_type.json", "tokenizer.json"})
+        return config
     config = dict(supplied)
     for key in ("server_source_root", "tokenizer_dir", "evidence_dir"):
         if not absolute(config.get(key)):
@@ -218,13 +231,16 @@ def validated(supplied):
 
 
 def server_config(config):
+    # Group health is published between native steps, including long prefill.
+    health_timeout = max(30, int(config["options"]["timeout-ms"]) / 1000 + 5)
     return {"host": "127.0.0.1", "port": 18080, "tokenizer": config["tokenizer_dir"],
             "arch": "qwen4exp", "model_name": "qwen3.8-flash-next-tp3-experimental",
             "parallel": config["parallel"], "open_browser": False, "before_load": None,
             "cwd": config["server_source_root"], "sampling": {"temperature": 0},
             "distributed": {"command": [config["binary"], "--mode", config["mode"], *config["args"]],
+                            "inherit_stderr": True,
                             "parallel": config["parallel"],
-                            "ready_timeout": config["ready_timeout"], "health_timeout": 30,
+                            "ready_timeout": config["ready_timeout"], "health_timeout": health_timeout,
                             "process_deadline": config["request_timeout"],
                             "cancel_timeout": config["cancel_timeout"], "shutdown_timeout": config["shutdown_timeout"]}}
 
@@ -242,7 +258,7 @@ def drain(stream, path, secret, overflow):
     needle = secret.encode()
     with path.open("wb") as output:
         while True:
-            chunk = stream.read(8192)
+            chunk = stream.read1(8192)
             pending += chunk
             pending = pending.replace(needle, b"[redacted]")
             keep = 0
@@ -255,14 +271,21 @@ def drain(stream, path, secret, overflow):
                 overflow.set()
                 emit = emit[:max(0, MAX_LOG - written)]
             output.write(emit)
+            output.flush()
             written += len(emit)
             if not chunk:
                 return
 
 
-def inspect_network(text):
+def inspect_network(text, rdma_only=False):
     if re.search(r"Using network Socket|via NET/Socket|NET/Socket/", text, re.I):
         return "socket tensor transport detected"
+    if rdma_only:
+        if 'NCCL INFO' in text or 'NCCL version' in text:
+            return "NCCL initialization detected in RDMA-only mode"
+        if 'STRATA_RDMA_ONLY transport=roce bootstrap=rdma_cm control=rdma nccl_initialized=0' not in text:
+            return "missing RDMA-only runtime evidence"
+        return ""
     if not re.search(r"Using network IB|via NET/IB", text):
         return "missing selected NET/IB evidence"
     return ""
@@ -301,6 +324,7 @@ def run(supplied, execute=False):
                    "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
                    "PYTHONPATH": os.pathsep.join((config["server_source_root"], str(Path(config["server_source_root"]) / "tools")))}
     environment.update(config.get("env", {}))
+    environment.update(config.get("engine_env", {}))
     raw_network = evidence / "nccl.raw"
     environment.update(STRATA_TP3_CREDENTIAL=secret, NCCL_NET="IB", NCCL_DEBUG="INFO",
                        NCCL_DEBUG_SUBSYS="INIT,NET", NCCL_CONF_FILE="/dev/null", NCCL_DEBUG_FILE=str(raw_network))
@@ -321,7 +345,7 @@ def run(supplied, execute=False):
             thread = threading.Thread(target=drain, args=(stream, evidence / name, secret, overflow), daemon=True)
             thread.start()
             threads.append(thread)
-        deadline = started + config["process_timeout_s"]
+        deadline = started + config["process_timeout_s"] if config["process_timeout_s"] else math.inf
         while process.poll() is None:
             if interrupted.is_set():
                 reason = "wrapper received termination signal"
@@ -369,7 +393,8 @@ def run(supplied, execute=False):
     (evidence / "nccl.log").write_bytes(network)
     raw_network.unlink(missing_ok=True)
     reason = reason or ("wrapper received termination signal" if interrupted.is_set() else "")
-    reason = reason or ("nonzero process exit" if process and process.returncode != 0 else "") or inspect_network(network.decode(errors="replace"))
+    reason = reason or ("nonzero process exit" if process and process.returncode != 0 else "") or inspect_network(
+        network.decode(errors="replace"), config.get('engine_env', {}).get('STRATA_TP_RDMA_ONLY') == '1')
     for name in ("stdout.log", "stderr.log"):
         (evidence / name).touch(exist_ok=True)
     receipt.update(status="failed" if reason else "completed", reason=reason, timed_out=timed_out,

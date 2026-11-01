@@ -21,7 +21,7 @@ struct ServeRequest {
     std::map<int32_t, float> logit_bias;
 };
 
-// One JSON value, at most 1 MiB and 16 nested containers. Failure leaves out unchanged.
+// One JSON value, at most kDistributedMaxLineBytes and 16 nested containers. Failure leaves out unchanged.
 // generate requires type, request_id, ids, max_new and sampling; cancel requires
 // type and request_id; shutdown requires only type. The context is limited to kDistributedMaxContext.
 bool parse_serve_request(std::string_view json, int32_t n_vocab, uint32_t context,

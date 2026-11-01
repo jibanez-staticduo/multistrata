@@ -702,6 +702,24 @@ void qsa_set_kv_elastic(bool enabled, int64_t init_cells) {
     if (init_cells > 0) g_kv_elastic_init = init_cells;
 }
 bool qsa_kv_elastic() { return g_kv_elastic; }
+bool qsa_kv_elastic_grow_state(const QsaState& state, int64_t cells) {
+    if (state.kv_elastic < 0) return cells >= 0 && cells <= state.max_cells;
+    if (cells < 0 || cells > state.max_cells || size_t(state.kv_elastic) >= g_pools.size()) return false;
+    return pool_grow(*g_pools[size_t(state.kv_elastic)], cells, [] { return strata::core::VmmChunk{0}; });
+}
+bool qsa_kv_elastic_shrink_state(const QsaState& state, int64_t cells) {
+    if (state.kv_elastic < 0) return cells >= 0 && cells <= state.max_cells;
+    if (cells < 0 || cells > state.max_cells || size_t(state.kv_elastic) >= g_pools.size()) return false;
+    auto& pool = *g_pools[size_t(state.kv_elastic)];
+    const auto granularity = strata::core::vmm_granularity();
+    const auto slots = pool_slots(pool, cells);
+    for (size_t a = 0; a < pool.off.size(); ++a) {
+        const auto begin = int64_t(pool.off[a] / granularity) + pool_chunks(pool, a, slots);
+        const auto end = a + 1 < pool.off.size() ? int64_t(pool.off[a + 1] / granularity) : pool.range.chunks();
+        for (auto i = begin; i < end; ++i) if (auto h = pool.range.unmap(i)) strata::core::vmm_chunk_free(h);
+    }
+    return true;
+}
 int64_t qsa_kv_elastic_cells() {
     int64_t cells = std::numeric_limits<int64_t>::max();
     for (const auto& p : g_pools) cells = std::min<int64_t>(cells, pool_slots_mapped(*p) * p->page_size);

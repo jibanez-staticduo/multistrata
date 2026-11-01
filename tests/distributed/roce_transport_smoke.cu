@@ -29,6 +29,7 @@ struct Options {
     uint32_t rank = 0;
     uint32_t timeout_ms = 30000;
     uint32_t stripes = 1;
+    uint32_t blocks = 1;
     int gid_index = -1;
     uint16_t port = 0;
     std::string rank0_address;
@@ -71,7 +72,7 @@ std::vector<std::string> split(std::string_view value, char separator) {
 Options parse(int argc, char** argv) {
     const std::vector<std::string> allowed = {
         "rank", "rank0-address", "port", "session-uuid", "credential-env", "hca-list", "route-hca",
-        "stripes", "gid-index", "timeout-ms", "fault", "fault-rank", "slot-bytes",
+        "stripes", "blocks", "gid-index", "timeout-ms", "fault", "fault-rank", "slot-bytes",
         "model-hash", "config-fingerprint", "build-commit"};
     std::map<std::string, std::string> args;
     for (int i = 1; i < argc; i += 2) {
@@ -101,6 +102,7 @@ Options parse(int argc, char** argv) {
     if (args.contains("credential-env")) o.credential_env = get("credential-env");
     if (args.contains("timeout-ms")) o.timeout_ms = static_cast<uint32_t>(number(args.at("timeout-ms"), UINT32_MAX));
     if (args.contains("stripes")) o.stripes = static_cast<uint32_t>(number(args.at("stripes"), UINT32_MAX));
+    if (args.contains("blocks")) o.blocks = static_cast<uint32_t>(number(args.at("blocks"), 8));
     if (args.contains("gid-index")) {
         if (args.at("gid-index") == "-1") o.gid_index = -1;
         else o.gid_index = static_cast<int>(number(args.at("gid-index"), UINT8_MAX));
@@ -108,7 +110,7 @@ Options parse(int argc, char** argv) {
     if (args.contains("fault")) o.fault = args.at("fault");
     if (args.contains("fault-rank")) o.fault_rank = static_cast<uint32_t>(number(args.at("fault-rank"), UINT32_MAX));
     if (args.contains("slot-bytes")) o.slot_bytes = number(args.at("slot-bytes"), UINT64_MAX);
-    if (o.rank >= kTpWorld || o.fault_rank >= kTpWorld || o.stripes != 1 ||
+    if (o.rank >= kTpWorld || o.fault_rank >= kTpWorld || o.stripes != 1 || (o.blocks != 1 && o.blocks != 8) ||
         o.timeout_ms < 100 || o.timeout_ms > 60000 ||
         (o.fault != "none" && o.fault != "missing-rank" && o.fault != "killed-peer" &&
          o.fault != "graph-killed-peer") ||
@@ -416,8 +418,8 @@ int main(int argc, char** argv) {
         backend_config.gid_index = options.gid_index;
         backend_config.timeout_ms = options.timeout_ms;
         backend_config.slot_bytes = options.slot_bytes;
-        backend_config.blocks = 1;
-        backend_config.threads = 256;
+        backend_config.blocks = options.blocks;
+        backend_config.threads = options.blocks == 8 ? 512 : 256;
         backend_config.approved_proxy_sha256 = options.proxy_sha256;
 
         RoceBackend backend(std::move(backend_config));

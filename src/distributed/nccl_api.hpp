@@ -68,6 +68,17 @@ class NcclApi {
     // anything else when it failed.
     virtual Failure poll_completion(Deadline deadline) = 0;
 
+    // Opt-in production executor: enqueue a complete compute step on one stream
+    // without a device wait between its reductions. The caller agrees the step
+    // before entry and waits once after all work (including graph replay).
+    // These calls do not replace the strict single-operation or graph APIs.
+    virtual Failure begin_stream_step(cudaStream_t) {
+        return Failure::fail(FailureCode::not_supported, "NCCL stream steps are not supported");
+    }
+    virtual Failure finish_stream_step(Deadline) {
+        return Failure::fail(FailureCode::not_supported, "NCCL stream steps are not supported");
+    }
+
     // Opt-in graph session. Prepare before beginning CUDA stream capture. Captured enqueues must all use
     // `stream` and exactly `expected_collectives`; they do not record or poll a CUDA event. Check and finish
     // perform NCCL host-side health queries only. After each graph launch, wait_captured_replay() records and
@@ -218,6 +229,14 @@ class NcclBackend final : public Backend {
 
     bool requires_process_exit() const {
         return api_ != nullptr && api_->requires_process_exit();
+    }
+    Failure begin_stream_step(cudaStream_t stream) {
+        if (auto f = usable()) return f;
+        return api_->begin_stream_step(stream);
+    }
+    Failure finish_stream_step(Deadline deadline) {
+        if (auto f = usable()) return f;
+        return api_->finish_stream_step(deadline);
     }
 
     bool raw_async_failure(Failure& out) const override {

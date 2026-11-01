@@ -5,6 +5,7 @@
 #include "strata/kernels/pdl.hpp"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -295,6 +296,14 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+#if defined(STRATA_TP_WIDE_WINDOW)
+    if(n_tok>16 && n_tok<=STRATA_VERIFY_MAX_T) {
+        for(int first=0;first<n_tok;first+=16)
+            bf16_gemv_fp32_mmvf_multi(x+first*ldx,ldx,w,y+first*ldy,ldy,n_in,n_out,
+                                      std::min(16,n_tok-first),stream);
+        return;
+    }
+#endif
     if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
     if (n_tok < 1 || n_tok > STRATA_VERIFY_MAX_T || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 ||
         x == nullptr || w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)

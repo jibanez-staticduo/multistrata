@@ -519,6 +519,7 @@ class ProductionNcclApi final : public NcclApi {
         std::unique_lock<std::mutex> lock(mutex_);
         ncclDataType_t dtype = ncclNumTypes;
         if (auto f = ready_locked(stream, elements, type, dtype)) return f;
+        if (step_stream_) return enqueue_step_locked(lock, send, recv, elements, stream, dtype, false);
         if (graph_state_ != GraphState::inactive) {
             return enqueue_graph_locked(lock, send, recv, elements, type, stream, dtype, false);
         }
@@ -536,6 +537,7 @@ class ProductionNcclApi final : public NcclApi {
         std::unique_lock<std::mutex> lock(mutex_);
         ncclDataType_t dtype = ncclNumTypes;
         if (auto f = ready_locked(stream, slot_elements, type, dtype)) return f;
+        if (step_stream_) return enqueue_step_locked(lock, send, recv, slot_elements, stream, dtype, true);
         if (graph_state_ != GraphState::inactive) {
             return enqueue_graph_locked(lock, send, recv, slot_elements, type, stream, dtype, true);
         }
@@ -550,6 +552,41 @@ class ProductionNcclApi final : public NcclApi {
         return begin_completion_locked(stream, rc);
     }
 
+    Failure begin_stream_step(cudaStream_t stream) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (auto f = graph_ready_locked()) return f;
+        if (!stream) return Failure::fail(FailureCode::bad_pointer, "a stream step needs a CUDA stream");
+        if (step_stream_ || in_flight_ || graph_state_ != GraphState::inactive)
+            return Failure::fail(FailureCode::in_flight, "NCCL is not idle for a stream step");
+        step_stream_ = stream;
+        return {};
+    }
+
+    Failure finish_stream_step(Deadline deadline) override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!step_stream_) return Failure::fail(FailureCode::not_ready, "no NCCL stream step");
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        const auto ce = cuda_.stream_is_capturing(step_stream_, &capture);
+        if (ce != cudaSuccess || capture != cudaStreamCaptureStatusNone)
+            return Failure::fail(FailureCode::bad_operation, "finish the CUDA capture before completing its stream step");
+        if (auto f = await_step_enqueue_locked(lock, deadline)) return f;
+        if (auto f = record_after_locked(step_stream_, "stream step")) return f;
+        for (;;) {
+            ncclResult_t state = ncclInProgress;
+            if (auto f = async_error_unlocked(state)) return step_failure_locked(f);
+            const auto q = state == ncclSuccess ? cuda_.event_query(event_) : cudaErrorNotReady;
+            if (q == cudaSuccess) { step_stream_ = nullptr; return {}; }
+            if (q != cudaErrorNotReady)
+                return step_failure_locked(Failure::fail(FailureCode::async_error, cudaGetErrorString(q)));
+            if (std::chrono::steady_clock::now() >= deadline.end)
+                return step_failure_locked(Failure::fail(FailureCode::deadline_expired, "NCCL stream step deadline expired"));
+            lock.unlock();
+            std::this_thread::yield();
+            lock.lock();
+            if (aborted_) return Failure::fail(FailureCode::aborted, "the communicator was abandoned");
+        }
+    }
+
     Failure prepare_graph_session(cudaStream_t stream, uint64_t expected_collectives) override {
         std::lock_guard<std::mutex> lock(mutex_);
         if (auto f = graph_ready_locked()) return f;
@@ -557,7 +594,7 @@ class ProductionNcclApi final : public NcclApi {
         if (expected_collectives == 0) {
             return Failure::fail(FailureCode::bad_extent, "a graph session must contain at least one collective");
         }
-        if (graph_state_ != GraphState::inactive || in_flight_) {
+        if (graph_state_ != GraphState::inactive || in_flight_ || step_stream_) {
             return Failure::fail(FailureCode::in_flight, "NCCL is not idle for graph preparation");
         }
         graph_state_ = GraphState::prepared;
@@ -754,7 +791,7 @@ class ProductionNcclApi final : public NcclApi {
         bool preserve_event = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            preserve_event = graph_replay_pending_;
+            preserve_event = graph_replay_pending_ || step_stream_;
             if (preserve_event) requires_process_exit_ = true;
             else event = event_;
             comm = comm_;
@@ -805,6 +842,42 @@ class ProductionNcclApi final : public NcclApi {
         sticky_ = true;
         sticky_failure_ = Failure::fail(FailureCode::deadline_expired, detail);
         return sticky_failure_;
+    }
+
+    Failure step_failure_locked(Failure failure) {
+        requires_process_exit_ = true;
+        sticky_ = true;
+        sticky_failure_ = failure;
+        return failure;
+    }
+
+    Failure await_step_enqueue_locked(std::unique_lock<std::mutex>& lock, Deadline deadline) {
+        for (;;) {
+            ncclResult_t state = ncclInProgress;
+            if (auto f = async_error_unlocked(state)) return step_failure_locked(f);
+            if (state == ncclSuccess) return {};
+            if (std::chrono::steady_clock::now() >= deadline.end)
+                return step_failure_locked(Failure::fail(FailureCode::deadline_expired, "NCCL stream enqueue deadline expired"));
+            lock.unlock();
+            std::this_thread::yield();
+            lock.lock();
+            if (aborted_) return Failure::fail(FailureCode::aborted, "the communicator was abandoned");
+        }
+    }
+
+    Failure enqueue_step_locked(std::unique_lock<std::mutex>& lock, const void* send, void* recv,
+                                uint64_t elements, cudaStream_t stream, ncclDataType_t dtype, bool gather) {
+        if (stream != step_stream_)
+            return Failure::fail(FailureCode::bad_pointer, "a stream step used another CUDA stream");
+        const Deadline at{std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.initialize_ms)};
+        if (auto f = await_step_enqueue_locked(lock, at)) return f;
+        const auto rc = gather ? symbols_.all_gather(send, recv, static_cast<size_t>(elements), dtype, comm_, stream)
+                               : symbols_.all_reduce(send, recv, static_cast<size_t>(elements), dtype, ncclSum, comm_, stream);
+        if (!accepted(rc))
+            return step_failure_locked(Failure::fail(FailureCode::enqueue_failed, "NCCL stream step enqueue: " + describe(rc)));
+        // NCCL nonblocking completion here means host enqueue has finished. It
+        // does not wait for GPU computation or communication on this stream.
+        return rc == ncclInProgress ? await_step_enqueue_locked(lock, at) : Failure{};
     }
 
     Failure enqueue_graph_locked(std::unique_lock<std::mutex>& lock, const void* send, void* recv,
@@ -961,6 +1034,7 @@ class ProductionNcclApi final : public NcclApi {
     ncclComm_t comm_ = nullptr;
     cudaEvent_t event_ = nullptr;
     cudaStream_t pending_stream_ = nullptr;
+    cudaStream_t step_stream_ = nullptr;
     cudaStream_t graph_stream_ = nullptr;
     uint64_t graph_expected_ = 0;
     uint64_t graph_enqueued_ = 0;

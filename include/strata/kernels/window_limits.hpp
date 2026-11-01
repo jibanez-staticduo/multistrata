@@ -19,9 +19,13 @@ namespace strata::kernels {
 
 /// The window every 0.2.7 kernel was built for: windows of up to this many rows keep their instantiations.
 inline constexpr int kVerifyNarrowT = 8;
-/// The most rows one window can hold in this build (8 or 16).
+/// Logical rows per window: 8/16 normally, 40 in the opt-in CUDA TP build.
 inline constexpr int kWindowMaxT = STRATA_VERIFY_MAX_T;
 
+#if defined(STRATA_TP_WIDE_WINDOW)
+static_assert(kWindowMaxT == 40, "the experimental TP window holds 40 logical rows");
+#else
 static_assert(kWindowMaxT == 8 || kWindowMaxT == 16, "STRATA_VERIFY_MAX_T is 8 or 16 (the wide kernels are built for 16)");
+#endif
 
 }  // namespace strata::kernels

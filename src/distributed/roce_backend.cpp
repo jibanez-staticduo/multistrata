@@ -160,7 +160,8 @@ std::vector<std::string> discover_hcas(int gid_index, size_t maximum) {
 RoceBackend::RoceBackend(Config config) : config_(std::move(config)) {}
 
 RoceBackend::~RoceBackend() {
-    if (unsafe_to_destroy_ || in_flight_ || captured_pending_ || capture_replay_pending_) return;
+    if (unsafe_to_destroy_ || in_flight_ || captured_pending_ || capture_replay_pending_ ||
+        (stream_step_active_ && stream_step_has_work_)) return;
     release_safe();
 }
 
@@ -173,7 +174,7 @@ Failure RoceBackend::create() {
         config_.gid_index < -1 || config_.gid_index > UINT8_MAX ||
         config_.traffic_class < 0 || config_.traffic_class > 255 ||
         config_.timeout_ms == 0 || config_.timeout_ms > (INT32_MAX / 1000u) ||
-        config_.blocks != 1 || config_.threads < 2 || config_.threads > 1024 ||
+        (config_.blocks != 1 && config_.blocks != 8) || config_.threads < 2 || config_.threads > 1024 ||
         config_.slot_bytes == 0 || config_.slot_bytes % 4096 != 0) {
         return Failure::fail(FailureCode::invalid_config, "invalid TP3 direct RoCE geometry");
     }
@@ -304,6 +305,22 @@ Failure RoceBackend::raw_all_reduce_sum(const DeviceBuffer& input, const DeviceB
     return enqueue(input, output, cuda::Kind::all_reduce_sum, elements, stream);
 }
 
+Failure RoceBackend::raw_all_reduce_ring_sum(const DeviceBuffer& input, const DeviceBuffer& output,
+                                             uint64_t elements, uint64_t global_first,
+                                             uint64_t global_total, cudaStream_t stream) {
+    uint64_t bytes = 0;
+    if (input.type != ScalarType::fp32 || output.type != ScalarType::fp32 ||
+        input.elements != elements || output.elements != elements ||
+        !elements || !global_total || global_total % 8 ||
+        global_first > global_total || elements > global_total - global_first ||
+        global_first % 4 || elements % 4 ||
+        !element_bytes(elements, ScalarType::fp32, bytes) || bytes % cuda::kPackBytes) {
+        return Failure::fail(FailureCode::bad_extent, "invalid RoCE ring all-reduce span");
+    }
+    return enqueue(input, output, cuda::Kind::all_reduce_ring_sum, elements, stream,
+                   global_first, global_total);
+}
+
 Failure RoceBackend::raw_all_gather(const DeviceBuffer& input, const DeviceBuffer& output,
                                     uint64_t slot_elements, cudaStream_t stream) {
     if (slot_elements > UINT64_MAX / config_.world) {
@@ -315,13 +332,20 @@ Failure RoceBackend::raw_all_gather(const DeviceBuffer& input, const DeviceBuffe
 }
 
 Failure RoceBackend::enqueue(const DeviceBuffer& input, const DeviceBuffer& output,
-                             cuda::Kind kind, uint64_t slot_elements, cudaStream_t stream) {
+                             cuda::Kind kind, uint64_t slot_elements, cudaStream_t stream,
+                             uint64_t global_first, uint64_t global_total) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (aborted_) return Failure::fail(FailureCode::aborted, "RoCE backend was aborted");
     if (!created_ || !connected_ || proxy_ == nullptr) {
         return Failure::fail(FailureCode::not_ready, "RoCE proxy is not connected");
     }
-    if (in_flight_) return Failure::fail(FailureCode::in_flight, "a RoCE operation is already in flight");
+    if (in_flight_ && !stream_step_active_) {
+        return Failure::fail(FailureCode::in_flight, "a RoCE operation is already in flight");
+    }
+    if (stream_step_active_ && stream != stream_step_stream_) {
+        return Failure::fail(FailureCode::invalid_config,
+                             "RoCE stream-step collectives must use one stream");
+    }
     if (stream == nullptr || input.data == nullptr || output.data == nullptr || slot_elements == 0) {
         return Failure::fail(FailureCode::bad_pointer, "RoCE enqueue needs non-empty CUDA buffers and a stream");
     }
@@ -335,7 +359,8 @@ Failure RoceBackend::enqueue(const DeviceBuffer& input, const DeviceBuffer& outp
         reinterpret_cast<uintptr_t>(output.data) % cuda::kPackBytes != 0) {
         return Failure::fail(FailureCode::bad_extent, "RoCE payload must fit a slot and be aligned to 16 bytes");
     }
-    if (kind == cuda::Kind::all_reduce_sum && output.elements != slot_elements) {
+    if ((kind == cuda::Kind::all_reduce_sum || kind == cuda::Kind::all_reduce_ring_sum) &&
+        output.elements != slot_elements) {
         return Failure::fail(FailureCode::bad_extent, "RoCE all-reduce input and output sizes differ");
     }
     if (kind == cuda::Kind::all_gather && output.elements != slot_elements * config_.world) {
@@ -346,17 +371,17 @@ Failure RoceBackend::enqueue(const DeviceBuffer& input, const DeviceBuffer& outp
     if (capture_query != cudaSuccess) return cuda_failure(capture_query, "cudaStreamIsCapturing(RoCE)");
     capture_active_ = capture_status != cudaStreamCaptureStatusNone;
     graph_capture_seen_ = graph_capture_seen_ || capture_active_;
-    if (!capture_active_ && capture_replay_pending_) {
+    if (!capture_active_ && capture_replay_pending_ && !stream_step_active_) {
         return Failure::fail(FailureCode::in_flight,
                              "a captured RoCE operation must be completed by wait_captured_replay");
     }
     const cudaError_t launched = cuda::launch(input, output, kind, config_.rank, layout_,
                                                region_device_, config_.slot_bytes, device_state_,
                                                config_.timeout_ms * 1000u, stream,
-                                               config_.blocks, config_.threads);
+                                               config_.blocks, config_.threads,
+                                               global_first, global_total);
     if (launched != cudaSuccess) return cuda_failure(launched, "launch RoCE collective");
     pending_stream_ = stream;
-    in_flight_ = true;
     if (capture_active_) {
         if (capture_stream_ == nullptr) {
             capture_stream_ = stream;
@@ -367,32 +392,49 @@ Failure RoceBackend::enqueue(const DeviceBuffer& input, const DeviceBuffer& outp
             unsafe_to_destroy_ = true;
             return sticky_;
         }
-        if (captured_collectives_ == UINT32_MAX ||
-            captured_collectives_ >= UINT32_MAX - 1u - capture_baseline_) {
-            sticky_ = Failure::fail(FailureCode::overflow, "RoCE graph sequence range is exhausted");
+        if (!stream_step_active_) {
+            if (captured_collectives_ == UINT32_MAX ||
+                captured_collectives_ >= UINT32_MAX - 1u - capture_baseline_) {
+                sticky_ = Failure::fail(FailureCode::overflow, "RoCE graph sequence range is exhausted");
+                unsafe_to_destroy_ = true;
+                return sticky_;
+            }
+            ++captured_collectives_;
+        }
+        captured_pending_ = true;
+        if (stream_step_active_) {
+            stream_step_has_work_ = true;
+            in_flight_ = true;
+        } else {
+            in_flight_ = false;
+        }
+        return ok_failure();
+    }
+    if (stream_step_active_) {
+        stream_step_has_work_ = true;
+        in_flight_ = true;
+    } else {
+        const cudaError_t recorded = cudaEventRecord(static_cast<cudaEvent_t>(event_), stream);
+        if (recorded != cudaSuccess) {
+            sticky_ = cuda_failure(recorded, "cudaEventRecord(RoCE collective)");
             unsafe_to_destroy_ = true;
             return sticky_;
         }
-        ++captured_collectives_;
-        captured_pending_ = true;
-        in_flight_ = false;
-        return ok_failure();
-    }
-    const cudaError_t recorded = cudaEventRecord(static_cast<cudaEvent_t>(event_), stream);
-    if (recorded != cudaSuccess) {
-        sticky_ = cuda_failure(recorded, "cudaEventRecord(RoCE collective)");
-        unsafe_to_destroy_ = true;
-        return sticky_;
+        in_flight_ = true;
     }
     return ok_failure();
 }
 
 Failure RoceBackend::raw_poll(Deadline deadline) {
+    return poll_completion(deadline, false);
+}
+
+Failure RoceBackend::poll_completion(Deadline deadline, bool step_completion) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (sticky_) return sticky_;
     if (aborted_) return Failure::fail(FailureCode::aborted, "RoCE backend was aborted");
     if (!in_flight_) return ok_failure();
-    if (captured_pending_ && capture_active_) return ok_failure();
+    if (captured_pending_ && capture_active_ && !step_completion) return ok_failure();
     if (proxy_ != nullptr && roce_failed(static_cast<roce_ctx_t*>(proxy_))) {
         const char* detail = roce_error(static_cast<roce_ctx_t*>(proxy_));
         sticky_ = Failure::fail(FailureCode::async_error,
@@ -425,10 +467,28 @@ Failure RoceBackend::raw_poll(Deadline deadline) {
     }
     uint32_t completed = 0;
     read_u32(region_, layout_.ctrl_off + kControlCompleted, completed);
+    uint32_t device_epoch = 0;
+    if (device_state_ == nullptr) {
+        return Failure::fail(FailureCode::not_ready, "RoCE device completion state is unavailable");
+    }
+    const cudaError_t copied = cudaMemcpy(&device_epoch, device_state_, sizeof(device_epoch),
+                                          cudaMemcpyDeviceToHost);
+    if (copied != cudaSuccess) {
+        sticky_ = cuda_failure(copied, "cudaMemcpy(RoCE device completion sequence)");
+        unsafe_to_destroy_ = true;
+        return sticky_;
+    }
+    const bool step_advanced = step_completion && stream_step_active_ &&
+                               completed > stream_step_baseline_;
+    const bool empty_step_complete = step_completion && stream_step_active_ &&
+                                    !stream_step_has_work_ && completed == stream_step_baseline_;
     const uint32_t expected = capture_replay_pending_
                                   ? capture_baseline_ + captured_collectives_
                                   : last_completed_ + 1u;
-    if (completed == 0 || completed != expected) {
+    if ((completed == 0 && !empty_step_complete) ||
+        (step_completion && stream_step_active_ && !step_advanced && !empty_step_complete) ||
+        (!(step_completion && stream_step_active_) && completed != expected) ||
+        device_epoch != completed) {
         return Failure::fail(FailureCode::deadline_expired, "RoCE host completion sequence is not visible yet");
     }
     if (roce_stat(static_cast<roce_ctx_t*>(proxy_), 2) != completed) {
@@ -437,12 +497,89 @@ Failure RoceBackend::raw_poll(Deadline deadline) {
     }
     last_completed_ = completed;
     in_flight_ = false;
-    if (capture_replay_pending_) {
+    if (capture_replay_pending_ || step_completion) {
         capture_replay_pending_ = false;
         captured_pending_ = false;
+        if (step_completion) captured_collectives_ = 0;
         capture_baseline_ = completed;
     }
     return ok_failure();
+}
+
+Failure RoceBackend::begin_stream_step(cudaStream_t stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (sticky_) return sticky_;
+    if (aborted_) return Failure::fail(FailureCode::aborted, "RoCE backend was aborted");
+    if (!created_ || !connected_ || proxy_ == nullptr) {
+        return Failure::fail(FailureCode::not_ready, "RoCE proxy is not connected");
+    }
+    if (stream == nullptr) return Failure::fail(FailureCode::bad_pointer, "RoCE stream step needs a CUDA stream");
+    if (stream_step_active_ || in_flight_ || captured_pending_ || capture_replay_pending_) {
+        return Failure::fail(FailureCode::in_flight, "a RoCE stream step or operation is already pending");
+    }
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    const cudaError_t query = cudaStreamIsCapturing(stream, &status);
+    if (query != cudaSuccess) return cuda_failure(query, "cudaStreamIsCapturing(RoCE stream step)");
+    stream_step_active_ = true;
+    stream_step_has_work_ = false;
+    stream_step_stream_ = stream;
+    stream_step_baseline_ = last_completed_;
+    pending_stream_ = stream;
+    return ok_failure();
+}
+
+Failure RoceBackend::finish_stream_step(Deadline deadline) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (sticky_) return sticky_;
+        if (aborted_) return Failure::fail(FailureCode::aborted, "RoCE backend was aborted");
+        if (!stream_step_active_ || stream_step_stream_ == nullptr) {
+            return Failure::fail(FailureCode::not_ready, "there is no RoCE stream step to finish");
+        }
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        const cudaError_t query = cudaStreamIsCapturing(stream_step_stream_, &status);
+        if (query != cudaSuccess) {
+            sticky_ = cuda_failure(query, "cudaStreamIsCapturing(RoCE step completion)");
+            unsafe_to_destroy_ = true;
+            return sticky_;
+        }
+        if (status != cudaStreamCaptureStatusNone) {
+            return Failure::fail(FailureCode::invalid_config,
+                                 "finish_stream_step must run after stream or graph execution completes");
+        }
+        if (captured_pending_ && stream_step_has_work_) {
+            capture_active_ = false;
+            capture_replay_pending_ = true;
+        }
+        const cudaError_t record = cudaEventRecord(static_cast<cudaEvent_t>(event_), stream_step_stream_);
+        if (record != cudaSuccess) {
+            sticky_ = cuda_failure(record, "cudaEventRecord(RoCE stream step)");
+            unsafe_to_destroy_ = true;
+            return sticky_;
+        }
+        in_flight_ = true;
+    }
+
+    for (;;) {
+        Failure pending;
+        if (raw_async_failure(pending)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            sticky_ = pending;
+            unsafe_to_destroy_ = true;
+            return sticky_;
+        }
+        const Failure result = poll_completion(deadline, true);
+        if (!result) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stream_step_active_ = false;
+            stream_step_has_work_ = false;
+            stream_step_stream_ = nullptr;
+            return ok_failure();
+        }
+        if (result.code != FailureCode::deadline_expired) return result;
+        if (std::chrono::steady_clock::now() >= deadline.end) return result;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 bool RoceBackend::raw_async_failure(Failure& out) const {
@@ -520,14 +657,16 @@ Failure RoceBackend::wait_captured_replay(Deadline deadline) {
 
 bool RoceBackend::requires_process_exit() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return unsafe_to_destroy_ || in_flight_ || captured_pending_ || capture_replay_pending_;
+    return unsafe_to_destroy_ || in_flight_ || captured_pending_ || capture_replay_pending_ ||
+           (stream_step_active_ && stream_step_has_work_);
 }
 
 void RoceBackend::raw_abort() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if (aborted_.exchange(true)) return;
     sticky_ = Failure::fail(FailureCode::aborted, "RoCE backend was aborted");
-    if (in_flight_ || captured_pending_ || capture_replay_pending_) {
+    if (in_flight_ || captured_pending_ || capture_replay_pending_ ||
+        (stream_step_active_ && stream_step_has_work_)) {
         unsafe_to_destroy_ = true;
         return;
     }

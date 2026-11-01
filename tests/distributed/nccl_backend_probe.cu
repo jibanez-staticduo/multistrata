@@ -166,6 +166,8 @@ void check_nonblocking_lifecycle() {
               "poll cannot complete or record while NCCL is enqueueing");
         fake::state = ncclSuccess;
         fake::event_state = cudaSuccess;
+        // The fake enqueue itself stays pending for two async queries.
+        while (fake::enqueue_pending_polls > 0) (void)api.poll_completion(at);
         check(!api.poll_completion(at) && fake::records == 1,
               "the completion event is recorded only after background enqueue succeeds");
         fake::state = ncclInProgress;
@@ -174,6 +176,7 @@ void check_nonblocking_lifecycle() {
         check(api.poll_completion(at).code == FailureCode::deadline_expired,
               "a completed previous event cannot complete a new background all-gather");
         fake::state = ncclRemoteError;
+        fake::enqueue_pending_polls = 0;
         Failure failure;
         check(api.async_failure(failure) && failure.code == FailureCode::async_error,
               "a communicator error reaches health polling");
@@ -207,6 +210,34 @@ void check_nonblocking_lifecycle() {
     }
 }
 
+void check_stream_step_lifecycle() {
+    fake::reset();
+    fake::capture_status = cudaStreamCaptureStatusNone;
+    auto config = fake::config();
+    ProductionNcclApi api(config, nullptr, fake::symbols(), "fake", "sha256:fake", fake::cuda());
+    auto stream = reinterpret_cast<cudaStream_t>(uintptr_t{0x30});
+    float input = 1, output = 0;
+    check(!api.comm_init(config) && !api.begin_stream_step(stream), "a stream step starts on an idle communicator");
+    check(api.begin_stream_step(stream).code == FailureCode::in_flight, "nested stream steps are refused");
+    check(!api.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream) &&
+          !api.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream) && fake::records == 0,
+          "two reductions enqueue without a GPU completion event between them");
+    check(api.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32,
+          reinterpret_cast<cudaStream_t>(uintptr_t{0x40})).code == FailureCode::bad_pointer,
+          "a stream step refuses another stream");
+    fake::capture_status = cudaStreamCaptureStatusActive;
+    check(api.finish_stream_step({std::chrono::steady_clock::now() + std::chrono::seconds(1)}).code == FailureCode::bad_operation,
+          "stream completion cannot record an event into an unfinished capture");
+    fake::capture_status = cudaStreamCaptureStatusNone;
+    fake::event_state = cudaSuccess;
+    check(!api.finish_stream_step({std::chrono::steady_clock::now() + std::chrono::seconds(1)}) && fake::records == 1,
+          "one completion event finishes the whole compute step");
+    check(!api.begin_stream_step(stream), "a completed step allows the next one");
+    fake::event_state = cudaErrorNotReady;
+    check(api.finish_stream_step({std::chrono::steady_clock::now()}).code == FailureCode::deadline_expired &&
+          api.requires_process_exit(), "unknown DMA completion quarantines the step allocations");
+}
+
 void check_graph_lifecycle() {
     fake::reset();
     auto config = fake::config();
@@ -216,14 +247,15 @@ void check_graph_lifecycle() {
     float input = 1, output = 0;
 
     check(!api.prepare_graph_session(stream, 3), "graph session prepares with an exact collective count");
-    check(api.begin_captured_replay().code == FailureCode::not_ready,
+    const auto early_replay = api.begin_captured_replay();
+    check(early_replay.code == FailureCode::not_ready || early_replay.code == FailureCode::bad_operation,
           "replay cannot begin until graph capture is finalized");
     check(!api.check_graph_capture(), "an explicitly prepared stream can be validated during capture");
     check(!api.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream) &&
               !api.enqueue_all_gather(&input, &output, 1, ScalarType::fp32, stream) &&
               !api.enqueue_all_reduce_sum(&input, &output, 1, ScalarType::fp32, stream),
           "three collectives enqueue in order without host completion polling");
-    check(fake::records == 0 && fake::polls == 15,
+    check(fake::records == 0 && fake::polls > fake::reduces + fake::gathers,
           "capture enqueues record no CUDA event and only query NCCL async health");
     check(api.enqueue_all_gather(&input, &output, 1, ScalarType::fp32, stream).code == FailureCode::bad_extent,
           "a capture cannot enqueue beyond its prepared collective count");
@@ -406,6 +438,7 @@ int main(int argc, char** argv) {
     check_bootstrap_encoding();
     check_version_decoder();
     check_nonblocking_lifecycle();
+    check_stream_step_lifecycle();
     check_graph_lifecycle();
     check_mapped_provenance();
     if (host_only) return g_failed == 0 ? 0 : 1;

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from serve.distributed_backend import (DistributedEngine, ReferenceEngine, normalize_sampling,
+from serve.distributed_backend import (MAX_LINE, DistributedEngine, ReferenceEngine, normalize_sampling,
                                        validate_config, validate_reference_config)
 from serve.frontend import ChatTemplate
 from serve.server import ByteTokenizer, EngineDied, Service, main, serve
@@ -283,6 +283,34 @@ def test_invalid_token_request_never_transmitted_and_group_survives(make_engine,
     assert list(engine.generate([17], 1, {}, threading.Event())) == [17]
 
 
+def test_maximum_context_prompt_fits_the_distributed_line_limit(make_engine):
+    engine = make_engine("echo")
+    engine.max_context = 262144
+    ids = [2**31 - 2] * 262143
+    line_bytes = len((json.dumps({
+        "type": "generate", "request_id": "0" * 32, "ids": ids,
+        "max_new": 1, "sampling": {},
+    }, separators=(",", ":"), allow_nan=False) + "\n").encode())
+    assert 1 << 20 < line_bytes <= MAX_LINE
+    assert list(engine.generate(ids, 1, {}, threading.Event())) == [ids[0]]
+
+
+def test_request_over_four_mib_is_rejected_before_send(make_engine):
+    engine = make_engine("echo")
+    engine.max_context = 500000
+    sent, original = [], engine._send
+
+    def record(message, timeout):
+        sent.append(message)
+        return original(message, timeout)
+
+    engine._send = record
+    with pytest.raises(ValueError, match="4 MiB"):
+        list(engine.generate([2**31 - 2] * 382000, 1, {}, threading.Event()))
+    assert sent == []
+    assert engine._request is None and engine.alive()
+
+
 def test_pack_vocabulary_bounds_are_validated_before_send(tmp_path):
     (tmp_path / "vocab.json").write_text(json.dumps({"a": 0, "b": 1}))
     cfg = config("echo")
@@ -373,6 +401,20 @@ def test_health_lease_expires_even_when_process_is_live(make_engine):
     time.sleep(.12)
     assert engine.health()["status"] == "unavailable"
     assert not engine.alive()
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_inherited_diagnostics_requires_an_explicit_boolean(value):
+    with pytest.raises(ValueError, match="inherit_stderr"):
+        validate_config(config(inherit_stderr=value))
+
+
+def test_managed_launcher_can_capture_native_stderr(make_engine, capfd):
+    engine = make_engine("stderr", inherit_stderr=True)
+    result = list(engine.generate([1], 1, {}, threading.Event()))
+    diagnostics = capfd.readouterr().err
+    assert result == [60]
+    assert "private-api-key" in diagnostics
 
 
 def test_cancel_ack_is_required_before_next_turn(make_engine):

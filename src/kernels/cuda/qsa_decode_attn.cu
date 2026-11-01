@@ -17,12 +17,20 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace strata::kernels {
+#ifndef STRATA_QSA_KERNEL_NAMESPACE
+#define STRATA_QSA_KERNEL_NAMESPACE strata::kernels
+#endif
+namespace STRATA_QSA_KERNEL_NAMESPACE {
 namespace {
 
 constexpr int HD = 256;          // head_dim
-constexpr int G = 12;            // query heads per KV head (24 / 2)
+#ifndef STRATA_QSA_LOCAL_GROUPS
+#define STRATA_QSA_LOCAL_GROUPS 12
+#endif
+constexpr int G = STRATA_QSA_LOCAL_GROUPS;
+#if STRATA_QSA_LOCAL_GROUPS == 12
 static_assert(HD == strata::core::kCompiledGeometry.head_dim && G == strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv, "qsa_decode_attn is compiled for core/geometry.hpp");
+#endif
 constexpr int CHUNK = 64;        // cells per block
 constexpr int THREADS = 256;
 constexpr int WARPS = THREADS / 32;
@@ -426,9 +434,10 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_q8_v3_kernel(const float* 
         const float sc = __half2float(__ushort_as_half(p.v_scale[srow[c] * (HD / KV_Q8_GROUP) + t / KV_Q8_GROUP]));
         const float v = (float) p.v_q[srow[c] * HD + t] * sc;
         const float4 p0 = *reinterpret_cast<const float4*>(&spt[c][0]);
-        const float4 p1 = *reinterpret_cast<const float4*>(&spt[c][4]);
-        const float4 p2 = *reinterpret_cast<const float4*>(&spt[c][8]);
-        const float pr[G] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w, p2.x, p2.y, p2.z, p2.w};
+        float4 p1 = make_float4(0,0,0,0), p2 = p1;
+        if constexpr (G > 4) p1 = *reinterpret_cast<const float4*>(&spt[c][4]);
+        if constexpr (G > 8) p2 = *reinterpret_cast<const float4*>(&spt[c][8]);
+        const float pr[12] = {p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w, p2.x, p2.y, p2.z, p2.w};
 #pragma unroll
         for (int h = 0; h < G; ++h) acc[h] = fmaf(pr[h], v, acc[h]);
     }
@@ -951,7 +960,7 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
                         : (pools.k_q != nullptr ? 1 : 0));
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
-    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    const long long stride = (long long) STRATA_QSA_KERNEL_NAMESPACE::qsa_decode_attn_scratch_floats(cap, s);
     float* part_acc = scratch;
     float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
     float* part_l = part_m + (size_t) n_chunks * s.n_head;
@@ -1042,7 +1051,7 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
 void launch_merge_batch(const int32_t* steps, int64_t cap, const QsaShapes& s, const float* scratch, float* attn,
                         int64_t n_q, int v2, cudaStream_t st) {
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
-    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    const long long stride = (long long) STRATA_QSA_KERNEL_NAMESPACE::qsa_decode_attn_scratch_floats(cap, s);
     const float* part_acc = scratch;
     const float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
     const float* part_l = part_m + (size_t) n_chunks * s.n_head;
@@ -1097,7 +1106,7 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
     if (query_swizzle && !lane_cell && kv_mode == 1 && query_swizzle_gfx906_device()) return false;
 #endif
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
-    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    const long long stride = (long long) STRATA_QSA_KERNEL_NAMESPACE::qsa_decode_attn_scratch_floats(cap, s);
     float* part_acc = scratch;
     float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
     float* part_l = part_m + (size_t) n_chunks * s.n_head;
@@ -1139,7 +1148,7 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
-    const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+    const long long stride = (long long) STRATA_QSA_KERNEL_NAMESPACE::qsa_decode_attn_scratch_floats(cap, s);
     float* part_acc = scratch;
     float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
     float* part_l = part_m + (size_t) n_chunks * s.n_head;
@@ -1158,7 +1167,7 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
 #endif
     if (per_row) {
         for (int64_t r = 0; r < n_q; ++r)
-            qsa_decode_attn_batch(q + (size_t) r * s.n_head * HD, rows.p[r], ids + (size_t) r * cap,
+            STRATA_QSA_KERNEL_NAMESPACE::qsa_decode_attn_batch(q + (size_t) r * s.n_head * HD, rows.p[r], ids + (size_t) r * cap,
                                   steps + (size_t) r * kStepCount, cap, s, scratch + (size_t) r * stride,
                                   attn + (size_t) r * s.n_head * HD, 1, stream);
         return;

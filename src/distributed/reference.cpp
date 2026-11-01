@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+#include <fstream>
 
 // The original session implementation owns this state-selection operation.
 namespace strata::core {
@@ -65,6 +66,8 @@ struct MonolithicReference::Impl : core::DistributedLayerHooks {
     uint32_t timeout_ms;
     ExpertResidency residency;
     std::map<std::string, std::unique_ptr<GgufFile>> files;
+    std::ifstream native_pack;
+    std::vector<uint64_t> pack_offsets;
     std::vector<Layer> layers;
     std::vector<std::unique_ptr<DeviceBuffer>> resident_layers;
     uint64_t expert_weight_bytes = 0;
@@ -114,26 +117,29 @@ struct MonolithicReference::Impl : core::DistributedLayerHooks {
         if (!kernels::cpu::expert_layout_load(pack, geometry.n_layers, geometry.n_expert, err))
             throw std::runtime_error(err);
         const auto layout = kernels::cpu::expert_layout();
+        const bool fp4_pack=std::all_of(layout.fmt.begin(),layout.fmt.end(),[](const auto& f){return f.gu_type==40&&f.d_type==40&&f.tail_off;});
+        if(fp4_pack){native_pack.open(pack+"/experts.bin",std::ios::binary);require(bool(native_pack),"TP1 reference: NVFP4 pack is missing");}
         require(layout.native && layout.fmt.size() == size_t(geometry.n_layers) &&
                 layout.bytes.size() == size_t(geometry.n_layers) &&
-                layout.gguf_off.size() == size_t(3 * geometry.n_layers),
+                (fp4_pack || layout.gguf_off.size() == size_t(3 * geometry.n_layers)),
                 "TP1 reference: incomplete original GGUF role manifest");
         for (int64_t l = 0; l < geometry.n_layers; ++l) {
             const auto& fmt = layout.fmt[size_t(l)];
-            require(fmt.n_embd == geometry.n_embd && fmt.n_ff == geometry.n_ff && !fmt.tail_off &&
+            require(fmt.n_embd == geometry.n_embd && fmt.n_ff == geometry.n_ff && (fp4_pack || !fmt.tail_off) &&
                     !fmt.had_block && !fmt.had_gu && !fmt.had_d &&
                     kernels::native_expert_supported(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff),
                     "TP1 reference: unsupported original expert geometry or codec");
             Layer layer;
             layer.format = kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
             const auto& f = layer.format;
-            require(!f.gu_nib && !f.tail_off && !f.had_block && f.gu_row == fmt.gu_row &&
+            require(!f.gu_nib && (fp4_pack || !f.tail_off) && !f.had_block && f.gu_row == fmt.gu_row &&
                     f.d_row == fmt.d_row && f.up_off == fmt.up_off && f.down_off == fmt.down_off &&
                     f.bytes == fmt.bytes && f.bytes == layout.bytes[size_t(l)] &&
                     f.down_off == 2 * f.up_off && f.up_off == size_t(geometry.n_ff) * f.gu_row &&
-                    f.bytes - f.down_off == size_t(geometry.n_embd) * f.d_row,
+                    f.bytes - f.down_off - (fp4_pack ? 16 : 0) == size_t(geometry.n_embd) * f.d_row,
                     "TP1 reference: original CPU/CUDA blob layouts differ");
-            for (int role = 0; role < 3; ++role) {
+            pack_offsets.push_back(layout.blob_offset(l,0));
+            for (int role = 0; !fp4_pack && role < 3; ++role) {
                 const auto index = size_t(3 * l + role);
                 std::filesystem::path path(native);
                 if (index < layout.gguf_file.size() && !layout.gguf_file[index].empty())
@@ -172,6 +178,7 @@ struct MonolithicReference::Impl : core::DistributedLayerHooks {
         const size_t embedding_bytes = size_t(geometry.n_embd) * sizeof(float);
         const size_t parts_bytes = k * size_t(geometry.n_embd) * sizeof(float);
         if (residency == ExpertResidency::AllResident) {
+            require(!native_pack.is_open(),"TP1 NVFP4 reference uses selected staging; full residency is not its speed baseline");
             std::vector<size_t> slots;
             for (const auto& layer : layers) slots.push_back(layer.format.bytes);
             const auto plan = ReferenceResidencyPlan::all(slots, size_t(geometry.n_expert));
@@ -255,7 +262,11 @@ struct MonolithicReference::Impl : core::DistributedLayerHooks {
                 ptr[i] = reinterpret_cast<unsigned long long>(resident_layers[size_t(layer_index)]->bytes() +
                     size_t(selected[i]) * layer.format.bytes);
             } else {
-                for (int role = 0; role < 3; ++role)
+                if(native_pack.is_open()) {
+                    native_pack.seekg(std::streamoff(pack_offsets.at(size_t(layer_index))+size_t(selected[i])*layer.format.bytes));
+                    require(bool(native_pack.read((char*)host_blobs.bytes()+i*slot_bytes,std::streamsize(layer.format.bytes))),
+                        "TP1 reference: NVFP4 blob truncated");
+                } else for (int role = 0; role < 3; ++role)
                     std::memcpy(host_blobs.bytes() + i * slot_bytes + offsets[role],
                                 layer.role[role] + size_t(selected[i]) * layer.role_bytes[role],
                                 layer.role_bytes[role]);

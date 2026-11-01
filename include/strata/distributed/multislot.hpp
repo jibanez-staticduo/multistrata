@@ -20,6 +20,26 @@ struct MultiSlotConfig {
     uint32_t context = 0;
     // Remember every admitted identity, including retired ones, without unbounded growth.
     uint32_t request_limit = 4096;
+    uint32_t prefill_chunk = 2048;
+    bool packed_prefill = false;
+};
+
+struct MultiSlotBatchRow {
+    uint32_t slot = 0;
+    StepPhase phase = StepPhase::decode;
+    std::string request;
+    std::vector<int32_t> tokens;
+    uint64_t position = 0;
+};
+struct MultiSlotProposal {
+    uint32_t slot = 0;
+    ServeRequest request;
+    std::vector<int32_t> history;
+    int32_t feedback = -1;
+    uint64_t draw = 0;
+};
+struct MultiSlotAccepted {
+    std::vector<int32_t> consumed, tokens;
 };
 
 struct MultiSlotCallbacks {
@@ -36,6 +56,17 @@ struct MultiSlotCallbacks {
     std::function<void(std::string_view type, uint32_t slot, std::string_view request, int32_t token)> emit;
     // Required, idempotent, non-throwing: invalidate ALL slot state and the shared transport.
     std::function<void()> abort_all;
+    // Production executor: one call runs and commits all independent decode
+    // rows, or one contiguous prompt chunk. No scalar forward fallback inside.
+    std::function<Failure(const std::vector<MultiSlotBatchRow>&)> execute_batch;
+    std::function<Failure(uint32_t slot, const ServeRequest&)> admitted;
+    // Resolves complete target-verified prefixes on all ranks. Results are
+    // published only after the adapter commits every participating slot.
+    std::function<Failure(const std::vector<MultiSlotProposal>&,
+                           std::vector<MultiSlotAccepted>&)> speculate;
+    // Optional compact control agreement. It must validate the exact payload on all ranks
+    // and return only after every rank has accepted it.
+    std::function<Failure(std::string_view label, std::string_view payload)> agree_payload;
 };
 
 enum class MultiSlotOutcome { accepted, rejected, progressed, idle, failed };
@@ -85,6 +116,7 @@ class MultiSlotScheduler {
     std::string identity(uint32_t slot) const;
     MultiSlotResult reject(std::string reason) const;
     MultiSlotResult terminal() const;
+    MultiSlotResult tick_batched();
 
     MultiSlotConfig config_;
     MultiSlotCallbacks callbacks_;
@@ -94,6 +126,7 @@ class MultiSlotScheduler {
     uint64_t tick_ = 0;
     uint64_t action_ = 1;
     Failure failure_;
+    bool prefer_prefill_ = true;
 };
 
 }  // namespace strata::distributed

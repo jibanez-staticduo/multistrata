@@ -5089,7 +5089,10 @@ class Service:
             ctx = getattr(self.engine, "known_ctx", 0)
             if ctx <= 0:
                 raise EngineStarting("the engine is starting (a minute or two); try again shortly")
-        room = ctx - CTX_SLACK - len(ids)
+        # The native distributed protocol enforces its exact token budget and
+        # does not need the legacy --serve runner's extra eight cells.
+        slack = 0 if getattr(self.engine, "distributed_health", False) else CTX_SLACK
+        room = ctx - slack - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
                 # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The

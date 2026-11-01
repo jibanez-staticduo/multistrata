@@ -81,15 +81,19 @@ struct Rig {
     std::vector<uint32_t> forwards;
     size_t sample_count = 0, abort_count = 0;
     size_t read = 0;
+    size_t compact_calls = 0;
+    std::string fail_compact_label;
     bool failed_phase = false;
     StepPhase fail_phase = StepPhase::abort;
     std::string fail_label;
     bool fail_sample = false;
     bool throw_emit = false;
     uint32_t rank;
+    size_t batch_calls = 0, largest_decode_batch = 0, largest_prompt_chunk = 0;
     std::unique_ptr<MultiSlotScheduler> scheduler;
     Rig(uint32_t slots, uint32_t rank_ = 0, const std::vector<Exchange>* replay = nullptr,
-        uint32_t limit = 4096, uint32_t context = 65536) : rank(rank_) {
+        uint32_t limit = 4096, uint32_t context = 65536, bool batched = false,
+        bool compact = false) : rank(rank_) {
         MultiSlotCallbacks cb;
         cb.broadcast = [&, replay](std::string_view label, std::string& bytes) {
             check(bytes.size() <= 24u * 1024u, "broadcast uses bounded chunks");
@@ -104,8 +108,20 @@ struct Rig {
             }
             return Failure{};
         };
+        if (compact) cb.agree_payload = [&, replay](std::string_view label, std::string_view payload) {
+            ++compact_calls;
+            if (!fail_compact_label.empty() && label.find(fail_compact_label) != std::string_view::npos) return bad();
+            if (rank == 0) wire.push_back({std::string(label) + ":payload", std::string(payload)});
+            else {
+                if (!replay || read == replay->size()) return bad();
+                const auto& frame = (*replay)[read++];
+                if (frame.label != std::string(label) + ":payload" || frame.bytes != payload) return bad();
+            }
+            return Failure{};
+        };
         cb.execute = [&](uint32_t slot, StepPhase phase, std::string_view request, int32_t token, uint64_t pos) {
-            if (rank == 0) check(!wire.empty() && wire.back().label.ends_with(":checked"),
+            if (rank == 0) check(!wire.empty() && (wire.back().label.ends_with(":checked") ||
+                                                   wire.back().label.ends_with(":payload")),
                                  "every backend mutation follows an acknowledged exact action");
             calls.push_back({slot, phase, std::string(request), token, pos});
             if (phase == fail_phase) { failed_phase = true; return bad(); }
@@ -145,6 +161,20 @@ struct Rig {
             events.push_back(std::string(type) + ":" + std::string(req));
         };
         cb.abort_all = [&] { ++abort_count; for (auto& s : states) s = FakeSlot{}; };
+        if (batched) cb.execute_batch = [&](const std::vector<MultiSlotBatchRow>& rows) {
+            ++batch_calls;
+            if (!rows.empty() && rows.front().phase == StepPhase::decode)
+                largest_decode_batch = std::max(largest_decode_batch, rows.size());
+            if (fail_phase == StepPhase::decode) return bad();
+            for (const auto& row : rows) {
+                auto& state = states[row.slot];
+                check(!state.has_pending && state.committed.positions == row.position,
+                      "batched inputs start at the independently committed position");
+                if (row.phase == StepPhase::prefill) largest_prompt_chunk = std::max(largest_prompt_chunk, row.tokens.size());
+                for (const auto token : row.tokens) forward(state.committed, token);
+            }
+            return Failure{};
+        };
         scheduler = std::make_unique<MultiSlotScheduler>(MultiSlotConfig{rank, slots, 100, context, limit}, std::move(cb));
     }
     void drain() {
@@ -193,6 +223,46 @@ void parity_and_followers() {
     }
 }
 
+void production_batching() {
+    Rig rig(8, 0, nullptr, 4096, 65536, true);
+    std::vector<std::string> inputs;
+    for (int i = 0; i < 8; ++i) {
+        inputs.push_back(generate("batch" + std::to_string(i), 33 + i, 32));
+        check(rig.scheduler->submit(inputs.back()).outcome == MultiSlotOutcome::accepted, "batch admission succeeds");
+    }
+    rig.drain();
+    for (const auto& input : inputs) {
+        ServeRequest request; std::string error;
+        check(parse_serve_request(input, 100, 65536, request, error), "batch reference request parses");
+        const auto expected = ordinary(input);
+        check(rig.output[request.request_id] == expected.first && rig.completed[request.request_id] == expected.second,
+              "real row batches preserve isolated scalar reference states and output");
+    }
+    check(rig.largest_prompt_chunk >= 33 && rig.largest_decode_batch > 1,
+          "production path emits whole prompt chunks and multiple decode slots in one callback");
+    for (uint32_t rank : {1u, 2u}) {
+        Rig follower(8, rank, &rig.wire, 4096, 65536, true);
+        for (const auto& input : inputs) follower.scheduler->submit(input);
+        follower.drain();
+        check(follower.read == rig.wire.size() && follower.sample_count == 0 && follower.events.empty(),
+              "production followers execute the identical batches without sampling or publishing");
+    }
+    Rig cancelled(4, 0, nullptr, 4096, 65536, true);
+    cancelled.scheduler->submit(generate("cancelled", 80, 20));
+    cancelled.scheduler->submit(generate("survives", 50, 6));
+    cancelled.scheduler->tick();
+    cancelled.scheduler->cancel("cancelled");
+    cancelled.drain();
+    check(cancelled.output["survives"] == ordinary(generate("survives", 50, 6)).first &&
+          cancelled.output["cancelled"].size() == 1,
+          "production cancellation retires one row while an independent slot continues");
+    Rig failed(4, 0, nullptr, 4096, 65536, true);
+    failed.scheduler->submit(generate("fail", 20, 3));
+    failed.fail_phase = StepPhase::decode;
+    check(failed.scheduler->tick().outcome == MultiSlotOutcome::failed && failed.output.empty() && failed.abort_count == 1,
+          "a failed batch cannot publish a token and aborts all state");
+}
+
 void cancellation_and_reuse() {
     Rig rig(4);
     check(rig.scheduler->submit(generate("partial", 7)).slot == 0, "partial prompt admitted");
@@ -230,7 +300,7 @@ void cancellation_and_reuse() {
 
 void admission_bounds() {
     for (const uint32_t slots : {1u, 4u, 8u}) {
-        Rig boundary(slots, 0, nullptr, 4096, kDistributedMaxContext);
+        Rig boundary(slots, 0, nullptr, 4096, 65792);
         check(boundary.scheduler->submit(generate("overflow", 65536, 257)).outcome == MultiSlotOutcome::rejected &&
               boundary.calls.empty() && boundary.scheduler->active() == 0,
               "C1/C4/C8 output overflow rejects before slot state changes");
@@ -246,6 +316,15 @@ void admission_bounds() {
     check(rig.scheduler->submit("{}").outcome == MultiSlotOutcome::rejected &&
           rig.scheduler->submit(generate("too_long", 65536, 1)).outcome == MultiSlotOutcome::rejected &&
           rig.scheduler->active() == 0 && rig.calls.empty(), "malformed or over-context admission does not mutate slot state");
+    Rig line_limit(1, 0, nullptr, 4096, 65792);
+    auto large_request = "{\"type\":\"generate\",\"request_id\":\"large\",\"ids\":[1],\"max_new\":3,"
+                         "\"sampling\":{\"stop\":\"" + std::string((1u << 20), 'x') + "\"}}";
+    check(large_request.size() > (1u << 20) &&
+          line_limit.scheduler->submit(large_request).outcome == MultiSlotOutcome::accepted,
+          "multislot admission accepts valid requests above the former one MiB limit");
+    check(line_limit.scheduler->submit(std::string(kDistributedMaxLineBytes + 1, 'x')).outcome ==
+              MultiSlotOutcome::rejected,
+          "multislot admission rejects a request at 4 MiB plus one byte");
     rig.scheduler->submit(generate("a", 1, 1));
     check(rig.scheduler->submit(generate("overflow")).outcome == MultiSlotOutcome::rejected &&
           rig.scheduler->submit(generate("a")).outcome == MultiSlotOutcome::rejected &&
@@ -358,13 +437,140 @@ void disagreements() {
               "cancel versus tick command ordering disagreement is terminal");
     }
 }
+void speculative_batching() {
+    std::vector<int32_t> published;
+    size_t steps=0,resets=0;
+    size_t compact_publish_calls=0;
+    StepPhase fail_reset=StepPhase::abort;
+    MultiSlotCallbacks cb;
+    cb.broadcast=[](std::string_view,std::string&){return Failure{};};
+    cb.agree_payload=[&](std::string_view label,std::string_view) {
+        if(label.find("spec-publish-batch")!=std::string_view::npos)++compact_publish_calls;
+        return Failure{};
+    };
+    cb.abort_all=[]{};
+    cb.execute=[&](uint32_t,StepPhase phase,std::string_view,int32_t,uint64_t) {
+        if(phase==StepPhase::reset)++resets;
+        if(phase==fail_reset)return bad();
+        return Failure{};
+    };
+    cb.execute_batch=[](const auto&){return Failure{};};
+    cb.sample=[](uint32_t,const ServeRequest&,const auto&,uint64_t,int32_t& token){token=4;return Failure{};};
+    cb.emit=[&](std::string_view kind,uint32_t,std::string_view,int32_t token){if(kind=="token")published.push_back(token);};
+    cb.speculate=[&](const std::vector<MultiSlotProposal>& rows,std::vector<MultiSlotAccepted>& out) {
+        ++steps;check(rows.size()==1,"speculative adapter receives active decode rows");
+        const auto& r=rows.front();check(r.feedback==4&&r.draw==1&&r.history.size()==2,"proposal preserves committed request state");
+        out={{{4,5,6},{5,6,7}}};return Failure{};
+    };
+    MultiSlotScheduler scheduler({0,1,100,32,4096,64},cb);
+    check(scheduler.submit(generate("spec",2,4)).outcome==MultiSlotOutcome::accepted,"speculative request admitted");
+    check(scheduler.tick().outcome==MultiSlotOutcome::progressed,"prompt completes before speculative decode");
+    check(scheduler.tick().outcome==MultiSlotOutcome::progressed&&steps==1&&resets==1&&scheduler.active()==0&&
+        compact_publish_calls==1&&published==std::vector<int32_t>({4,5,6,7}),
+        "whole accepted prefix uses one batch agreement and publishes after successful commit and reset");
+    published.clear();
+    cb.speculate=[](const auto&,std::vector<MultiSlotAccepted>& out){out={{{4,99},{5,6}}};return Failure{};};
+    MultiSlotScheduler invalid_chain({0,1,100,32,4096,64},cb);
+    invalid_chain.submit(generate("invalid",2,4));invalid_chain.tick();
+    check(invalid_chain.tick().outcome==MultiSlotOutcome::failed&&published==std::vector<int32_t>({4}),
+        "invalid speculative chain publishes no prefix tokens");
+
+    std::vector<uint32_t> batch_sizes;
+    cb.speculate=[&](const std::vector<MultiSlotProposal>& rows,std::vector<MultiSlotAccepted>& out) {
+        batch_sizes.push_back(rows.size());
+        out.clear();
+        for(const auto& row:rows) out.push_back({{row.feedback},{5}});
+        return Failure{};
+    };
+    MultiSlotScheduler batch({0,2,100,32,4096,64},cb);
+    batch.submit(generate("spec_a",2,3));
+    batch.submit(generate("spec_b",2,3));
+    for(int i=0;i<3;++i) batch.tick();
+    const auto publish_agreements_before_batch=compact_publish_calls;
+    published.clear();
+    check(batch.tick().outcome==MultiSlotOutcome::progressed,
+          "two-row speculative test progresses");
+    check(!batch_sizes.empty()&&batch_sizes.back()==2,
+          "speculative adapter receives two rows in one batch");
+    check(compact_publish_calls==publish_agreements_before_batch+1,
+          "two speculative slots use one batch publish agreement");
+    check(published.size()==2, "two-row speculative batch publishes one token per slot");
+
+    published.clear();
+    resets=0;
+    fail_reset=StepPhase::reset;
+    MultiSlotScheduler reset_failure({0,2,100,32,4096,64},cb);
+    reset_failure.submit(generate("reset_a",2,3));
+    reset_failure.submit(generate("reset_b",2,3));
+    for(int i=0;i<3;++i) reset_failure.tick();
+    published.clear();
+    reset_failure.tick();
+    check(reset_failure.failed(), "reset failure aborts the speculative batch");
+    check(published.empty(), "reset failure withholds every token in the speculative batch");
+}
+
+void compact_agreement() {
+    Rig root(1, 0, nullptr, 4096, 65536, false, true);
+    const auto request = generate("compact", 1, 1);
+    check(root.scheduler->submit(request).outcome == MultiSlotOutcome::accepted &&
+          root.compact_calls == 2 && root.wire.size() == 2,
+          "small submit and admission each use one compact agreement");
+    Rig follower(1, 1, &root.wire, 4096, 65536, false, true);
+    check(follower.scheduler->submit(request).outcome == MultiSlotOutcome::accepted &&
+          follower.read == root.wire.size() && follower.compact_calls == 2,
+          "follower validates exact compact payloads in the same sequence");
+
+    Rig mismatch(1, 1, &root.wire, 4096, 65536, false, true);
+    check(mismatch.scheduler->submit(generate("different", 1, 1)).outcome == MultiSlotOutcome::failed &&
+          mismatch.abort_count == 1 && mismatch.scheduler->active() == 0,
+          "compact agreement mismatch aborts before admission mutates slot state");
+
+    Rig failed(1, 0, nullptr, 4096, 65536, false, true);
+    failed.fail_compact_label = ":admission";
+    check(failed.scheduler->submit(request).outcome == MultiSlotOutcome::failed &&
+          failed.abort_count == 1 && failed.scheduler->active() == 0,
+          "compact agreement failure aborts before admission mutates slot state");
+
+    Rig large(1, 0, nullptr, 4096, 65536, false, true);
+    const std::string large_request =
+        "{\"type\":\"generate\",\"request_id\":\"large\",\"ids\":[1],\"max_new\":1,"
+        "\"sampling\":{\"stop\":\"" + std::string(25u * 1024u, 'x') + "\"}}";
+    check(large_request.size() > 24u * 1024u &&
+          large.scheduler->submit(large_request).outcome == MultiSlotOutcome::accepted &&
+          large.compact_calls == 1 && large.wire.size() > 3,
+          "oversized agreement falls back to the bounded legacy fragment protocol");
+}
+void packed_prompt_budget() {
+    std::vector<MultiSlotBatchRow> captured;
+    MultiSlotCallbacks cb;
+    cb.broadcast=[](std::string_view,std::string&){return Failure{};};
+    cb.agree_payload=[](std::string_view,std::string_view){return Failure{};};
+    cb.execute=[](uint32_t,StepPhase,std::string_view,int32_t,uint64_t){return Failure{};};
+    cb.execute_batch=[&](const auto& rows){captured=rows;return Failure{};};
+    cb.abort_all=[]{};
+    cb.sample=[](uint32_t,const ServeRequest&,const auto&,uint64_t,int32_t& out){out=1;return Failure{};};
+    MultiSlotScheduler scheduler({0,4,100,65536,4096,8,true},cb);
+    scheduler.submit(generate("packed-a",13,2));scheduler.submit(generate("packed-b",9,2));
+    scheduler.submit(generate("packed-c",1,2));
+    check(scheduler.tick().outcome==MultiSlotOutcome::progressed&&captured.size()==3,
+          "packed prompt includes every active prompt within aggregate budget");
+    size_t total=0;for(const auto& row:captured)total+=row.tokens.size();
+    check(total<=8&&captured[0].tokens.size()==2&&captured[1].tokens.size()==3&&captured[2].tokens.size()==1,
+          "packed quota is deterministic and bounded across unequal lengths");
+    check(captured[0].position==0&&captured[1].position==0&&captured[2].position==0,
+          "packed prompt rows preserve independent initial positions");
+}
 }
 int main() {
     parity_and_followers();
+    production_batching();
     cancellation_and_reuse();
     admission_bounds();
     failures_withhold_output();
     disagreements();
+    speculative_batching();
+    compact_agreement();
+    packed_prompt_budget();
     std::printf("multislot: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

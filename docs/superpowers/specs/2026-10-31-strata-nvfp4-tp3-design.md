@@ -47,8 +47,10 @@ reference; it is not the production executor for this profile.
 
 ### Tensor Layout And Communication
 
-- Gate/up are column parallel, down is row parallel; FFN cuts 256/192/192 preserve
-  NVFP4 64-value weight blocks. Original scales apply to their own projection.
+- Gate/up are column parallel, down is row parallel. The balanced profile uses
+  FFN cuts 224/208/208, padded to 256 for storage. Down repacking copies each
+  original 16-value code/scale group without requantization. The initial
+  256/192/192 layout remains available. Original scales apply to their projection.
 - Each rank keeps its hidden channels, quantizes locally for the chosen production
   arithmetic and computes its local down contribution. Never gather hidden vectors
   or original FMA operands merely to reproduce single-host bit patterns.

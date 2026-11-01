@@ -285,6 +285,11 @@ struct PreagreedBatch {
 // The rank coordinator.  Single-threaded: one rank, one thread, one conversation at a time.
 class Session {
  public:
+    // Opt-in rank-ordered binary all-gather used for steady-state control once the
+    // fast transport is ready. The callback must complete within `at`.
+    using ControlExchangeFn =
+        std::function<Failure(std::string_view, std::vector<std::string>&, Deadline)>;
+
     Session(SessionConfig config, JoinInfo self, ControlChannel& channel, const Clock& clock, LogFn log = {});
 
     // Run the handshake to READY.  Blocks at most the configured phase budgets, never longer.  On any failure
@@ -335,6 +340,14 @@ class Session {
     // sequence, requires READY and no collective in flight. Any failure ends the session; output is unchanged.
     Failure broadcast_control_payload(std::string_view label, std::string& payload, Deadline at);
 
+    // Every rank supplies one bounded binary fragment. On success, outputs contains all fragments in rank
+    // order on every rank. The gather and committed broadcast share one control sequence.
+    Failure exchange_control_payloads(std::string_view label, std::string_view local,
+                                      std::vector<std::string>& outputs, Deadline at);
+    // Install before the first control operation, normally after the fast transport
+    // connects. The callback and this Session must outlive one another.
+    Failure enable_control_exchange(ControlExchangeFn exchange);
+
     // End the session and try to tell the others.  Idempotent; the first reason wins.
     void abort(std::string_view reason);
 
@@ -365,6 +378,12 @@ class Session {
     Failure peer_abort(const ReceivedFrame& got);
     // Record a failure, tell the peers that can still hear it, release the channel.
     Failure fail(Failure f, bool notify);
+    Failure broadcast_control_payload_impl(std::string_view label, std::string& payload, Deadline at,
+                                           const std::function<Failure(std::string_view)>* validate_received,
+                                           bool request_already_validated = false);
+    Failure control_exchange_impl(uint32_t kind, std::string_view label, std::string_view local,
+                                  std::string* broadcast_output,
+                                  std::vector<std::string>* exchange_outputs, Deadline at);
     void log(std::string_view line);
     Deadline deadline_after(uint32_t ms) const;
     void notify_peers(const Failure& f);
@@ -392,6 +411,7 @@ class Session {
     size_t batch_cursor_ = 0;
     size_t batch_count_ = 0;
     std::vector<std::string> schedule_signatures_;
+    ControlExchangeFn control_exchange_{};
     bool notified_ = false;
 };
 

@@ -66,4 +66,21 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
                                             const QsaIndexerLayers& layers, int n_layers, const QsaShapes& shapes,
                                             int64_t max_cells, const RopeScaling& scaling, void* stream);
 
+// Batched speculative appends for independent slot groups. Each group's rows are
+// appended sequentially; snapshot buffers store pre-append state and raw keys.
+struct QsaIndexerGroups {
+    static constexpr int kMax = 8;
+    QsaIndexerBuffers buffers[kMax] = {};
+    float* history_prefix[kMax] = {};
+    float* raw_prefix[kMax] = {};
+    int first[kMax] = {};
+    int count[kMax] = {};
+    bool snapshot[kMax] = {};
+    int n = 0;
+};
+void native_qsa_indexer_append_groups(const float* raw0, const int32_t* steps, int pos_stride,
+                                      float* dead_rows, const float* gamma, float epsilon,
+                                      const QsaIndexerGroups& groups, const QsaShapes& shapes,
+                                      int64_t max_cells, const RopeScaling& scaling, void* stream);
+
 } // namespace strata::kernels

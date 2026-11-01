@@ -179,3 +179,78 @@ It keeps original weight formats and Q8_1 activation arithmetic. This is an
 integration candidate: consult the acceptance record before treating a flag
 combination as qualified or faster. Keep state capture separate from speed
 measurements because writing diagnostics adds work.
+
+## NVFP4 Production Profile
+
+The final NVFP4 implementation is tracked by
+[`2026-10-31-strata-nvfp4-tp3-final.md`](../../../docs/superpowers/plans/2026-10-31-strata-nvfp4-tp3-final.md).
+It has a separate runner profile, `"profile": "nvfp4_tp3"`, because its
+arithmetic, model assets, 262144 protocol capacity and execution flags differ
+from the IQ exact-reference path. It requires the original NVFP4 expert pack,
+dense GGUF, BF16 embedding and FP8 PLE, all pinned in `asset_manifest`.
+The runner checks complete source and tokenizer manifests too.
+
+`--prefill-chunk` selects the large prompt chunk (64..8192), and `--parallel`
+selects 1, 4 or 8 active slots. A `process_timeout_s` of 0 keeps this opt-in
+service running until SparkRun stops it; individual requests still have bounded
+deadlines. `engine_env` accepts only the named performance settings validated by
+`fast_profile.py`. This profile is under implementation: protocol capacity and
+flags do not establish GPU fit, model correctness or performance acceptance.
+
+The NVFP4 executor can select `STRATA_TP_DENSE_MMQ=1` in `engine_env` for
+Q8 mixer projections with at least four rows, 2048 outputs and a reduction
+width divisible by 256. Smaller projections retain native MMVQ. Weights stay
+in their original Q8 format; the tensor-core reduction can change rounding.
+`STRATA_TP_PHASE_TIMING=1` writes host phase durations to native stderr for
+diagnostics. The managed service enables `inherit_stderr` so its existing
+bounded, redacted private log also captures the root engine's diagnostics.
+Other backend launchers discard stderr unless they explicitly enable this option.
+The service health lease covers the native operation budget plus five seconds,
+with a thirty-second minimum; a long prefill step does not expire an earlier lease.
+
+`STRATA_TP_ROCE_BLOCKS=8` selects eight cooperative CUDA blocks with 512
+threads for the direct RoCE copy and reduction. The device must support a
+cooperative launch with all eight blocks resident. Grid barriers protect the
+doorbell and slot reuse; the single-block default keeps its existing kernel.
+Use a qualified profile: transport smoke and graph replay alone do not
+establish model throughput or maximum-context correctness.
+
+The CUDA distributed build can opt into `-DSTRATA_TP_WIDE_WINDOW=ON` for
+40 logical target-verification rows. This build is for `strata-distributed-fast`;
+native matvec kernels still process at most 16 rows per launch. Eight slots
+can then verify up to four drafts each. A larger window is not necessarily
+faster; select the draft budget using whole-model measurements.
+
+`STRATA_TP_COMPACT_HEAD=1` exchanges only candidate maxima for plain greedy
+requests. Tie-breaking keeps the lowest global token ID, and every local logit
+is checked for nonfinite values. Sampling, history penalties and mixed batches
+use full logits. `STRATA_TP_LOGITS_DIR` also forces full logits for diagnostics.
+Graph caches distinguish these modes. The HTTP API's existing token-bias
+restriction remains in effect.
+
+`STRATA_TP_HC_BF16=1` selects a single BF16 activation image for decode HC
+projections with FP32 accumulation and original BF16 weights. It changes rounding;
+whole-model numerical and performance qualification is separate from component
+checks. `STRATA_SPEC_COST=1` enables adaptive greedy draft-window costs; without
+it the executor uses its configured fixed draft budget, bounded by active rows.
+
+`STRATA_TP_MTP_HNORM=stream` selects the existing GB10 draft hidden-norm option.
+It normalizes each HC stream separately, while the default pooled norm follows
+vLLM's reference equation. This affects proposals only; target verification and
+request sampling remain authoritative. Measure acceptance and throughput before
+selecting it for a serving profile.
+
+## Strict RDMA Between Hosts
+
+`STRATA_TP_RDMA_ONLY=1` requires the RoCE transport. It uses authenticated
+RDMA-CM SEND/RECV for bootstrap and errors, and native RoCE for control and
+tensors. It never initializes an NCCL communicator. IPv4 endpoint addresses
+select RDMA routes; they do not imply TCP sockets. The local HTTP API remains
+available for clients. Set `STRATA_TP_CONTROL_RDMA=1` and rank-specific
+`STRATA_TP_RDMA_BIND` / `STRATA_TP_RDMA_ROOT` addresses in the checked profile.
+
+`STRATA_TP_ROCE_RING_ORDER=1` preserves the selected NCCL SIMPLE eight-channel
+FP32 sum association for large messages, including16KiB cell boundaries and
+the shorter final channel. This is a compatibility profile for the measured
+three-Spark setup, not a general NCCL algorithm emulator. Requalify numerical
+results when changing the model or transport configuration.

@@ -51,6 +51,14 @@ Failure MultiSlotScheduler::agree(std::string_view kind, const std::string& expe
     const std::string length = "slots=" + std::to_string(config_.slots) + ":vocab=" +
         std::to_string(config_.n_vocab) + ":context=" + std::to_string(config_.context) +
         ":limit=" + std::to_string(config_.request_limit) + ":bytes=" + std::to_string(expected.size());
+    if (callbacks_.agree_payload && length.size() + 1 + expected.size() <= kChunk) {
+        std::string payload = length;
+        payload.push_back('\n');
+        payload += expected;
+        if (auto f = callbacks_.agree_payload(label, payload)) return f;
+        ++action_;
+        return {};
+    }
     std::string bytes = config_.rank == 0 ? length : std::string{};
     if (auto f = callbacks_.broadcast(label + ":length", bytes)) return f;
     if (bytes != length) return invalid("multislot action length disagrees");
@@ -85,10 +93,10 @@ Failure MultiSlotScheduler::execute(uint32_t slot, StepPhase phase, int32_t toke
 
 MultiSlotResult MultiSlotScheduler::submit(std::string_view json) try {
     if (failed()) return terminal();
-    // Admission is bounded before copying. The public parser has the same 1 MiB limit.
-    if (json.size() > (1u << 20)) {
+    // Admission is bounded before copying; the parser enforces the same line limit.
+    if (json.size() > kDistributedMaxLineBytes) {
         if (auto f = agree("oversized-admission", std::to_string(json.size()))) return abort(f);
-        return reject("generate JSON exceeds 1 MiB");
+        return reject("generate JSON exceeds 4 MiB");
     }
     if (auto f = agree("submit", std::string(json))) return abort(f);
     ServeRequest candidate;
@@ -104,6 +112,7 @@ MultiSlotResult MultiSlotScheduler::submit(std::string_view json) try {
     if (auto f = agree("admission", candidate.request_id + ":slot=" + std::to_string(index) + ":" + decision))
         return abort(f);
     if (decision != "accepted") return reject(decision);
+    if (callbacks_.admitted) if (auto f = callbacks_.admitted(index, candidate)) return abort(f);
     admitted_.insert(candidate.request_id);
     free->request = std::move(candidate);
     return {MultiSlotOutcome::accepted, index, {}, {}};
@@ -146,6 +155,7 @@ Failure MultiSlotScheduler::sampled(std::string_view id, int32_t& token) {
 
 MultiSlotResult MultiSlotScheduler::tick() try {
     if (failed()) return terminal();
+    if (callbacks_.execute_batch) return tick_batched();
     uint32_t index = kMultiSlotMaximum;
     for (uint32_t n = 0; n < config_.slots; ++n) {
         const uint32_t at = (cursor_ + n) % config_.slots;
@@ -200,5 +210,170 @@ MultiSlotResult MultiSlotScheduler::tick() try {
     return {MultiSlotOutcome::progressed, index, {}, {}};
 } catch (...) {
     return abort(Failure::fail(FailureCode::comm_failed, "exception during multislot tick"));
+}
+
+MultiSlotResult MultiSlotScheduler::tick_batched() {
+    if (!config_.prefill_chunk || config_.prefill_chunk > 8192)
+        return abort(invalid("invalid production prefill chunk"));
+    if (tick_ == std::numeric_limits<uint64_t>::max()) return abort(invalid("multislot tick exhausted"));
+    // Retire cancellation before selecting GPU rows. No cancelled slot can be
+    // included in the next graph, and reset never changes another slot's state.
+    for (uint32_t i = 0; i < config_.slots; ++i) {
+        auto& s = slots_[i];
+        if (!s.request || !s.cancel) continue;
+        const auto id = s.request->request_id;
+        if (auto f = agree("batch-cancel", identity(i))) return abort(f);
+        if (!s.history.empty()) if (auto f = execute(i, StepPhase::cancel, -1, 0)) return abort(f);
+        s = Slot{};
+        if (config_.rank == 0 && callbacks_.emit) callbacks_.emit("cancelled", i, id, -1);
+    }
+    std::vector<uint32_t> prompt, decode;
+    for (uint32_t n = 0; n < config_.slots; ++n) {
+        const auto i = (cursor_ + n) % config_.slots;
+        const auto& s = slots_[i];
+        if (!s.request) continue;
+        (s.prompt < s.request->ids.size() ? prompt : decode).push_back(i);
+    }
+    const bool prefill = !prompt.empty() && (prefer_prefill_ || decode.empty());
+    if(!prefill && !decode.empty() && callbacks_.speculate) {
+        std::vector<MultiSlotProposal> proposals;
+        std::string envelope="tick="+std::to_string(tick_);
+        for(auto slot:decode) {
+            const auto& s=slots_[slot];
+            proposals.push_back({slot,*s.request,s.history,s.feedback,s.generated});
+            envelope+=':'+identity(slot);
+        }
+        if(auto f=agree("spec-batch",envelope))return abort(f);
+        std::vector<MultiSlotAccepted> accepted;
+        if(auto f=callbacks_.speculate(proposals,accepted))return abort(f);
+        if(accepted.size()!=proposals.size())return abort(invalid("speculative batch result count mismatch"));
+        for(size_t i=0;i<accepted.size();++i) {
+            const auto slot=proposals[i].slot;
+            const auto& a=accepted[i];const auto& s=slots_[slot];
+            if(a.tokens.empty()||a.tokens.size()!=a.consumed.size()||
+                a.tokens.size()>s.request->max_new-s.generated||a.consumed.front()!=s.feedback)
+                return abort(invalid("invalid speculative prefix result"));
+            for(size_t j=0;j<a.tokens.size();++j) {
+                if(a.tokens[j]<0||a.tokens[j]>=config_.n_vocab||a.consumed[j]<0||a.consumed[j]>=config_.n_vocab||
+                    (j && a.consumed[j]!=a.tokens[j-1]))return abort(invalid("invalid speculative token chain"));
+            }
+        }
+        if (!callbacks_.agree_payload) {
+            // Preserve the established per-slot agreement sequence for legacy adapters.
+            for(size_t i=0;i<accepted.size();++i) {
+                const auto slot=proposals[i].slot;auto& s=slots_[slot];const auto id=s.request->request_id;
+                const auto& a=accepted[i];std::string decision=identity(slot);
+                for(auto token:a.tokens)decision+=':'+std::to_string(token);
+                if(auto f=agree("spec-publish",decision))return abort(f);
+                s.history.insert(s.history.end(),a.consumed.begin(),a.consumed.end());
+                s.generated+=a.tokens.size();s.feedback=a.tokens.back();const bool done=s.generated==s.request->max_new;
+                if(done)if(auto f=execute(slot,StepPhase::reset,-1,0))return abort(f);
+                if(done)s=Slot{};
+                if(config_.rank==0 && callbacks_.emit) {
+                    for(auto token:a.tokens)callbacks_.emit("token",slot,id,token);
+                    if(done)callbacks_.emit("done",slot,id,-1);
+                }
+            }
+        } else {
+            // Length-prefix every value so identities and token sequences cannot collide.
+            std::string decision;
+            auto append_field = [&](std::string_view field) {
+                decision += std::to_string(field.size());
+                decision.push_back(':');
+                decision.append(field);
+            };
+            append_field(std::to_string(accepted.size()));
+            for(size_t i=0;i<accepted.size();++i) {
+                append_field(identity(proposals[i].slot));
+                append_field(std::to_string(accepted[i].tokens.size()));
+                for(const auto token:accepted[i].tokens) append_field(std::to_string(token));
+            }
+            if(auto f=agree("spec-publish-batch",decision))return abort(f);
+            std::vector<std::string> request_ids;
+            std::vector<bool> done_slots;
+            request_ids.reserve(accepted.size());
+            done_slots.reserve(accepted.size());
+            for(size_t i=0;i<accepted.size();++i) {
+                const auto slot=proposals[i].slot;auto& s=slots_[slot];const auto id=s.request->request_id;
+                const auto& a=accepted[i];
+                s.history.insert(s.history.end(),a.consumed.begin(),a.consumed.end());
+                s.generated+=a.tokens.size();s.feedback=a.tokens.back();const bool done=s.generated==s.request->max_new;
+                request_ids.push_back(id);
+                done_slots.push_back(done);
+            }
+            for(size_t i=0;i<accepted.size();++i) {
+                const auto slot=proposals[i].slot;
+                if(done_slots[i]) if(auto f=execute(slot,StepPhase::reset,-1,0))return abort(f);
+            }
+            for(size_t i=0;i<accepted.size();++i) {
+                const auto slot=proposals[i].slot;
+                const auto& id=request_ids[i];
+                const bool done=done_slots[i];
+                const auto& a=accepted[i];
+                if(done)slots_[slot]=Slot{};
+                if(config_.rank==0 && callbacks_.emit) {
+                    for(auto token:a.tokens)callbacks_.emit("token",slot,id,token);
+                    if(done)callbacks_.emit("done",slot,id,-1);
+                }
+            }
+        }
+        cursor_=(decode.back()+1)%config_.slots;prefer_prefill_=true;++tick_;
+        return {MultiSlotOutcome::progressed,decode.front(),{}, {}};
+    }
+    std::vector<MultiSlotBatchRow> rows;
+    if (prefill) {
+        const size_t count=config_.packed_prefill?prompt.size():1;
+        size_t remaining=config_.prefill_chunk;
+        for(size_t at=0;at<count&&remaining;++at) {
+            const auto i=prompt[at];const auto& s=slots_[i];
+            const auto quota=std::max<size_t>(1,remaining/(count-at));
+            const auto end=std::min(s.request->ids.size(),s.prompt+quota);
+            rows.push_back({i,StepPhase::prefill,s.request->request_id,
+                {s.request->ids.begin()+s.prompt,s.request->ids.begin()+end},s.history.size()});
+            remaining-=end-s.prompt;
+        }
+    } else for (const auto i : decode) {
+        const auto& s = slots_[i];
+        if (s.feedback < 0) return abort(invalid("decode batch lacks committed feedback"));
+        rows.push_back({i, StepPhase::decode, s.request->request_id, {s.feedback}, s.history.size()});
+    }
+    std::string envelope = "tick=" + std::to_string(tick_) + ":rows=" + std::to_string(rows.size());
+    for (const auto& row : rows) {
+        envelope += ":slot=" + std::to_string(row.slot) + ":request=" + row.request +
+                    ":position=" + std::to_string(row.position) + ":phase=" + std::to_string(uint32_t(row.phase));
+        for (const auto token : row.tokens) { envelope.push_back(':'); envelope += std::to_string(token); }
+    }
+    if (auto f = agree("batch-execute", envelope)) return abort(f);
+    if (rows.empty()) return {};
+    if (auto f = callbacks_.execute_batch(rows)) return abort(f);
+    // Only an entirely successful, committed GPU batch advances host histories.
+    for (const auto& row : rows) {
+        auto& s = slots_[row.slot];
+        s.history.insert(s.history.end(), row.tokens.begin(), row.tokens.end());
+        if (prefill) s.prompt += row.tokens.size();
+    }
+    for (const auto& row : rows) {
+        auto& s = slots_[row.slot];
+        if (s.prompt != s.request->ids.size()) continue;
+        const auto id = s.request->request_id;
+        int32_t token = -1;
+        if (config_.rank == 0) if (auto f = callbacks_.sample(row.slot, *s.request, s.history, s.generated, token))
+            return abort(f);
+        if (auto f = sampled(identity(row.slot), token)) return abort(f);
+        if (auto f = agree("batch-publish", identity(row.slot) + ":token=" + std::to_string(token))) return abort(f);
+        const bool done = s.generated + 1 == s.request->max_new;
+        if (done) if (auto f = execute(row.slot, StepPhase::reset, -1, 0)) return abort(f);
+        s.feedback = token;
+        ++s.generated;
+        if (done) s = Slot{};
+        if (config_.rank == 0 && callbacks_.emit) {
+            callbacks_.emit("token", row.slot, id, token);
+            if (done) callbacks_.emit("done", row.slot, id, -1);
+        }
+    }
+    cursor_ = (rows.back().slot + 1) % config_.slots;
+    prefer_prefill_ = !prefill;
+    ++tick_;
+    return {MultiSlotOutcome::progressed, rows.front().slot, {}, {}};
 }
 }  // namespace strata::distributed

@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import subprocess
 import time
+import threading
 
 import pytest
 
@@ -63,6 +64,26 @@ def change_binary(config, text):
     path = Path(config["binary"])
     path.write_text("#!/usr/bin/python3\n" + text)
     config["binary_sha256"] = runner.digest(path)
+
+
+def test_private_diagnostics_flush_before_child_exits(tmp_path):
+    read_fd, write_fd = os.pipe()
+    path = tmp_path / "live.log"
+    overflow = threading.Event()
+    with os.fdopen(read_fd, "rb") as stream:
+        worker = threading.Thread(target=runner.drain, args=(stream, path, "private-credential", overflow))
+        worker.start()
+        try:
+            os.write(write_fd, b"native failed private-credential\n")
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and (not path.exists() or not path.stat().st_size):
+                time.sleep(.005)
+            assert path.read_bytes() == b"native failed [redacted]\n"
+            assert not overflow.is_set()
+        finally:
+            os.close(write_fd)
+            worker.join(timeout=1)
+        assert not worker.is_alive()
 
 
 def mtp_args(config, tmp_path, rank="0"):
@@ -294,10 +315,20 @@ def test_rank0_config_is_explicit_localhost_and_native(config):
     cfg = runner.validated(dict(config, args=args))
     server = runner.server_config(cfg)
     assert server["host"] == "127.0.0.1" and server["port"] == 18080
+    assert server["distributed"]["inherit_stderr"] is True
     assert server["tokenizer"] == config["tokenizer_dir"] and server["arch"] == "qwen4exp"
     assert server["distributed"]["command"] == [config["binary"], "--mode", "autoregressive", *args]
-    assert server["distributed"]["ready_timeout"] >= 300 and server["distributed"]["health_timeout"] == 30
+    assert server["distributed"]["ready_timeout"] >= 300
+    assert server["distributed"]["health_timeout"] >= int(cfg["options"]["timeout-ms"]) / 1000 + 5
     assert server["distributed"]["cancel_timeout"] == 30 and server["distributed"]["shutdown_timeout"] == 10
+
+
+@pytest.mark.parametrize("timeout_ms,health_s", [(100, 30), (30000, 35), (120000, 125)])
+def test_health_lease_covers_a_bounded_native_step(config, timeout_ms, health_s):
+    args = list(config["args"])
+    args[args.index("--timeout-ms") + 1] = str(timeout_ms)
+    cfg = runner.validated(dict(config, args=args))
+    assert runner.server_config(cfg)["distributed"]["health_timeout"] == health_s
 
 
 def test_follower_environment_redaction_and_terminal_receipt(config, monkeypatch):
@@ -364,6 +395,13 @@ def test_socket_transport_and_missing_ib_fail(config):
     assert result["status"] == "failed" and result["reason"] == "socket tensor transport detected"
     assert time.monotonic() - before < 3
     assert runner.inspect_network("") == "missing selected NET/IB evidence"
+
+
+def test_rdma_only_runtime_evidence():
+    marker='STRATA_RDMA_ONLY transport=roce bootstrap=rdma_cm control=rdma nccl_initialized=0'
+    assert runner.inspect_network(marker, rdma_only=True) == ''
+    assert runner.inspect_network('', rdma_only=True) == 'missing RDMA-only runtime evidence'
+    assert runner.inspect_network(marker+'\nNCCL INFO init', rdma_only=True) == 'NCCL initialization detected in RDMA-only mode'
 
 
 def test_deadline_escalates_and_descendant_does_not_survive(config, tmp_path):

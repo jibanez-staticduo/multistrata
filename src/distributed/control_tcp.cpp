@@ -141,6 +141,7 @@ Failure FrameDecoder::feed(const char* data, size_t n, std::vector<DecodedFrame>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -171,6 +172,13 @@ bool out_of_time(const Clock& clock, Deadline at) { return deadline_passed(clock
 std::string errno_text() { return std::string(strerror(errno)); }
 
 bool set_nonblocking(int fd, std::string& err) {
+    // Control frames are short request/reply exchanges; Nagle plus delayed
+    // acknowledgements can otherwise add tens of milliseconds to each step.
+    const int one = 1;
+    if (::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) < 0) {
+        err = "setsockopt TCP_NODELAY: " + errno_text();
+        return false;
+    }
     const int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) {
         err = "fcntl F_GETFL: " + errno_text();

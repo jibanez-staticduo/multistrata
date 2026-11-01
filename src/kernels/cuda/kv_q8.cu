@@ -1,5 +1,7 @@
 // src/kernels/cuda/kv_q8.cu - see include/strata/kernels/kv_q8.hpp.
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/window_limits.hpp"
+#include <stdexcept>
 #include "strata/kernels/f16_bits.hpp"
 
 #include <cuda_runtime.h>
@@ -43,6 +45,58 @@ __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict
     const long long pos = (long long) __ldg(step + kStepPos);
     const int h = blockIdx.x, g = blockIdx.y, t = threadIdx.x;
     const bool is_v = MULTI ? (blockIdx.z & 1) == 1 : blockIdx.z == 1;
+    const int groups = head_dim / KV_Q8_GROUP;
+    const float x = (is_v ? vcur : kcur)[h * head_dim + g * KV_Q8_GROUP + t];
+    // max |x| over the 64 values: two warps, then combine through shared memory in a fixed order
+    float a = fabsf(x);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    __shared__ float warp_max[2];
+    if ((t & 31) == 0) warp_max[t >> 5] = a;
+    __syncthreads();
+    const float amax = fmaxf(warp_max[0], warp_max[1]);
+    const uint16_t sbits = f16_from_f32(amax / 127.0f);
+    const float sf = f32_from_f16(sbits);                          // quantize against the STORED scale
+    int q = 0;
+    if (sf > 0.0f) {
+        q = __float2int_rn(x / sf);
+        q = q < -127 ? -127 : (q > 127 ? 127 : q);
+    }
+    // KV streaming: the host copy (identity layout) always, the VRAM page only if the block is resident
+    const long long page = (long long) table[pos / page_size];
+    if (page >= 0) {
+        const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
+        (is_v ? v_q : k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
+        if (t == 0) (is_v ? v_scale : k_scale)[row * groups + g] = sbits;
+    }
+    if (host.k_q != nullptr) {
+        const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+        (is_v ? host.v_q : host.k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
+        if (t == 0) (is_v ? host.v_scale : host.k_scale)[row * groups + g] = sbits;
+    }
+}
+
+__global__ void kv_append_q8_groups_kernel(int8_t* __restrict__ k_q, int8_t* __restrict__ v_q,
+                                    uint16_t* __restrict__ k_scale, uint16_t* __restrict__ v_scale,
+                                    const int32_t* __restrict__ table, const int32_t* __restrict__ step,
+                                    const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
+                                    int head_dim, int page_size, KvHostPools host, int step_stride,
+                                    int cur_stride, KvQ8AppendGroups pools) {
+    {
+        const int row = blockIdx.z >> 1;
+        int group = -1;
+        for (int i=0;i<pools.n;++i)
+            if(row>=pools.first[i]&&row<pools.first[i]+pools.count[i])group=i;
+        if(group<0)return;
+        k_q=pools.k[group];v_q=pools.v[group];
+        k_scale=pools.k_scale[group];v_scale=pools.v_scale[group];table=pools.page_table[group];
+    }
+    {
+        const int j = blockIdx.z >> 1;
+        step += (size_t) j * step_stride; kcur += (size_t) j * cur_stride; vcur += (size_t) j * cur_stride;
+    }
+    const long long pos = (long long) __ldg(step + kStepPos);
+    const int h = blockIdx.x, g = blockIdx.y, t = threadIdx.x;
+    const bool is_v = (blockIdx.z & 1) == 1;
     const int groups = head_dim / KV_Q8_GROUP;
     const float x = (is_v ? vcur : kcur)[h * head_dim + g * KV_Q8_GROUP + t];
     // max |x| over the 64 values: two warps, then combine through shared memory in a fixed order
@@ -200,6 +254,31 @@ void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v
         k_q, v_q, k_scale, v_scale, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim,
         (int) s.page_size, host ? *host : KvHostPools{}, step_stride, cur_stride);
     check("kv_append_q8 (steps) launch");
+}
+
+void kv_append_q8_groups(const KvQ8AppendGroups& pools,const int32_t* steps,int step_stride,
+                         const float* keys,const float* values,int cur_stride,int rows,
+                         const QsaShapes& s,void* stream) {
+    validate(s,"kv_append_q8 (groups)");
+    if(pools.n<1||pools.n>8||rows<1||rows>kWindowMaxT||!steps||!keys||!values||!stream||
+       step_stride<1||cur_stride<s.n_head_kv*s.head_dim)
+        throw std::invalid_argument("invalid grouped Q8 KV append");
+    int next=0;
+    for(int i=0;i<pools.n;++i) {
+        if(!pools.k[i]||!pools.v[i]||!pools.k_scale[i]||!pools.v_scale[i]||!pools.page_table[i]||
+           pools.first[i]!=next||pools.count[i]<1||pools.count[i]>5||pools.count[i]>rows-next)
+            throw std::invalid_argument("invalid grouped Q8 KV pools/ranges");
+        for(int j=0;j<i;++j)
+            if(pools.k[i]==pools.k[j]||pools.v[i]==pools.v[j])
+                throw std::invalid_argument("grouped Q8 KV pools alias");
+        next+=pools.count[i];
+    }
+    if(next!=rows)throw std::invalid_argument("grouped Q8 KV ranges omit rows");
+    const dim3 grid(unsigned(s.n_head_kv),unsigned(s.head_dim/KV_Q8_GROUP),unsigned(2*rows));
+    kv_append_q8_groups_kernel<<<grid,KV_Q8_GROUP,0,(cudaStream_t)stream>>>(
+        nullptr,nullptr,nullptr,nullptr,nullptr,steps,keys,values,int(s.n_head_kv),int(s.head_dim),
+        int(s.page_size),KvHostPools{},step_stride,cur_stride,pools);
+    check("kv_append_q8 (groups) launch");
 }
 
 void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,

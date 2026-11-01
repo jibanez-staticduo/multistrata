@@ -12,6 +12,9 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#if defined(STRATA_QSA_TP_PARITY)
+#include "strata/kernels/fast_qsa.hpp"
+#endif
 #include "strata/kernels/kv_q4.hpp"
 
 #include <cuda_fp16.h>
@@ -26,6 +29,11 @@
 #include <vector>
 
 namespace k = strata::kernels;
+#if defined(STRATA_QSA_TP_PARITY)
+#define QSA_PARITY_API strata::kernels::tp::cuda::fast_qsa
+#else
+#define QSA_PARITY_API strata::kernels
+#endif
 
 namespace {
 void ck(cudaError_t e, const char* w) {
@@ -53,7 +61,10 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         }
     }
 #endif
-    const k::QsaShapes s = k::qsa_real_shapes();
+    k::QsaShapes s = k::qsa_real_shapes();
+#if defined(STRATA_QSA_TP_PARITY)
+    s.n_head = 8;
+#endif
     const int64_t HD = s.head_dim, NKV = s.n_head_kv, NH = s.n_head, PS = s.page_size;
     const int64_t pages = (ctx + PS - 1) / PS, rows = pages * NKV * PS;
     std::mt19937 rng(1234 + fmt);
@@ -203,16 +214,16 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     const int64_t batch = 32;
     ck(cudaMalloc(&d_old, nq * NH * HD * 4), "malloc");
     ck(cudaMalloc(&d_new, nq * NH * HD * 4), "malloc");
-    ck(cudaMalloc(&scratch, batch * k::qsa_decode_attn_scratch_floats(cap, s) * 4), "malloc");
+    ck(cudaMalloc(&scratch, batch * QSA_PARITY_API::qsa_decode_attn_scratch_floats(cap, s) * 4), "malloc");
     auto old_run = [&]() {
         for (int64_t t0 = 0; t0 < nq; t0 += batch)
-            k::qsa_decode_attn_batch(d_q + t0 * NH * HD, pl, d_ids + t0 * cap, d_steps + t0 * k::kStepCount, cap, s,
+            QSA_PARITY_API::qsa_decode_attn_batch(d_q + t0 * NH * HD, pl, d_ids + t0 * cap, d_steps + t0 * k::kStepCount, cap, s,
                                      scratch, d_old + t0 * NH * HD, std::min(batch, nq - t0), nullptr);
     };
     // int8 KV: v2 here, and the opt-in INT8-MMA kernel (STRATA_PROMPT_ATTN_IMMA) checked and timed below beside it
-    if (fmt == 1) k::qsa_prompt_attn_set_imma(0);
+    if (fmt == 1) QSA_PARITY_API::qsa_prompt_attn_set_imma(0);
     auto new_run = [&]() {
-        if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, nullptr)) {
+        if (!QSA_PARITY_API::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, nullptr)) {
             std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools\n");
             std::exit(2);
         }
@@ -220,13 +231,29 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     float* d_im = nullptr;
     ck(cudaMalloc(&d_im, nq * NH * HD * 4), "malloc");
     auto imma_run = [&]() {
-        k::qsa_prompt_attn_set_imma(1);
-        const bool ok = k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_im, nq, nullptr);
-        k::qsa_prompt_attn_set_imma(0);
+        QSA_PARITY_API::qsa_prompt_attn_set_imma(1);
+        const bool ok = QSA_PARITY_API::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_im, nq, nullptr);
+        QSA_PARITY_API::qsa_prompt_attn_set_imma(0);
         if (!ok) { std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools (imma)\n"); std::exit(2); }
     };
     old_run();
     new_run();
+#if defined(STRATA_QSA_TP_PARITY)
+    // Changing the host batch boundary must preserve every query's result.
+    std::vector<float> whole(size_t(nq*NH*HD)),chunked(whole.size());
+    ck(cudaMemcpy(whole.data(),d_new,whole.size()*4,cudaMemcpyDeviceToHost),"whole prompt batch");
+    for(int64_t first=0;first<nq;first+=32) {
+        if(!QSA_PARITY_API::qsa_prompt_attn_batch(d_q+first*NH*HD,pl,d_ids+first*cap,
+            d_steps+first*k::kStepCount,cap,s,d_new+first*NH*HD,std::min<int64_t>(32,nq-first),nullptr)) {
+            std::fprintf(stderr,"chunked prompt attention refused pools\n");std::exit(2);
+        }
+    }
+    ck(cudaMemcpy(chunked.data(),d_new,chunked.size()*4,cudaMemcpyDeviceToHost),"chunked prompt batch");
+    if(std::memcmp(whole.data(),chunked.data(),whole.size()*4)) {
+        std::fprintf(stderr,"prompt attention batch boundary changed output\n");std::exit(2);
+    }
+    std::printf("prompt attention whole/chunk32 bitexact PASS (%lld queries)\n",(long long)nq);
+#endif
     if (fmt == 1) imma_run();
     ck(cudaDeviceSynchronize(), "run");
     std::vector<float> o((size_t) (nq * NH * HD)), nw(o.size()), im(fmt == 1 ? o.size() : 0);
@@ -320,7 +347,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                     "v2 %.3f -> IMMA %.3f ms per chunk (%.2fx)\n", ok_im ? "PASS" : "FAIL", (long long) ctx, (long long) nq,
                     err_im, err_new, err_old, d_iv, d_iv / scale, ms_v2 / reps, ms_im / reps, ms_v2 / ms_im);
     }
-    k::qsa_prompt_attn_set_imma(-1);
+    QSA_PARITY_API::qsa_prompt_attn_set_imma(-1);
     cudaFree(d_im);
     const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale) && ok_im;
     const bool ok2 = diff <= 1e-4 * scale;

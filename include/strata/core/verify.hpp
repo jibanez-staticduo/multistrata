@@ -26,6 +26,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/tensor_parallel.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/window_limits.hpp"
 
@@ -101,11 +102,41 @@ public:
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
 
+    // ================================ TENSOR-PARALLEL WINDOWS ================================
+    //
+    // With hooks set, a window's attention (the `mixer` seam) and its routed experts (the `experts` seam) go to the
+    // provider instead of being computed whole here: each rank owns its shard of the projections, of the GDN
+    // recurrence and of the QSA K/V, and the provider returns the globally reduced block output and the globally
+    // reduced, already weighted routed sum.  This engine keeps the row layout, the hyper-connections, the router,
+    // the shared expert, the head and every per-row residual.
+    //
+    // Ordinary windows keep one row per slot. Speculative windows explicitly
+    // enable provider prefix snapshots and restore PLE to the accepted row;
+    // commit_slot_prefixes leaves recurrent/indexer restoration to that provider.
+    // Neither path runs a replicated state commit or raises expert doorbells.
+    //
+    // Set both BEFORE `init`.  A null `hooks` (the default) leaves every path byte-identical.
+    void set_tensor_parallel(TensorParallelHooks* hooks) { tp_ = hooks; }
+    /// The device table of row slot ids, at a FIXED address, alive until the owning stream completes: a captured
+    /// graph bakes the pointer in and reads it at every replay.  The driver stages it before each window.  Null
+    /// means the provider reads `TensorParallelRows::slot` (the same slot for every row).
+    void set_tensor_parallel_slot_table(const int32_t* device_slots) { tp_slots_ = device_slots; }
+    bool tensor_parallel() const { return tp_ != nullptr; }
+    void set_tensor_parallel_speculative(bool on) { tp_speculative_ = on; }
+    /// The collectives one window graph issues with hooks set: two per layer (the mixer's and the experts').
+    /// Pure arithmetic, so a driver can price a placement before capturing anything.  Valid after `init`.
+    int64_t tp_collectives_per_window() const { return tp_ == nullptr ? 0 : 2 * (le_ - lb_); }
+
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
+    const float* logits_device(int row) const {
+        if (next_ != nullptr && !last_stage()) return next_->logits_device(row);
+        return row >= 0 && row < last_t_ && head_logits_ != nullptr
+            ? head_logits_ + (size_t) row * (size_t) n_vocab_ : nullptr;
+    }
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// #879 GUARD: the first row of the last finished window (run, run_slot_rows, batch_poll, pl_finish) whose head
     /// logits held a NaN or an infinity, else -1; nonfinite_pos() is that row's position.  Every window graph
@@ -119,7 +150,7 @@ public:
     /// Row t of the last window (a batch window: each slot's own rows) held a non-finite logit.
     bool nonfinite_in(int t) const {
         if (next_ != nullptr && !last_stage()) return next_->nonfinite_in(t);
-        return t >= 0 && t < 32 && ((nf_mask_ >> t) & 1u) != 0;
+        return t >= 0 && t < 64 && ((nf_mask_ >> t) & 1ull) != 0;
     }
     static bool nan_guard_on();
     /// The most tokens one window holds (`init`'s `max_t`; 0 before it).
@@ -415,6 +446,10 @@ private:
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
+        if (tp_ != nullptr) {
+            k.push_back(tp_speculative_ ? 1 : 0);
+            k.push_back(tp_->compact_greedy_head() ? 1 : 0);
+        }
         return k;
     }
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
@@ -521,6 +556,10 @@ private:
     unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT's counters on device_ (#1578); null: none
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows
     bool all_resident_ = false;           ///< 100% of experts in [lb_, le_) resident in VRAM: zero-doorbell graph
+    TensorParallelHooks* tp_ = nullptr;   ///< the tensor-parallel seams; null: every path exactly as before
+    const int32_t* tp_slots_ = nullptr;   ///< the driver's fixed-address device row slot ids (see set_tensor_parallel)
+    float* tp_one_ = nullptr;             ///< [max_t_] ones: the reduced routed sum enters the combine as one part
+    bool tp_speculative_ = false;
     /// #871: the zero-doorbell graph plans from the device residency table alone, so it is only right while every
     /// expert of the stage is in VRAM.  A prompt loan, a VRAM shrink or an adaptive swap marks some -1 for a while:
     /// every window then runs the doorbell graph (exec_nr_ / the batch key's top bit), the same as a stage that never
@@ -640,7 +679,7 @@ private:
     uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
     int nf_row_ = -1;                     ///< nonfinite_row()
     int64_t nf_pos_ = -1;                 ///< nonfinite_pos()
-    uint32_t nf_mask_ = 0;                ///< nonfinite_in(): bit t = row t
+    uint64_t nf_mask_ = 0;                ///< nonfinite_in(): bit t = row t
     void note_nonfinite(int T, const int64_t* pos_b);   ///< the window's flags (+ STRATA_NAN_INJECT) -> nf_row_
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k

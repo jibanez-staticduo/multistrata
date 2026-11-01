@@ -271,6 +271,41 @@ std::string broadcast_payload(uint64_t sequence, std::string_view label, std::st
     return std::string("BRC1", 4) + control_payload(sequence, label, payload);
 }
 
+std::string exchange_label(std::string_view label) {
+    std::string out("\0XCP1", 5);
+    for (int shift : {24, 16, 8, 0}) out.push_back(static_cast<char>((label.size() >> shift) & 0xff));
+    out.append(label);
+    return out;
+}
+
+std::string exchange_contribution(uint64_t sequence, std::string_view label, std::string_view local) {
+    std::string out("XCH1", 4);
+    auto field = [&](std::string_view value) {
+        const uint32_t n = static_cast<uint32_t>(value.size());
+        for (int shift : {24, 16, 8, 0}) out.push_back(static_cast<char>((n >> shift) & 0xff));
+        out.append(value);
+    };
+    field(kUuid);
+    for (int shift : {56, 48, 40, 32, 24, 16, 8, 0})
+        out.push_back(static_cast<char>((sequence >> shift) & 0xff));
+    field(label);
+    field(local);
+    return out;
+}
+
+std::string exchange_outputs(const std::vector<std::string>& values) {
+    std::string out("XCV1", 4);
+    auto field = [&](std::string_view value) {
+        const uint32_t n = static_cast<uint32_t>(value.size());
+        for (int shift : {24, 16, 8, 0}) out.push_back(static_cast<char>((n >> shift) & 0xff));
+        out.append(value);
+    };
+    const uint32_t count = static_cast<uint32_t>(values.size());
+    for (int shift : {24, 16, 8, 0}) out.push_back(static_cast<char>((count >> shift) & 0xff));
+    for (const auto& value : values) field(value);
+    return out;
+}
+
 void queue_coordinator_ready(Harness& h) {
     const auto ranks = good_roster();
     h.channel.recv_frames.push_back(from(1, FrameKind::join, join_payload(good_join(1))));
@@ -509,6 +544,158 @@ void control_payload_broadcast() {
             exact &= output == value;
         }
         check(exact, "agreement and broadcast share a sequence, including an empty root broadcast");
+    }
+}
+
+void control_payload_exchange() {
+    const std::string label("mtp\0proposals", 13);
+    const std::vector<std::string> fragments{std::string("root\0\xff", 6),
+                                             std::string("rank1\0\xff", 7), ""};
+    const auto aggregate = exchange_outputs(fragments);
+    const auto internal_label = exchange_label(label);
+    {
+        Harness h;
+        queue_coordinator_ready(h);
+        Session session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "coordinator is ready for control exchange");
+        h.channel.recv_frames.push_back(from(2, FrameKind::control, exchange_contribution(1, label, fragments[2])));
+        h.channel.recv_frames.push_back(from(1, FrameKind::control, exchange_contribution(1, label, fragments[1])));
+        h.channel.recv_frames.push_back(from(2, FrameKind::control_ack, broadcast_payload(1, internal_label, aggregate)));
+        h.channel.recv_frames.push_back(from(1, FrameKind::control_ack, broadcast_payload(1, internal_label, aggregate)));
+        std::vector<std::string> output;
+        const auto f = session.exchange_control_payloads(label, fragments[0], output,
+            {h.clock.now() + std::chrono::seconds(1)});
+        check(!f && output == fragments && session.ready(),
+              "control exchange gathers binary fragments in rank order and accepts out-of-order ACKs");
+        check(h.channel.sends_of(FrameKind::control_ack) == 2,
+              "control exchange commits only after all ranks acknowledge the aggregate");
+    }
+    for (int mode = 0; mode < 8; ++mode) {
+        Harness h;
+        const auto ranks = good_roster();
+        h.channel.recv_frames.push_back(from(0, FrameKind::roster, roster_payload(ranks, PhaseBudgets{})));
+        h.channel.recv_frames.push_back(from(0, FrameKind::ready, make_ack(kUuid, 0, roster_digest(ranks))));
+        Session session = h.session(1, good_join(1), good_config(1));
+        check(!session.start(), "follower is ready for control exchange validation");
+        std::string wire = aggregate;
+        if (mode == 0) wire[0] ^= 1;
+        if (mode == 1) wire.pop_back();
+        if (mode == 2) wire += 'x';
+        if (mode == 3) wire.assign(kControlMaxPayload + 1, 'x');
+        if (mode == 4) wire[4 + 4 + 4 + fragments[0].size() + 4] ^= 1;
+        h.channel.recv_frames.push_back(from(0, FrameKind::control, broadcast_payload(1, internal_label, wire)));
+        if (mode != 5) {
+            std::string ack = broadcast_payload(1, internal_label, wire);
+            if (mode == 6) ack.back() ^= 1;
+            h.channel.recv_frames.push_back(from(0, FrameKind::control_ack, ack));
+        }
+        std::vector<std::string> output{"untouched"};
+        const auto before = output;
+        const auto f = session.exchange_control_payloads(label, fragments[1], output,
+            {h.clock.now() + std::chrono::seconds(1)});
+        const FailureCode expected = mode == 1 ? FailureCode::truncated_frame :
+            mode == 2 ? FailureCode::bad_frame :
+            mode == 3 ? FailureCode::oversized_frame :
+            mode == 5 ? FailureCode::deadline_expired :
+            mode == 7 ? FailureCode::none : FailureCode::bad_operation;
+        check(f.code == expected &&
+                  (mode == 7 ? output == fragments && session.ready() :
+                               output == before && !session.ready()),
+              "malformed exchange never publishes; valid exchange commits rank-ordered fragments");
+    }
+    {
+        Harness h;
+        queue_coordinator_ready(h);
+        Session session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "coordinator is ready for exchange cap validation");
+        const std::string too_large(kControlMaxPayload, 'x');
+        std::vector<std::string> output{"untouched"};
+        const auto f = session.exchange_control_payloads(label, too_large, output,
+            {h.clock.now() + std::chrono::seconds(1)});
+        check(f.code == FailureCode::oversized_frame && output == std::vector<std::string>{"untouched"},
+              "oversized contribution is rejected without changing output");
+    }
+    for (int mode = 0; mode < 4; ++mode) {
+        Harness h;
+        queue_coordinator_ready(h);
+        Session session = h.session(0, good_join(0), good_config(0));
+        check(!session.start(), "coordinator is ready for contribution validation");
+        std::string rank1 = exchange_contribution(1, label, fragments[1]);
+        std::string rank2 = exchange_contribution(1, label, fragments[2]);
+        if (mode == 0) rank1.pop_back();
+        if (mode == 1) {
+            auto wrong_label=label;wrong_label[0]^=1;
+            rank2 = exchange_contribution(1, wrong_label, fragments[2]);
+        }
+        if (mode == 2) rank1.assign(kControlMaxPayload + 1, 'x');
+        if (mode == 3) rank2 = rank1;
+        h.channel.recv_frames.push_back(from(1, FrameKind::control, rank1));
+        h.channel.recv_frames.push_back(from(mode == 3 ? 1 : 2, FrameKind::control, rank2));
+        std::vector<std::string> output{"untouched"};
+        const auto before = output;
+        const auto f = session.exchange_control_payloads(label, fragments[0], output,
+            {h.clock.now() + std::chrono::seconds(1)});
+        const FailureCode expected = mode == 0 ? FailureCode::truncated_frame :
+            mode == 2 ? FailureCode::oversized_frame : FailureCode::bad_operation;
+        check(f.code == expected && output == before && !session.ready() &&
+                  h.channel.sends_of(FrameKind::control_ack) == 0,
+              "bad, duplicate or oversized contribution aborts before aggregate commit");
+    }
+}
+
+uint16_t pick_free_port();
+
+void control_payload_exchange_over_tcp() {
+    const uint16_t port = pick_free_port();
+    check(port != 0, "a TCP port for three-rank control exchange");
+    if (!port) return;
+    const std::string label("mtp\0proposals", 13);
+    const std::string fragments[kTpWorld]{
+        std::string("root\0\xff", 6), std::string("rank1\0\x01", 7), ""};
+    std::atomic<int> finished{0};
+    FailureCode results[kTpWorld]{};
+    std::string details[kTpWorld];
+    bool exact[kTpWorld]{true, true, true};
+    std::vector<std::thread> threads;
+    for (uint32_t rank = 0; rank < kTpWorld; ++rank) {
+        threads.emplace_back([&, rank] {
+            SystemClock clock;
+            TcpChannelConfig wire;
+            wire.rank = rank;
+            wire.self = wire.rank0 = TcpEndpoint{"127.0.0.1", port};
+            wire.credential = kCredential;
+            std::string err;
+            auto channel = make_tcp_control_channel(wire, clock, err);
+            auto config = good_config(rank);
+            config.budgets = PhaseBudgets{3000, 3000, 3000, 3000};
+            Session session(config, good_join(rank), *channel, clock, [](std::string_view) {});
+            Failure f = session.start();
+            for (int iteration = 0; !f && iteration < 25; ++iteration) {
+                const std::string local = iteration % 2 ? fragments[rank] : std::string{};
+                std::vector<std::string> outputs{"unchanged"};
+                f = session.exchange_control_payloads(label, local, outputs,
+                    {clock.now() + std::chrono::seconds(3)});
+                std::vector<std::string> expected(kTpWorld);
+                for (uint32_t i = 0; i < kTpWorld; ++i) {
+                    expected[i] = iteration % 2 ? fragments[i] : std::string{};
+                }
+                exact[rank] &= !f && outputs == expected;
+            }
+            results[rank] = f.code;
+            details[rank] = f.detail;
+            ++finished;
+            const auto end = clock.now() + std::chrono::seconds(3);
+            while (finished != kTpWorld && clock.now() < end) std::this_thread::yield();
+            session.close();
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    for (uint32_t rank = 0; rank < kTpWorld; ++rank) {
+        check(results[rank] == FailureCode::none && exact[rank],
+              "three TCP ranks exchange distinct binary and empty fragments across repeated rounds");
+        if (results[rank] != FailureCode::none || !exact[rank])
+            std::printf("    rank %u: %s: %s exact=%d\n", rank, failure_code_name(results[rank]),
+                        details[rank].c_str(), exact[rank]);
     }
 }
 
@@ -2226,6 +2413,7 @@ int main() {
     collective_agreement();
     control_payload_agreement();
     control_payload_broadcast();
+    control_payload_exchange();
     follower_reaches_ready();
     follower_adopts_the_smaller_budget();
     coordinator_refuses_a_group_that_does_not_agree();
@@ -2246,6 +2434,7 @@ int main() {
     preagreed_batch_gates();
     control_payload_agreement_over_tcp();
     control_payload_broadcast_over_tcp();
+    control_payload_exchange_over_tcp();
     queued_abort_survives_tcp_reset();
     a_follower_starts_before_its_coordinator();
     raw_peers_over_real_tcp();

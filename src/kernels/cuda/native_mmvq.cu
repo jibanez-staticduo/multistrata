@@ -2323,6 +2323,19 @@ void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     }
     if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= MAX_NCOLS");
 }
+void validate_q8_1_shape(int n_in, int ncols) {
+    if (n_in <= 0 || n_in % Q8K != 0) {
+        throw std::invalid_argument("native Q8_1 requires n_in > 0 and divisible by 32");
+    }
+#if defined(STRATA_TP_WIDE_WINDOW)
+    constexpr int max_q8_1_cols = 40;
+#else
+    constexpr int max_q8_1_cols = MAX_NCOLS;
+#endif
+    if (ncols < 1 || ncols > max_q8_1_cols) {
+        throw std::invalid_argument("native Q8_1 requires 1 <= ncols <= the logical window limit");
+    }
+}
 void validate_pointer(const void* p) {
     if (!p || reinterpret_cast<std::uintptr_t>(p) % 4 != 0) {
         throw std::invalid_argument("native MMVQ requires non-null 4-byte aligned device pointers");
@@ -3054,36 +3067,43 @@ void native_mmvq_set_b6_rows(int mode) { g_b6_rows = mode; }
 int native_mmvq_b6_rows() { return b6_rows_mode(); }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {
-    validate_shape(n_in, ncols);
+    validate_q8_1_shape(n_in, ncols);
     return std::size_t(ncols) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
 }
 
 void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
+    validate_q8_1_shape(n_in, ncols);
     validate_pointer(x);
     validate_pointer(x_q8_1);
     validate_stream(stream);
-    // Columns are contiguous and n_in is a multiple of 32, so ncols columns quantize as one vector of
-    // ncols * n_in elements: every 32-element block stays inside one column.
-    const int n_total = n_in * ncols;
-    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
-    launch_pdl(native_quantize_q8_1_kernel, dim3(blocks), dim3(QUANT_THREADS), 0, static_cast<cudaStream_t>(stream), x,
-               static_cast<Q81Block*>(x_q8_1), n_total);
+    const std::size_t row_blocks = std::size_t(n_in / Q8K);
+    for (int first = 0; first < ncols; first += MAX_NCOLS) {
+        const int cols = std::min(MAX_NCOLS, ncols - first);
+        const int n_total = n_in * cols;
+        const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+        launch_pdl(native_quantize_q8_1_kernel, dim3(blocks), dim3(QUANT_THREADS), 0,
+                   static_cast<cudaStream_t>(stream), x + std::size_t(first) * std::size_t(n_in),
+                   static_cast<Q81Block*>(x_q8_1) + std::size_t(first) * row_blocks, n_total);
+    }
     launch_check();
 }
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream) {
-    validate_shape(n_in, ncols);
+    validate_q8_1_shape(n_in, ncols);
     validate_pointer(gate);
     validate_pointer(up);
     validate_pointer(x_q8_1);
     validate_stream(stream);
-    const int n_total = n_in * ncols;
-    const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
-    native_swiglu_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0,
-                                         static_cast<cudaStream_t>(stream)>>>(
-        gate, up, static_cast<Q81Block*>(x_q8_1), n_total);
+    const std::size_t row_blocks = std::size_t(n_in / Q8K);
+    for (int first = 0; first < ncols; first += MAX_NCOLS) {
+        const int cols = std::min(MAX_NCOLS, ncols - first);
+        const int n_total = n_in * cols;
+        const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+        native_swiglu_quantize_q8_1_kernel<<<blocks, QUANT_THREADS, 0, static_cast<cudaStream_t>(stream)>>>(
+            gate + std::size_t(first) * std::size_t(n_in), up + std::size_t(first) * std::size_t(n_in),
+            static_cast<Q81Block*>(x_q8_1) + std::size_t(first) * row_blocks, n_total);
+    }
     launch_check();
 }
 

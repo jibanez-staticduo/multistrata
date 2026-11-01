@@ -10,8 +10,6 @@
 namespace strata::distributed {
 namespace {
 
-constexpr size_t kMaxLine = 1u << 20;
-
 struct Value {
     enum class Kind { object, array, string, number, literal } kind = Kind::literal;
     std::string text;
@@ -23,7 +21,7 @@ class Reader {
  public:
     explicit Reader(std::string_view input) : input_(input) {}
     bool parse(Value& value) {
-        if (input_.size() > kMaxLine) return fail("JSON exceeds 1 MiB");
+        if (input_.size() > kDistributedMaxLineBytes) return fail("JSON exceeds 4 MiB");
         if (!read(value, 0)) return false;
         ws();
         return pos_ == input_.size() || fail("trailing JSON data");

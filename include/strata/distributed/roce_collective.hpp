@@ -21,7 +21,11 @@ struct Layout {
     uint64_t slots = 0;
 };
 
-enum class Kind : uint32_t { all_reduce_sum = 0, all_gather = 1 };
+enum class Kind : uint32_t {
+    all_reduce_sum = 0,
+    all_gather = 1,
+    all_reduce_ring_sum = 2,
+};
 
 // These host offsets are shared with proxy.c. The device epoch/counters are
 // separate allocations so CUDA graph replay never captures a fixed sequence.
@@ -46,6 +50,7 @@ cudaError_t launch(const DeviceBuffer& input, const DeviceBuffer& output,
                    Kind kind, uint32_t rank, const Layout& layout,
                    void* host_region_device, uint64_t slot_bytes,
                    void* device_state, uint32_t timeout_us,
-                   cudaStream_t stream, uint32_t blocks, uint32_t threads);
+                   cudaStream_t stream, uint32_t blocks, uint32_t threads,
+                   uint64_t global_first = 0, uint64_t global_total = 0);
 
 }  // namespace strata::distributed::roce::cuda

@@ -23,12 +23,20 @@
 #include <cstring>
 #include <type_traits>
 
-namespace strata::kernels {
+#ifndef STRATA_QSA_KERNEL_NAMESPACE
+#define STRATA_QSA_KERNEL_NAMESPACE strata::kernels
+#endif
+namespace STRATA_QSA_KERNEL_NAMESPACE {
 namespace {
 
 constexpr int HD = 256;           // head_dim
-constexpr int G = 12;             // query heads per KV head
+#ifndef STRATA_QSA_LOCAL_GROUPS
+#define STRATA_QSA_LOCAL_GROUPS 12
+#endif
+constexpr int G = STRATA_QSA_LOCAL_GROUPS;
+#if STRATA_QSA_LOCAL_GROUPS == 12
 static_assert(HD == strata::core::kCompiledGeometry.head_dim && G == strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv, "qsa_prompt_attn is compiled for core/geometry.hpp");
+#endif
 #ifndef D1_CH
 #define D1_CH 32
 #endif
@@ -479,7 +487,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int d = warp * 64 + j * 8 + 2 * tig;
-        *reinterpret_cast<float2*>(attn + (size_t) gid * HD + d) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
+        if (gid < G) *reinterpret_cast<float2*>(attn + (size_t) gid * HD + d) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
         if (gid + 8 < G)
             *reinterpret_cast<float2*>(attn + (size_t) (gid + 8) * HD + d) = make_float2(acc[j][2] * i1, acc[j][3] * i1);
     }
@@ -792,7 +800,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_i8_kernel(const float* __
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int d = dim0 + j * 8 + 2 * tig;
-        *reinterpret_cast<float2*>(attn + (size_t) gid * HD + d) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
+        if (gid < G) *reinterpret_cast<float2*>(attn + (size_t) gid * HD + d) = make_float2(acc[j][0] * i0, acc[j][1] * i0);
         if (gid + 8 < G)
             *reinterpret_cast<float2*>(attn + (size_t) (gid + 8) * HD + d) = make_float2(acc[j][2] * i1, acc[j][3] * i1);
     }
@@ -1016,7 +1024,7 @@ __global__ void __launch_bounds__(THREADS) decode_attn_i8_split_kernel(const flo
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int d = dim0 + j * 8 + 2 * tig;
-        *reinterpret_cast<float2*>(pacc + (size_t) gid * HD + d) = make_float2(acc[j][0], acc[j][1]);
+        if (gid < G) *reinterpret_cast<float2*>(pacc + (size_t) gid * HD + d) = make_float2(acc[j][0], acc[j][1]);
         if (gid + 8 < G)
             *reinterpret_cast<float2*>(pacc + (size_t) (gid + 8) * HD + d) = make_float2(acc[j][2], acc[j][3]);
     }
@@ -1265,8 +1273,10 @@ __global__ void __launch_bounds__(THREADS, 3) prompt_attn_i8v3_kernel(const floa
             }
             const int c = nt * 8 + 2 * tig;
             const float s0 = S.sc[warp][0][c], s1 = S.sc[warp][0][c + 1];
-            S.part[warp][gid][c] = join3(ch[0], cl[0], cm[0]) * qinv[0] * s0;
-            S.part[warp][gid][c + 1] = join3(ch[1], cl[1], cm[1]) * qinv[0] * s1;
+            if (gid < G) {
+                S.part[warp][gid][c] = join3(ch[0], cl[0], cm[0]) * qinv[0] * s0;
+                S.part[warp][gid][c + 1] = join3(ch[1], cl[1], cm[1]) * qinv[0] * s1;
+            }
             if (gid + 8 < G) {
                 S.part[warp][gid + 8][c] = join3(ch[2], cl[2], cm[2]) * qinv[1] * s0;
                 S.part[warp][gid + 8][c + 1] = join3(ch[3], cl[3], cm[3]) * qinv[1] * s1;
@@ -1386,8 +1396,10 @@ __global__ void __launch_bounds__(THREADS, 3) prompt_attn_i8v3_kernel(const floa
 #pragma unroll
     for (int j = 0; j < 8; ++j) {   // column 2 * tig is dim 16 * tig + j, column 2 * tig + 1 dim 16 * tig + 8 + j
         const int d0 = dim0 + 16 * tig + j, d1 = d0 + 8;
-        attn[(size_t) gid * HD + d0] = acc[j][0] * i0;
-        attn[(size_t) gid * HD + d1] = acc[j][1] * i0;
+        if (gid < G) {
+            attn[(size_t) gid * HD + d0] = acc[j][0] * i0;
+            attn[(size_t) gid * HD + d1] = acc[j][1] * i0;
+        }
         if (gid + 8 < G) {
             attn[(size_t) (gid + 8) * HD + d0] = acc[j][2] * i1;
             attn[(size_t) (gid + 8) * HD + d1] = acc[j][3] * i1;

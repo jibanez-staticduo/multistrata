@@ -707,8 +707,10 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     head_ = head;
     window_R_ = window_R;
     const WeightRef* wo = wt.find("output.weight");
-    if (!wo) { err = "mtp: output.weight is missing"; return false; }
-    n_vocab_ = wo->ne1;
+    if (!wo && !(head != nullptr && head->loaded() && g_ != nullptr)) {
+        err = "mtp: output.weight is missing"; return false;
+    }
+    n_vocab_ = wo ? wo->ne1 : g_->n_vocab;
     if (head == nullptr || !head->loaded()) { err = "mtp: the draft layer needs the native head (--native)"; return false; }
     if (head_logits_ == nullptr &&
         cudaMalloc((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float)) != cudaSuccess) {

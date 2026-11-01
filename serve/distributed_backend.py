@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 
 PROTOCOL = "strata-distributed-v1"
 ROSTER = [0, 1, 2]
-MAX_LINE = 1 << 20
+MAX_LINE = 4 << 20
 MAX_TOKEN = (1 << 31) - 1
 MAX_TIMING_NS = (1 << 64) - 1
 
@@ -146,6 +146,8 @@ def _validate_config(cfg: dict, section: str, capacities: tuple[int, ...]) -> di
         raise ValueError(f"{section} engine currently supports Qwen model families only")
     out = dict(spec)
     out["parallel"] = parallel
+    if type(spec.get("inherit_stderr", False)) is not bool:
+        raise ValueError(f"{section}.inherit_stderr must be a boolean")
     for key, default in (("ready_timeout", 60.0), ("health_timeout", 15.0),
                          ("process_deadline", 900.0), ("cancel_timeout", 10.0), ("shutdown_timeout", 5.0)):
         value = spec.get(key, default)
@@ -264,9 +266,10 @@ class DistributedEngine:
         self._writers = 0
         self.proc = None
         try:
-            # Discard stderr: a noisy worker cannot fill a pipe or expose prompts or keys in API errors.
+            # A managed launcher may already bound and redact its private stderr.
             self.proc = subprocess.Popen(self.spec["command"], cwd=cfg.get("cwd"), stdin=subprocess.PIPE,
-                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                         stdout=subprocess.PIPE,
+                                         stderr=None if self.spec.get("inherit_stderr", False) else subprocess.DEVNULL,
                                          text=True, encoding="utf-8", bufsize=1)
             self._reader = threading.Thread(target=self._read, daemon=True, name="strata-distributed-output")
             self._reader.start()
@@ -494,7 +497,7 @@ class DistributedEngine:
         message = {"type": "generate", "request_id": request, "ids": list(ids),
                    "max_new": max_new, "sampling": sampling}
         if len((json.dumps(message, separators=(",", ":"), allow_nan=False) + "\n").encode()) > MAX_LINE:
-            raise ValueError("distributed request exceeds one MiB")
+            raise ValueError("distributed request exceeds 4 MiB")
         deadline = time.monotonic() + self.spec["process_deadline"]
         queue_deadline = getattr(cancel, "_strata_queue_deadline", None)
         admission_deadline = min(deadline, queue_deadline) if queue_deadline is not None else deadline

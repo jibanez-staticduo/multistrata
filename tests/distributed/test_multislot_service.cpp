@@ -255,9 +255,9 @@ void budgets_chunks_and_validation() {
         return frame.label.starts_with("multislot-message-v1:bytes=") && frame.bytes.size() == 24u * 1024u;
     }) >= 2, "large service input is divided into multiple bounded wire chunks");
     Rig oversize;
-    oversize.input = {std::string((1u << 20) + 1, 'x')};
+    oversize.input = {std::string(kDistributedMaxLineBytes + 1, 'x')};
     check(bool(oversize.run()) && oversize.calls.empty() && oversize.aborted == 1,
-          "oversized root line aborts before scheduling or broadcasting payload");
+          "root line above 4 MiB aborts before scheduling or broadcasting payload");
     for (const uint32_t slots : {0u, 2u, 3u, 9u}) {
         Rig invalid;
         invalid.config.slots = slots;

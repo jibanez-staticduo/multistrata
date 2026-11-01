@@ -122,6 +122,61 @@ class FieldReader {
     size_t off_ = 0;
 };
 
+std::string exchange_broadcast_label(std::string_view label) {
+    std::string out("\0XCP1", 5);
+    put_u32(out, static_cast<uint32_t>(label.size()));
+    out.append(label);
+    return out;
+}
+
+Failure exchange_outputs_payload(const std::vector<std::string>& outputs, size_t maximum, std::string& out) {
+    if (outputs.size() > UINT32_MAX || maximum < 8) {
+        return Failure::fail(FailureCode::oversized_frame, "combined control exchange exceeds the payload cap");
+    }
+    size_t size = 8;
+    for (const auto& value : outputs) {
+        if (size > maximum - 4 || value.size() > UINT32_MAX || value.size() > maximum - size - 4) {
+            return Failure::fail(FailureCode::oversized_frame, "combined control exchange exceeds the payload cap");
+        }
+        size += 4 + value.size();
+    }
+    out.clear();
+    out.reserve(size);
+    out.assign("XCV1", 4);
+    put_u32(out, static_cast<uint32_t>(outputs.size()));
+    for (const auto& value : outputs) {
+        put_u32(out, static_cast<uint32_t>(value.size()));
+        out.append(value);
+    }
+    return ok_failure();
+}
+
+Failure decode_exchange_outputs(std::string_view payload, uint32_t world,
+                                std::vector<std::string>& outputs) {
+    if (payload.size() < 8) {
+        return Failure::fail(FailureCode::truncated_frame, "exchange output envelope is incomplete");
+    }
+    if (payload.substr(0, 4) != "XCV1") {
+        return Failure::fail(FailureCode::bad_operation, "exchange output has an unexpected protocol marker");
+    }
+    FieldReader reader(payload.substr(4));
+    uint32_t count = 0;
+    if (auto f = reader.u32(count)) return f;
+    if (count != world) {
+        return Failure::fail(FailureCode::bad_operation, "exchange output rank count disagrees with the session");
+    }
+    std::vector<std::string> staged;
+    staged.reserve(world);
+    for (uint32_t rank = 0; rank < world; ++rank) {
+        std::string value;
+        if (auto f = reader.field(value, "exchange fragment", kControlMaxPayload)) return f;
+        staged.push_back(std::move(value));
+    }
+    if (auto f = reader.finish()) return f;
+    outputs.swap(staged);
+    return ok_failure();
+}
+
 Failure require_non_empty(std::string_view value, std::string_view name, FailureCode code) {
     if (value.empty()) return Failure::fail(code, "'" + std::string(name) + "' is empty");
     return ok_failure();
@@ -1167,7 +1222,158 @@ Failure Session::complete_operation(const Operation& operation) {
     return ok_failure();
 }
 
+Failure Session::enable_control_exchange(ControlExchangeFn exchange) {
+    if (!exchange) {
+        return Failure::fail(FailureCode::invalid_config, "control exchange callback is empty");
+    }
+    if ((state_ != SessionState::fresh && state_ != SessionState::ready) ||
+        operation_in_flight_ || schedule_active_ || batch_active_ || next_control_sequence_ != 1 ||
+        control_exchange_) {
+        return Failure::fail(FailureCode::invalid_config,
+                             "control exchange must be installed once before the first control operation");
+    }
+    control_exchange_ = std::move(exchange);
+    return ok_failure();
+}
+
+Failure Session::control_exchange_impl(uint32_t kind, std::string_view label, std::string_view local,
+                                      std::string* broadcast_output,
+                                      std::vector<std::string>* exchange_outputs, Deadline at) {
+    if (state_ != SessionState::ready) {
+        return Failure::fail(FailureCode::not_ready, "no control exchange before READY");
+    }
+    if (operation_in_flight_ || (batch_active_ && !batch_control_active_) ||
+        (kind != 1 && batch_active_)) {
+        return fail(Failure::fail(FailureCode::in_flight, "a collective is already in flight"), true);
+    }
+    if ((kind == 2 && broadcast_output == nullptr) || (kind == 3 && exchange_outputs == nullptr)) {
+        return fail(Failure::fail(FailureCode::invalid_config, "control exchange output target is missing"), true);
+    }
+    if (kind == 2 && config_.rank != 0 && !broadcast_output->empty()) {
+        return fail(Failure::fail(FailureCode::bad_operation, "a control broadcast follower supplied input"), true);
+    }
+    if (next_control_sequence_ == UINT64_MAX) {
+        return fail(Failure::fail(FailureCode::overflow, "control exchange sequence is exhausted"), true);
+    }
+    constexpr size_t cap = kControlMaxPayload;
+    auto check_deadline = [&]() -> Failure {
+        return deadline_passed(clock_, at)
+            ? Failure::fail(FailureCode::deadline_expired, "control exchange deadline passed")
+            : ok_failure();
+    };
+    if (auto f = check_deadline()) return fail(f, true);
+
+    auto append_field = [](std::string& destination, std::string_view value) {
+        put_u32(destination, static_cast<uint32_t>(value.size()));
+        destination.append(value);
+    };
+    const size_t fixed_overhead = 4 + 4 + 4 + config_.session_uuid.size() + 8 + 4 + 4 + 4 + 4;
+    if (fixed_overhead > cap || label.size() > cap - fixed_overhead ||
+        local.size() > cap - fixed_overhead - label.size()) {
+        return fail(Failure::fail(FailureCode::oversized_frame, "control exchange envelope exceeds the payload cap"), true);
+    }
+    std::string envelope("RDC1", 4);
+    put_u32(envelope, kind);
+    append_field(envelope, config_.session_uuid);
+    put_u32(envelope, static_cast<uint32_t>(next_control_sequence_ >> 32));
+    put_u32(envelope, static_cast<uint32_t>(next_control_sequence_));
+    append_field(envelope, label);
+    put_u32(envelope, config_.rank);
+    append_field(envelope, local);
+    if (envelope.size() > cap) {
+        return fail(Failure::fail(FailureCode::oversized_frame, "control exchange envelope exceeds the payload cap"), true);
+    }
+
+    auto gather = [&](std::string_view input, std::vector<std::string>& gathered) -> Failure {
+        if (auto f = check_deadline()) return f;
+        try {
+            if (auto f = control_exchange_(input, gathered, at)) return f;
+        } catch (const std::exception&) {
+            return Failure::fail(FailureCode::comm_failed, "control exchange callback threw an exception");
+        } catch (...) {
+            return Failure::fail(FailureCode::comm_failed, "control exchange callback threw an unknown exception");
+        }
+        if (auto f = check_deadline()) return f;
+        return ok_failure();
+    };
+
+    std::vector<std::string> envelopes;
+    if (auto f = gather(envelope, envelopes)) return fail(f, true);
+    bool valid = envelopes.size() == config_.world;
+    constexpr size_t transcript_cap = kTpWorld * (cap + 4) + 8;
+    size_t transcript_size = 8;
+    std::vector<std::string> payloads;
+    payloads.reserve(config_.world);
+    for (uint32_t rank = 0; valid && rank < config_.world; ++rank) {
+        const std::string& bytes = envelopes[rank];
+        if (bytes.size() > cap || bytes.size() < 4 + 4 + 4 + config_.session_uuid.size() + 8 + 4 + label.size() + 4 + 4) {
+            valid = false;
+            break;
+        }
+        FieldReader reader(std::string_view(bytes).substr(4));
+        uint32_t got_kind = 0, seq_hi = 0, seq_lo = 0, got_rank = 0;
+        std::string uuid, got_label, payload;
+        if (bytes.compare(0, 4, "RDC1") != 0 || reader.u32(got_kind) || reader.field(uuid, "session UUID") ||
+            reader.u32(seq_hi) || reader.u32(seq_lo) || reader.field(got_label, "control label") ||
+            reader.u32(got_rank) || reader.field(payload, "control payload", cap) || reader.finish() ||
+            got_kind != kind || uuid != config_.session_uuid ||
+            ((static_cast<uint64_t>(seq_hi) << 32) | seq_lo) != next_control_sequence_ ||
+            got_label != label || got_rank != rank) {
+            valid = false;
+            break;
+        }
+        if (transcript_size > transcript_cap - 4 || bytes.size() > transcript_cap - transcript_size - 4) {
+            valid = false;
+            break;
+        }
+        transcript_size += 4 + bytes.size();
+        payloads.push_back(std::move(payload));
+    }
+    if (valid) {
+        if (kind == 1) {
+            valid = std::all_of(payloads.begin() + 1, payloads.end(),
+                                [&](const std::string& value) { return value == payloads.front(); });
+        } else if (kind == 2) {
+            valid = std::all_of(payloads.begin() + 1, payloads.end(),
+                                [](const std::string& value) { return value.empty(); });
+        }
+    }
+
+    // A failed local validation still enters the second round with NACK, so every rank
+    // that completed the first gather reaches the same bounded decision point.
+    std::string decision;
+    if (valid) {
+        decision.assign("ACK1", 4);
+        put_u32(decision, static_cast<uint32_t>(envelopes.size()));
+        for (const auto& bytes : envelopes) append_field(decision, bytes);
+    } else {
+        decision.assign("NAK1", 4);
+    }
+    std::vector<std::string> acknowledgements;
+    if (auto f = gather(decision, acknowledgements)) return fail(f, true);
+    bool acknowledged = valid && acknowledgements.size() == config_.world &&
+                        std::all_of(acknowledgements.begin(), acknowledgements.end(),
+                                    [&](const std::string& value) { return value == decision; });
+    if (!acknowledged) {
+        return fail(Failure::fail(FailureCode::bad_operation,
+                                  "ranks disagree on control exchange metadata, payload or acknowledgement"), true);
+    }
+
+    if (auto f = check_deadline()) return fail(f, true);
+    if (kind == 2) {
+        std::string staged = std::move(payloads[0]);
+        broadcast_output->swap(staged);
+    } else if (kind == 3) {
+        exchange_outputs->swap(payloads);
+    }
+    ++next_control_sequence_;
+    return ok_failure();
+}
+
 Failure Session::agree_control_payload(std::string_view label, std::string_view exact_payload, Deadline at) {
+    if (control_exchange_) {
+        return control_exchange_impl(1, label, exact_payload, nullptr, nullptr, at);
+    }
     if (state_ != SessionState::ready) {
         return Failure::fail(FailureCode::not_ready, "no control agreement before READY");
     }
@@ -1251,6 +1457,20 @@ Failure Session::agree_control_payload(std::string_view label, std::string_view 
 }
 
 Failure Session::broadcast_control_payload(std::string_view label, std::string& output, Deadline at) {
+    if (control_exchange_) {
+        if (config_.rank != 0 && !output.empty()) {
+            return fail(Failure::fail(FailureCode::bad_operation, "a control broadcast follower supplied input"), true);
+        }
+        const std::string_view local = config_.rank == 0 ? std::string_view(output) : std::string_view{};
+        return control_exchange_impl(2, label, local, &output, nullptr, at);
+    }
+    return broadcast_control_payload_impl(label, output, at, nullptr);
+}
+
+Failure Session::broadcast_control_payload_impl(
+    std::string_view label, std::string& output, Deadline at,
+    const std::function<Failure(std::string_view)>* validate_received,
+    bool request_already_validated) {
     if (state_ != SessionState::ready) {
         return Failure::fail(FailureCode::not_ready, "no control broadcast before READY");
     }
@@ -1325,6 +1545,9 @@ Failure Session::broadcast_control_payload(std::string_view label, std::string& 
                                      "control broadcast payload length disagrees with the envelope");
             }
             staged.assign(bytes.data() + prefix.size() + 4, length);
+            if (validate_received != nullptr) {
+                if (auto f = (*validate_received)(staged)) return f;
+            }
             payload = bytes;
         } else if (bytes != expected) {
             return Failure::fail(FailureCode::bad_operation, "ranks disagree on control broadcast metadata or payload");
@@ -1335,8 +1558,10 @@ Failure Session::broadcast_control_payload(std::string_view label, std::string& 
     if (config_.rank == 0) {
         std::vector<bool> seen(config_.world, false);
         seen[0] = true;
-        for (uint32_t i = 1; i < config_.world; ++i) {
-            if (auto f = receive(FrameKind::control, seen, request)) return fail(f, true);
+        if (!request_already_validated) {
+            for (uint32_t i = 1; i < config_.world; ++i) {
+                if (auto f = receive(FrameKind::control, seen, request)) return fail(f, true);
+            }
         }
         for (uint32_t i = 1; i < config_.world; ++i) {
             if (auto f = send(i, FrameKind::control, payload)) return fail(f, true);
@@ -1350,7 +1575,9 @@ Failure Session::broadcast_control_payload(std::string_view label, std::string& 
             if (auto f = send(i, FrameKind::control_ack, payload)) return fail(f, true);
         }
     } else {
-        if (auto f = send(0, FrameKind::control, request)) return fail(f, true);
+        if (!request_already_validated) {
+            if (auto f = send(0, FrameKind::control, request)) return fail(f, true);
+        }
         std::vector<bool> seen(config_.world, true);
         seen[0] = false;
         if (auto f = receive(FrameKind::control, seen, {}, true)) return fail(f, true);
@@ -1361,6 +1588,116 @@ Failure Session::broadcast_control_payload(std::string_view label, std::string& 
     if (auto f = check_deadline()) return fail(f, true);
     ++next_control_sequence_;
     if (config_.rank != 0) output.swap(staged);
+    return ok_failure();
+}
+
+Failure Session::exchange_control_payloads(std::string_view label, std::string_view local,
+                                           std::vector<std::string>& outputs, Deadline at) {
+    if (control_exchange_) return control_exchange_impl(3, label, local, nullptr, &outputs, at);
+    if (state_ != SessionState::ready) {
+        return Failure::fail(FailureCode::not_ready, "no control exchange before READY");
+    }
+    if (operation_in_flight_ || batch_active_) {
+        return fail(Failure::fail(FailureCode::in_flight, "a collective is already in flight"), true);
+    }
+    constexpr size_t cap = kControlMaxPayload;
+    const size_t base_overhead = 4 + 4 + config_.session_uuid.size() + 8 + 4 + 4;
+    if (base_overhead > cap || label.size() > cap - base_overhead ||
+        local.size() > cap - base_overhead - label.size()) {
+        return fail(Failure::fail(FailureCode::oversized_frame, "control exchange contribution exceeds the payload cap"), true);
+    }
+    if (next_control_sequence_ == UINT64_MAX) {
+        return fail(Failure::fail(FailureCode::overflow, "control exchange sequence is exhausted"), true);
+    }
+    auto check_deadline = [&]() -> Failure {
+        return deadline_passed(clock_, at)
+            ? Failure::fail(FailureCode::deadline_expired, "control exchange deadline passed")
+            : ok_failure();
+    };
+    if (auto f = check_deadline()) return fail(f, true);
+
+    auto append_field = [](std::string& destination, std::string_view value) {
+        put_u32(destination, static_cast<uint32_t>(value.size()));
+        destination.append(value);
+    };
+    std::string prefix("XCH1", 4);
+    append_field(prefix, config_.session_uuid);
+    put_u32(prefix, static_cast<uint32_t>(next_control_sequence_ >> 32));
+    put_u32(prefix, static_cast<uint32_t>(next_control_sequence_));
+    append_field(prefix, label);
+    std::string contribution = prefix;
+    append_field(contribution, local);
+
+    auto parse_contribution = [&](std::string_view payload, std::string& value) -> Failure {
+        if (payload.size() < prefix.size() + 4) {
+            return Failure::fail(FailureCode::truncated_frame, "control exchange contribution is incomplete");
+        }
+        if (payload.substr(0, prefix.size()) != prefix) {
+            return Failure::fail(FailureCode::bad_operation, "ranks disagree on control exchange metadata");
+        }
+        FieldReader reader(payload.substr(prefix.size()));
+        if (auto f = reader.field(value, "exchange contribution", cap)) return f;
+        return reader.finish();
+    };
+    auto send = [&](uint32_t rank, FrameKind kind, std::string_view bytes) -> Failure {
+        if (auto f = check_deadline()) return f;
+        return channel_.send(rank, kind, bytes, at);
+    };
+
+    std::vector<std::string> staged(config_.world);
+    staged[config_.rank].assign(local);
+    if (config_.rank == 0) {
+        std::vector<bool> seen(config_.world, false);
+        seen[0] = true;
+        for (uint32_t n = 1; n < config_.world; ++n) {
+            if (auto f = check_deadline()) return fail(f, true);
+            ReceivedFrame got;
+            if (auto f = channel_.recv(got, at)) return fail(f, true);
+            if (got.frame.kind == FrameKind::abort) return fail(peer_abort(got), false);
+            if (got.frame.kind != FrameKind::control || got.from_rank >= config_.world || seen[got.from_rank]) {
+                return fail(Failure::fail(FailureCode::bad_operation, "unexpected or duplicate control exchange contribution"), true);
+            }
+            if (got.frame.payload.size() > cap) {
+                return fail(Failure::fail(FailureCode::oversized_frame, "control exchange contribution exceeds the payload cap"), true);
+            }
+            if (auto f = parse_contribution(got.frame.payload, staged[got.from_rank])) return fail(f, true);
+            seen[got.from_rank] = true;
+        }
+    } else if (auto f = send(0, FrameKind::control, contribution)) {
+        return fail(f, true);
+    }
+
+    const std::string internal_label = exchange_broadcast_label(label);
+    if (base_overhead > cap || internal_label.size() > cap - base_overhead) {
+        return fail(Failure::fail(FailureCode::oversized_frame, "combined control exchange exceeds the payload cap"), true);
+    }
+    const size_t aggregate_max = cap - base_overhead - internal_label.size();
+    if (aggregate_max < 4) {
+        return fail(Failure::fail(FailureCode::oversized_frame, "combined control exchange exceeds the payload cap"), true);
+    }
+    std::string aggregate;
+    if (config_.rank == 0) {
+        if (auto f = exchange_outputs_payload(staged, aggregate_max, aggregate)) return fail(f, true);
+    }
+    std::function<Failure(std::string_view)> validate_received = [&](std::string_view received) -> Failure {
+        std::vector<std::string> decoded;
+        if (auto f = decode_exchange_outputs(received, config_.world, decoded)) return f;
+        if (decoded[config_.rank] != local) {
+            return Failure::fail(FailureCode::bad_operation, "control exchange changed the local contribution");
+        }
+        staged.swap(decoded);
+        return ok_failure();
+    };
+    const auto* validator = config_.rank == 0 ? nullptr : &validate_received;
+    if (auto f = broadcast_control_payload_impl(internal_label, aggregate, at, validator, true)) return f;
+
+    if (config_.rank == 0) {
+        std::vector<std::string> committed;
+        if (auto f = decode_exchange_outputs(aggregate, config_.world, committed)) return fail(f, true);
+        outputs.swap(committed);
+    } else {
+        outputs.swap(staged);
+    }
     return ok_failure();
 }
 

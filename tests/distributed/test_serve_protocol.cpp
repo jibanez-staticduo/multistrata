@@ -1,4 +1,5 @@
 #include "strata/distributed/serve_protocol.hpp"
+#include "strata/distributed/limits.hpp"
 
 #include <cstdio>
 #include <limits>
@@ -37,6 +38,7 @@ template <typename F> void throws(F f, const char* name) {
 
 int main() {
     ServeRequest out;
+    std::string error;
     check(parse(generate(), out), "generate parses");
     check(out.kind == ServeRequest::Kind::generate && out.request_id == "r_1-A" &&
           out.ids == std::vector<int32_t>({1, 2}) && out.max_new == 3, "generate fields preserved");
@@ -59,8 +61,18 @@ int main() {
           out.ids.size() == 65536 && out.max_new == 256,
           "64K prompt plus 256 outputs fits bounded context without truncation");
     out.request_id = "unchanged";
-    check(!parse(generate("{}", prompt_ids, "257"), out, kDistributedMaxContext) &&
+    check(!parse(generate("{}", prompt_ids, "257"), out, 65792) &&
           out.request_id == "unchanged", "one extra output is rejected without changing request");
+    std::string maximum_ids = "[2147483646";
+    maximum_ids.reserve(262143 * 11 + 2);
+    for (size_t i = 1; i < 262143; ++i) maximum_ids += ",2147483646";
+    maximum_ids += ']';
+    check(parse_serve_request(generate("{}", maximum_ids, "1"), std::numeric_limits<int32_t>::max(),
+                              262144, out, error) && out.ids.size() == 262143,
+          "256K prompt with maximum-width token IDs and one output parses without truncation");
+    check(!parse_serve_request(generate("{}", maximum_ids, "2"), std::numeric_limits<int32_t>::max(),
+                               262144, out, error),
+          "256K prompt still rejects a one-token context overflow");
 
     for (auto malformed : {"", "{", "[]", "null", "true", "{}", "{\"type\":true}",
         "{\"type\":\"other\"}", "{\"type\":\"shutdown\",}", "{\"type\":\"shutdown\"}{}",
@@ -127,13 +139,14 @@ int main() {
     check(parse(generate("{\"stop\":" + nested + '}'), out), "16 container depth accepted");
     nested = '[' + nested + ']';
     reject(generate("{\"stop\":" + nested + '}'), "17 container depth refused");
-    reject(std::string((1u << 20) + 1, ' '), "line above 1 MiB refused");
-    check(parse(std::string((1u << 20) - base.size(), ' ') + base, out), "1 MiB line accepted");
+    reject(std::string(kDistributedMaxLineBytes + 1, ' '), "line above 4 MiB refused");
+    check(parse(std::string(kDistributedMaxLineBytes - base.size(), ' ') + base, out),
+          "4 MiB line accepted");
 
     check(serve_event("ready", {}, -1, 65536) ==
           "{\"type\":\"ready\",\"alive_ranks\":[0,1,2],\"protocol\":\"strata-distributed-v1\",\"mode\":\"autoregressive\",\"world\":3,\"max_context\":65536}",
           "ready JSON matches contract");
-    check(serve_event("ready", {}, -1, kDistributedMaxContext) ==
+    check(serve_event("ready", {}, -1, 65792) ==
           "{\"type\":\"ready\",\"alive_ranks\":[0,1,2],\"protocol\":\"strata-distributed-v1\",\"mode\":\"autoregressive\",\"world\":3,\"max_context\":65792}",
           "expanded ready capacity preserves protocol and roster");
     check(serve_event("token", "r", 42) ==

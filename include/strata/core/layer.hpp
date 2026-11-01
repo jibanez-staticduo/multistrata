@@ -308,6 +308,10 @@ void qsa_set_kv_resident(int64_t cells);
 /// captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
 void qsa_set_kv_elastic(bool enabled, int64_t init_cells);
 bool qsa_kv_elastic();
+// Grow/shrink only this request's pool, preserving every other slot's mapping.
+// Caller orders with all users of the pool and enforces its shared byte budget.
+bool qsa_kv_elastic_grow_state(const QsaState&, int64_t cells);
+bool qsa_kv_elastic_shrink_state(const QsaState&, int64_t cells);
 /// Cells every elastic state can hold now (INT64_MAX when none is elastic).
 int64_t qsa_kv_elastic_cells();
 /// Chunks still to map for every elastic state to hold `cells` cells.
@@ -699,9 +703,9 @@ bool block_layer_post(const WeightTable& tables, const ModelGeometry& g, int64_t
                       const MoEBuffers& mb, const BlockBuffers& bb, const float* parts, void* stream,
                       std::string& err
 #ifdef STRATA_BUILD_DISTRIBUTED
-                      , DistributedLayerHooks* distributed = nullptr,
+                      , DistributedLayerHooks* distributed = nullptr
 #endif
-                      bool shared_ready = false
+                      , bool shared_ready = false
                       );
 
 }  // namespace strata::core

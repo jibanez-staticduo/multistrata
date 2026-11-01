@@ -21,6 +21,7 @@
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <atomic>
@@ -144,6 +145,42 @@ __global__ void append_layers(const float* __restrict__ raw0, long long raw_stri
     append_body<TAB>(raw0 + (long long) i * raw_stride, pos_dev, pos_stride, n_steps, pos_base, L.gamma[i], epsilon, tail,
                      L.dead[i], L.pooled[i], L.block_pos[i], max_cells, theta_scale, freq_scale, corr_low, corr_high,
                      ext_factor, mscale, mtab, rt);
+}
+template <bool TAB>
+__global__ void append_groups(const float* __restrict__ raw0, const int32_t* __restrict__ steps,
+                              int pos_stride, float* __restrict__ dead_rows, const float* __restrict__ gamma,
+                              float epsilon, QsaIndexerGroups groups, int max_cells,
+                              float theta_scale, float freq_scale, float corr_low, float corr_high,
+                              float ext_factor, float mscale, const int32_t* __restrict__ mtab, RopeTab rt) {
+    const int group = int(blockIdx.x);
+    const int first = groups.first[group];
+    const int count = groups.count[group];
+    const int tid = threadIdx.x;
+    const QsaIndexerBuffers b = groups.buffers[group];
+
+    for (int token = 0; token < count; ++token) {
+        const int row = first + token;
+        const float* raw = raw0 + std::size_t(row) * D;
+        if (groups.snapshot[group]) {
+            float* history = groups.history_prefix[group] + std::size_t(token) * (4 * D + 1);
+            for (int i = tid; i < 4 * D; i += blockDim.x)
+                history[i] = i < (R - 1) * D ? b.tail[i] : b.dead[i - (R - 1) * D];
+            if (!tid) reinterpret_cast<int32_t*>(history + 4 * D)[0] = *b.block_pos;
+            __syncthreads();
+        }
+
+        append_body<TAB>(raw, steps + std::size_t(row) * pos_stride, 0, 1, 0, gamma, epsilon,
+                         b.tail, b.dead, b.pooled, b.block_pos, max_cells,
+                         theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt);
+        __syncthreads();
+
+        if (groups.snapshot[group]) {
+            float* raw_saved = groups.raw_prefix[group] + std::size_t(token) * D;
+            if (tid < D) raw_saved[tid] = raw[tid];
+        }
+        if (tid < D) dead_rows[std::size_t(row) * D + tid] = b.dead[tid];
+        __syncthreads();
+    }
 }
 // ---- C-2: the batched append.  The pooled key of a completed block b (its last cell pos = 4b+3), computed with
 // the single append's arithmetic: keys rounded through F16, summed tail[0]+tail[1]+tail[2]+incoming in that order,
@@ -330,6 +367,111 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
             k.attn_factor, mrope_table(), rt);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+void native_qsa_indexer_append_groups(const float* raw0, const int32_t* steps, int pos_stride,
+                                      float* dead_rows, const float* gamma, float epsilon,
+                                      const QsaIndexerGroups& groups, const QsaShapes& s,
+                                      int64_t max_cells, const RopeScaling& scaling, void* stream) {
+    if (!stream || groups.n < 1 || groups.n > QsaIndexerGroups::kMax ||
+        s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
+        max_cells < 1 || max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        rope_scaling_invalid(scaling) != nullptr || pos_stride < 1)
+        throw std::invalid_argument("native QSA indexer (groups): bad geometry or parameters");
+
+    int max_row = 0;
+    int total_rows = 0;
+    Span state_spans[QsaIndexerGroups::kMax][4]{};
+    Span snapshot_spans[QsaIndexerGroups::kMax][2]{};
+    for (int i = 0; i < groups.n; ++i) {
+        const int first = groups.first[i], count = groups.count[i];
+        if (first < 0 || count < 1 || count > 5 ||
+            first > kWindowMaxT - count || total_rows > kWindowMaxT - count)
+            throw std::invalid_argument("native QSA indexer (groups): invalid row range");
+        total_rows += count;
+        max_row = std::max(max_row, first + count);
+
+        const auto& b = groups.buffers[i];
+        state_spans[i][0] = {b.tail, (R - 1) * D * sizeof(float)};
+        state_spans[i][1] = {b.dead, D * sizeof(float)};
+        state_spans[i][2] = {b.pooled, std::size_t(max_cells / R + 1) * D * sizeof(float)};
+        state_spans[i][3] = {b.block_pos, sizeof(int32_t)};
+        for (const auto& span : state_spans[i]) validate(span);
+
+        if (groups.snapshot[i]) {
+            snapshot_spans[i][0] = {groups.history_prefix[i], std::size_t(count) * (4 * D + 1) * sizeof(float)};
+            snapshot_spans[i][1] = {groups.raw_prefix[i], std::size_t(count) * D * sizeof(float)};
+            for (const auto& span : snapshot_spans[i]) validate(span);
+        }
+    }
+    for (int i = 0; i < groups.n; ++i) {
+        const int i_end = groups.first[i] + groups.count[i];
+        for (int j = i + 1; j < groups.n; ++j) {
+            const int j_end = groups.first[j] + groups.count[j];
+            if (groups.first[i] < j_end && groups.first[j] < i_end)
+                throw std::invalid_argument("native QSA indexer (groups): row ranges overlap");
+            for (const auto& a : state_spans[i]) {
+                for (const auto& b : state_spans[j])
+                    if (overlaps(a, b)) throw std::invalid_argument("native QSA indexer (groups): slot states overlap");
+            }
+        }
+        for (int a = 0; a < 4; ++a) for (int b = a + 1; b < 4; ++b)
+            if (overlaps(state_spans[i][a], state_spans[i][b]))
+                throw std::invalid_argument("native QSA indexer (groups): slot state buffers overlap");
+        if (groups.snapshot[i] && overlaps(snapshot_spans[i][0], snapshot_spans[i][1]))
+            throw std::invalid_argument("native QSA indexer (groups): snapshot buffers overlap");
+    }
+
+    const Span common[] = {
+        {raw0, std::size_t(max_row) * D * sizeof(float)},
+        {steps, (std::size_t(max_row - 1) * std::size_t(pos_stride) + 1) * sizeof(int32_t)},
+        {dead_rows, std::size_t(max_row) * D * sizeof(float)},
+        {gamma, D * sizeof(float)},
+    };
+    for (const auto& span : common) validate(span);
+    for (int i = 0; i < 4; ++i) for (int j = i + 1; j < 4; ++j)
+        if (overlaps(common[i], common[j]))
+            throw std::invalid_argument("native QSA indexer (groups): common buffers overlap");
+    for (int i = 0; i < groups.n; ++i) {
+        for (const auto& state : state_spans[i]) for (const auto& shared : common)
+            if (overlaps(state, shared))
+                throw std::invalid_argument("native QSA indexer (groups): common and slot buffers overlap");
+        if (groups.snapshot[i]) {
+            for (const auto& saved : snapshot_spans[i]) {
+                for (const auto& shared : common)
+                    if (overlaps(saved, shared))
+                        throw std::invalid_argument("native QSA indexer (groups): snapshot and common buffers overlap");
+                for (int j = 0; j < groups.n; ++j) {
+                    for (const auto& state : state_spans[j])
+                        if (overlaps(saved, state))
+                            throw std::invalid_argument("native QSA indexer (groups): snapshot and slot buffers overlap");
+                }
+            }
+            if (overlaps(snapshot_spans[i][0], snapshot_spans[i][1]))
+                throw std::invalid_argument("native QSA indexer (groups): snapshot buffers overlap");
+            for (int j = i + 1; j < groups.n; ++j) {
+                if (!groups.snapshot[j]) continue;
+                for (const auto& a : snapshot_spans[i]) for (const auto& b : snapshot_spans[j])
+                    if (overlaps(a, b))
+                        throw std::invalid_argument("native QSA indexer (groups): snapshot spans overlap");
+            }
+        }
+    }
+
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);
+    const RopeTab rt = rope_table_for(scaling);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (rt.cos != nullptr)
+        append_groups<true><<<groups.n, THREADS, 0, st>>>(raw0, steps, pos_stride, dead_rows, gamma, epsilon,
+            groups, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+            k.attn_factor, mrope_table(), rt);
+    else
+        append_groups<false><<<groups.n, THREADS, 0, st>>>(raw0, steps, pos_stride, dead_rows, gamma, epsilon,
+            groups, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
+            k.attn_factor, mrope_table(), rt);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(std::string("native QSA indexer (groups): ") + cudaGetErrorString(error));
 }
 
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,

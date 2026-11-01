@@ -1,10 +1,15 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 namespace strata::distributed {
 
-// Bounded capacity for a 64K prompt plus 256 output tokens. GPU qualification is separate.
-inline constexpr uint32_t kDistributedMaxContext = 65792;
+// Protocol capacity. Actual GPU capacity and resident-page admission are
+// separately qualified by the chosen executor and model profile.
+inline constexpr uint32_t kDistributedMaxContext = 262144;
+inline constexpr size_t kDistributedMaxLineBytes = 4u << 20;
+// Retained qualification limit of the diagnostic IQ/exact-reference runners.
+inline constexpr uint32_t kDistributedReferenceMaxContext = 65792;
 
 } // namespace strata::distributed

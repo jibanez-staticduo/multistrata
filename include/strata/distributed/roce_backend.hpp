@@ -60,11 +60,20 @@ public:
     uint32_t local_rank() const override { return config_.rank; }
     Failure raw_all_reduce_sum(const DeviceBuffer& input, const DeviceBuffer& output,
                                uint64_t elements, cudaStream_t stream) override;
+    Failure raw_all_reduce_ring_sum(const DeviceBuffer& input, const DeviceBuffer& output,
+                                    uint64_t elements, uint64_t global_first,
+                                    uint64_t global_total, cudaStream_t stream);
     Failure raw_all_gather(const DeviceBuffer& input, const DeviceBuffer& output,
                            uint64_t slot_elements, cudaStream_t stream) override;
     Failure raw_poll(Deadline deadline) override;
     bool raw_async_failure(Failure& out) const override;
     void raw_abort() noexcept override;
+
+    // Optional fast path for callers that own stream ordering: begin a step,
+    // enqueue any number of collectives on its stream, then finish once after
+    // the stream has completed (or after a graph launch using that stream).
+    Failure begin_stream_step(cudaStream_t stream);
+    Failure finish_stream_step(Deadline deadline);
 
     // CUDA graph capture defers execution/completion to graph replay. The
     // wrapper's per-operation wait is a capture-order acknowledgement; callers
@@ -79,8 +88,10 @@ public:
 
 private:
     Failure enqueue(const DeviceBuffer& input, const DeviceBuffer& output,
-                    cuda::Kind kind, uint64_t slot_elements, cudaStream_t stream);
+                    cuda::Kind kind, uint64_t slot_elements, cudaStream_t stream,
+                    uint64_t global_first = 0, uint64_t global_total = 0);
     Failure health_locked() const;
+    Failure poll_completion(Deadline deadline, bool step_completion);
     void release_safe() noexcept;
 
     Config config_;
@@ -98,6 +109,10 @@ private:
     bool created_ = false;
     bool connected_ = false;
     bool in_flight_ = false;
+    bool stream_step_active_ = false;
+    bool stream_step_has_work_ = false;
+    uint32_t stream_step_baseline_ = 0;
+    cudaStream_t stream_step_stream_ = nullptr;
     bool capture_active_ = false;
     bool graph_capture_seen_ = false;
     bool captured_pending_ = false;
