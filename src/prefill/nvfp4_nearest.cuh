@@ -164,4 +164,3 @@ static __global__ void quantize_mmq_nvfp4_nearest(
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 
 }
-
